@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 export default function (pi: ExtensionAPI) {
   let totalStartMs = 0;
@@ -85,6 +86,22 @@ export default function (pi: ExtensionAPI) {
     return `${prefix}${tokensPerSecond(tokens, elapsedMs).toFixed(1)} tok/s`;
   }
 
+  function formatClock(date = new Date()) {
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    return `${hours}:${minutes} `;
+  }
+
+  function fitsLine(text: string, maxWidth: number | undefined) {
+    return maxWidth === undefined || visibleWidth(text) <= maxWidth;
+  }
+
+  function terminalWidth() {
+    return typeof process.stdout.columns === "number" && process.stdout.columns > 0
+      ? process.stdout.columns
+      : undefined;
+  }
+
   function average(values: number[]) {
     if (values.length === 0) return 0;
     return values.reduce((sum, value) => sum + value, 0) / values.length;
@@ -144,18 +161,40 @@ export default function (pi: ExtensionAPI) {
     return streamMs + (activeStreamStartMs > 0 ? Date.now() - activeStreamStartMs : 0);
   }
 
-  function formatStats(usage: TurnTokenUsage = { input: 0, output: estimatedOutputTokens, cacheRead: 0, cacheWrite: 0, exact: false }) {
+  function formatStats(
+    usage: TurnTokenUsage = { input: 0, output: estimatedOutputTokens, cacheRead: 0, cacheWrite: 0, exact: false },
+    finishedAt = new Date(),
+  ) {
     const totalMs = totalStartMs > 0 ? Date.now() - totalStartMs : 0;
     const toolMs = currentToolMs();
     const usagePart = formatUsage(usage);
     const rateMs = currentStreamMs() || Math.max(0, totalMs - toolMs) || totalMs;
     const avgLatencyMs = average(providerLatenciesMs);
-    const latencyPart = avgLatencyMs > 0 ? ` · ${formatDuration(avgLatencyMs)} avg latency` : "";
-    const tokenPart = usage.output > 0
-      ? ` · ${usagePart}${usagePart ? " · " : ""}${formatTokenRate(usage.output, rateMs, !usage.exact)}`
-      : "";
+    const maxWidth = terminalWidth();
 
-    return `${formatDuration(totalMs)} total · ${formatDuration(toolMs)} tools${latencyPart}${tokenPart}`;
+    const totalPart = `${formatDuration(totalMs)} total`;
+    const toolPart = `${formatDuration(toolMs)} tools`;
+    const latencyPart = avgLatencyMs > 0 ? `${formatDuration(avgLatencyMs)} avg latency` : undefined;
+    const usageRatePart = usage.output > 0
+      ? `${usagePart}${usagePart ? " · " : ""}${formatTokenRate(usage.output, rateMs, !usage.exact)}`
+      : undefined;
+    const clockPart = formatClock(finishedAt);
+
+    const candidates = [
+      [totalPart, toolPart, latencyPart, usageRatePart, clockPart],
+      [totalPart, latencyPart, usageRatePart, clockPart],
+      [totalPart, usageRatePart, clockPart],
+      [totalPart, usagePart || undefined, clockPart],
+      [totalPart, clockPart],
+      [clockPart],
+    ];
+
+    for (const candidate of candidates) {
+      const line = candidate.filter(Boolean).join(" · ");
+      if (fitsLine(line, maxWidth)) return line;
+    }
+
+    return clockPart;
   }
 
   pi.on("agent_start", async () => {
@@ -213,7 +252,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, ctx) => {
     const totalMs = totalStartMs > 0 ? Date.now() - totalStartMs : 0;
     const usage = turnTokenUsage(event.messages);
-    const stats = formatStats(usage);
+    const finishedAt = new Date();
+    const stats = formatStats(usage, finishedAt);
 
     lastStats = stats;
     lastStatsAtMs = Date.now();
