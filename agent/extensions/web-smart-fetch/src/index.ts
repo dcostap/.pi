@@ -47,6 +47,17 @@ function textOutput(result: any): string {
 		.join("\n");
 }
 
+function renderErrorResult(result: any, theme: any, context: any): Text | undefined {
+	if (!context.isError && !result?.isError) return undefined;
+	const message =
+		result?.details?.error ||
+		result?.error?.message ||
+		result?.error ||
+		textOutput(result) ||
+		"Tool failed";
+	return renderLine(`${theme.fg("error", "✗ Error:")} ${theme.fg("toolOutput", oneLine(message, 300))}`, theme, context);
+}
+
 function renderToolOutputBlock(output: string, expanded: boolean, theme: any, maxLines = 10): string {
 	const trimmed = output.trim();
 	if (!trimmed) return "";
@@ -86,6 +97,8 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			if (isPartial) return renderLine(theme.fg("warning", "fetch_url running…"), theme, context);
+			const errorResult = renderErrorResult(result, theme, context);
+			if (errorResult) return errorResult;
 			const d = result.details || {};
 			let text = theme.fg("success", "✓");
 			if (d.method) text += ` ${theme.fg("muted", d.method)}`;
@@ -140,6 +153,8 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			if (isPartial) return renderLine(theme.fg("warning", "firecrawl_search running…"), theme, context);
+			const errorResult = renderErrorResult(result, theme, context);
+			if (errorResult) return errorResult;
 			const d = result.details || {};
 			let text = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", "firecrawl_search")} ${theme.fg("accent", oneLine(d.query || context.args?.query, 100))}`;
 			if (typeof d.count === "number") text += ` · ${d.count} results`;
@@ -199,6 +214,8 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			if (isPartial) return renderLine(theme.fg("warning", "firecrawl_crawl running…"), theme, context);
+			const errorResult = renderErrorResult(result, theme, context);
+			if (errorResult) return errorResult;
 			const d = result.details || {};
 			let text = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", "firecrawl_crawl")} ${theme.fg("accent", oneLine(context.args?.url, 100))}`;
 			if (typeof d.pages === "number") text += ` · ${d.pages} pages`;
