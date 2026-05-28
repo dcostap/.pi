@@ -1,0 +1,56 @@
+# Ignore everything by default. This repo is an allowlisted ~/.pi sync repo.
+*
+
+# Repo metadata
+!.gitignore
+!.gitattributes
+
+# Allow agent directory traversal
+!agent/
+
+# Hand-picked core config
+!agent/keybindings.json
+
+# Pi customizations
+!agent/extensions/
+!agent/extensions/**
+!agent/prompts/
+!agent/prompts/**
+!agent/skills/
+!agent/skills/**
+!agent/themes/
+!agent/themes/**
+
+# But never track generated extension dependencies/build outputs
+agent/extensions/**/node_modules/
+agent/extensions/**/dist/
+agent/extensions/**/build/
+agent/extensions/**/coverage/
+agent/extensions/**/.cache/
+agent/extensions/**/.turbo/
+
+# Per-machine Pi config/auth/secrets
+agent/auth.json
+agent/settings.json
+agent/models.json
+web-smart-fetch.json
+
+# Runtime/generated/bulky Pi state
+agent/sessions/
+agent/bin/
+agent/npm/
+agent/git/
+agent/messenger/
+agent/simple-messenger/
+agent/codex-usage-observations.jsonl
+agent/pi-crash.log
+agent/*.log
+agent/*.jsonl
+
+# OS/editor/temp noise
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,9 @@
+{
+  "tui.editor.cursorLineStart": ["home"],
+  "tui.editor.cursorLineEnd": ["end"],
+  "tui.editor.deleteCharForward": ["delete"],
+  "tui.editor.yank": [],
+  "app.exit": [],
+  "app.model.select": ["ctrl+e"],
+  "app.message.followUp": ["ctrl+q"]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "web-smart-fetch",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@mendable/firecrawl-js": "^4.22.2",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^26.1.0",
+    "pdf-parse": "^1.1.1",
+    "turndown": "^7.2.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
