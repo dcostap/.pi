@@ -1,8 +1,0 @@
-{
-  "persistState": true,
-  "desiredActive": false,
-  "supportedModels": [
-    "gpt-5.4",
-    "gpt-5.5"
-  ]
-}

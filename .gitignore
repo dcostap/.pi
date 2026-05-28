@@ -22,6 +22,7 @@
 !agent/themes/**
 
 # But never track generated extension dependencies/build outputs
+agent/extensions/codex-fast-mode.json
 agent/extensions/**/node_modules/
 agent/extensions/**/dist/
 agent/extensions/**/build/
