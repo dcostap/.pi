@@ -96,7 +96,10 @@ export default function (pi: ExtensionAPI) {
 			return renderLine(`${label} ${url}${prompt}`, theme, context);
 		},
 		renderResult(result, { expanded, isPartial }, theme, context) {
-			if (isPartial) return renderLine(theme.fg("warning", "fetch_url running…"), theme, context);
+			if (isPartial) {
+				const status = oneLine(textOutput(result) || result?.details?.status || "fetch_url running…", 180);
+				return renderLine(theme.fg("warning", status), theme, context);
+			}
 			const errorResult = renderErrorResult(result, theme, context);
 			if (errorResult) return errorResult;
 			const d = result.details || {};

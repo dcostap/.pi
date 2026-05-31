@@ -13,8 +13,29 @@ const REPO_LOCK_STALE_MS = 30 * 60 * 1000;
 const GIT_INDEX_LOCK_STALE_MS = 10 * 60 * 1000;
 
 type RepoLock = { path: string };
+type ProgressReporter = (message: string) => void;
 
-async function acquireRepoLock(config: ExtensionConfig, owner: string, repo: string): Promise<RepoLock> {
+function formatElapsed(ms: number): string {
+	const seconds = Math.max(1, Math.floor(ms / 1000));
+	const minutes = Math.floor(seconds / 60);
+	const rest = seconds % 60;
+	return minutes > 0 ? `${minutes}m ${rest}s` : `${seconds}s`;
+}
+
+async function withProgress<T>(onProgress: ProgressReporter | undefined, message: string, fn: () => Promise<T>): Promise<T> {
+	onProgress?.(message);
+	const start = Date.now();
+	const interval = setInterval(() => {
+		onProgress?.(`${message} (${formatElapsed(Date.now() - start)} elapsed)`);
+	}, 10_000);
+	try {
+		return await fn();
+	} finally {
+		clearInterval(interval);
+	}
+}
+
+async function acquireRepoLock(config: ExtensionConfig, owner: string, repo: string, onProgress?: ProgressReporter): Promise<RepoLock> {
 	ensureDir(join(config.githubCacheDir, owner));
 	const lockPath = join(config.githubCacheDir, owner, `${repo}.lock`);
 	const start = Date.now();
@@ -32,6 +53,7 @@ async function acquireRepoLock(config: ExtensionConfig, owner: string, repo: str
 			try {
 				const stat = statSync(lockPath);
 				if (Date.now() - stat.mtimeMs > REPO_LOCK_STALE_MS) {
+					onProgress?.(`Removing stale GitHub cache lock for ${owner}/${repo}...`);
 					await rm(lockPath, { recursive: true, force: true });
 					continue;
 				}
@@ -41,7 +63,11 @@ async function acquireRepoLock(config: ExtensionConfig, owner: string, repo: str
 			if (!warned && Date.now() - start > 5_000) {
 				warned = true;
 				const ownerInfo = await readFile(join(lockPath, "owner.json"), "utf8").catch(() => "another pi agent");
-				console.error(`Waiting for GitHub cache lock for ${owner}/${repo} held by ${ownerInfo.trim()}`);
+				const message = `Waiting for GitHub cache lock for ${owner}/${repo} held by ${ownerInfo.trim()}`;
+				onProgress?.(`${message} (${formatElapsed(Date.now() - start)} elapsed)`);
+				console.error(message);
+			} else if (warned) {
+				onProgress?.(`Waiting for GitHub cache lock for ${owner}/${repo} (${formatElapsed(Date.now() - start)} elapsed)`);
 			}
 			await sleep(500 + Math.floor(Math.random() * 500));
 		}
@@ -54,8 +80,8 @@ async function releaseRepoLock(lock: RepoLock) {
 	});
 }
 
-async function withRepoLock<T>(config: ExtensionConfig, owner: string, repo: string, fn: () => Promise<T>): Promise<T> {
-	const lock = await acquireRepoLock(config, owner, repo);
+async function withRepoLock<T>(config: ExtensionConfig, owner: string, repo: string, onProgress: ProgressReporter | undefined, fn: () => Promise<T>): Promise<T> {
+	const lock = await acquireRepoLock(config, owner, repo, onProgress);
 	try {
 		return await fn();
 	} finally {
@@ -123,57 +149,59 @@ export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
 	}
 }
 
-async function git(args: string[], cwd?: string) {
-	const { stdout } = await execFileAsync("git", args, { cwd, windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+async function git(args: string[], cwd?: string, signal?: AbortSignal) {
+	const { stdout } = await execFileAsync("git", args, { cwd, windowsHide: true, maxBuffer: 10 * 1024 * 1024, signal } as any);
 	return stdout.trim();
 }
 
-async function ensureRepo(config: ExtensionConfig, owner: string, repo: string) {
+async function ensureRepo(config: ExtensionConfig, owner: string, repo: string, signal?: AbortSignal, onProgress?: ProgressReporter) {
 	const repoDir = ensureDir(join(config.githubCacheDir, owner, repo));
 	if (!existsSync(join(repoDir, ".git"))) {
-		await git([
-			"clone",
-			"--filter=blob:none",
-			"--origin",
-			"origin",
-			`https://github.com/${owner}/${repo}.git`,
-			repoDir,
-		]);
+		await withProgress(onProgress, `Cloning ${owner}/${repo} into cache (first time; large repos can take several minutes)...`, () =>
+			git([
+				"clone",
+				"--filter=blob:none",
+				"--origin",
+				"origin",
+				`https://github.com/${owner}/${repo}.git`,
+				repoDir,
+			], undefined, signal),
+		);
 	} else {
 		await cleanupStaleGitIndexLock(repoDir);
-		await git(["fetch", "--all", "--tags", "--prune"], repoDir);
+		await withProgress(onProgress, `Refreshing cached GitHub repo ${owner}/${repo}...`, () => git(["fetch", "--all", "--tags", "--prune"], repoDir, signal));
 	}
 	return repoDir;
 }
 
-async function getRefs(repoDir: string): Promise<string[]> {
-	const raw = await git(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "refs/tags"], repoDir);
+async function getRefs(repoDir: string, signal?: AbortSignal): Promise<string[]> {
+	const raw = await git(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "refs/tags"], repoDir, signal);
 	return raw
 		.split(/\r?\n/)
 		.map((s) => s.replace(/^origin\//, ""))
 		.filter(Boolean);
 }
 
-async function getDefaultRef(repoDir: string): Promise<string> {
-	const ref = await git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoDir).catch(() => "origin/main");
+async function getDefaultRef(repoDir: string, signal?: AbortSignal): Promise<string> {
+	const ref = await git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoDir, signal).catch(() => "origin/main");
 	return ref.replace(/^origin\//, "");
 }
 
-async function resolveRefAndPath(repoDir: string, mode: "root" | "tree" | "blob" | "raw", rest: string[]) {
-	if (mode === "root") return { ref: await getDefaultRef(repoDir), relPath: "" };
-	const refs = new Set(await getRefs(repoDir));
+async function resolveRefAndPath(repoDir: string, mode: "root" | "tree" | "blob" | "raw", rest: string[], signal?: AbortSignal) {
+	if (mode === "root") return { ref: await getDefaultRef(repoDir, signal), relPath: "" };
+	const refs = new Set(await getRefs(repoDir, signal));
 	for (let i = rest.length; i >= 1; i--) {
 		const maybeRef = rest.slice(0, i).join("/");
 		if (refs.has(maybeRef)) {
 			return { ref: maybeRef, relPath: rest.slice(i).join("/") };
 		}
 	}
-	return { ref: rest[0] || (await getDefaultRef(repoDir)), relPath: rest.slice(1).join("/") };
+	return { ref: rest[0] || (await getDefaultRef(repoDir, signal)), relPath: rest.slice(1).join("/") };
 }
 
-async function checkout(repoDir: string, ref: string) {
+async function checkout(repoDir: string, ref: string, signal?: AbortSignal, onProgress?: ProgressReporter) {
 	await cleanupStaleGitIndexLock(repoDir);
-	await git(["checkout", "--force", ref], repoDir);
+	await withProgress(onProgress, `Checking out ${ref}...`, () => git(["checkout", "--force", ref], repoDir, signal));
 }
 
 async function fetchGitHubJson(apiPath: string) {
@@ -232,16 +260,17 @@ async function handleGitHubPullOrIssue(parsed: Extract<ParsedGitHubUrl, { mode: 
 	return { kind: "github", url, owner: parsed.owner, repo: parsed.repo, preview };
 }
 
-export async function handleGitHubUrl(config: ExtensionConfig, url: string): Promise<GitHubResolution> {
+export async function handleGitHubUrl(config: ExtensionConfig, url: string, onProgress?: ProgressReporter, signal?: AbortSignal): Promise<GitHubResolution> {
 	const parsed = parseGitHubUrl(url);
 	if (!parsed) throw new Error("Not a GitHub URL");
 	if (parsed.mode === "pull" || parsed.mode === "issue") return handleGitHubPullOrIssue(parsed, url);
 
 	const sourceUrl = parsed as Extract<ParsedGitHubUrl, { mode: "root" | "tree" | "blob" | "raw" }>;
-	return await withRepoLock(config, sourceUrl.owner, sourceUrl.repo, async () => {
-		const repoDir = await ensureRepo(config, sourceUrl.owner, sourceUrl.repo);
-		const resolved = await resolveRefAndPath(repoDir, sourceUrl.mode, sourceUrl.rest);
-		await checkout(repoDir, resolved.ref);
+	return await withRepoLock(config, sourceUrl.owner, sourceUrl.repo, onProgress, async () => {
+		const repoDir = await ensureRepo(config, sourceUrl.owner, sourceUrl.repo, signal, onProgress);
+		onProgress?.(`Resolving ref/path for ${sourceUrl.owner}/${sourceUrl.repo}...`);
+		const resolved = await resolveRefAndPath(repoDir, sourceUrl.mode, sourceUrl.rest, signal);
+		await checkout(repoDir, resolved.ref, signal, onProgress);
 
 		const localPath = resolved.relPath ? join(repoDir, resolved.relPath) : repoDir;
 		let preview = "";
@@ -254,7 +283,8 @@ export async function handleGitHubUrl(config: ExtensionConfig, url: string): Pro
 		} else if (existsSync(localPath) && statSync(localPath).isDirectory()) {
 			preview = [`Directory: ${resolved.relPath}`, `Ref: ${resolved.ref}`, `Local path: ${localPath}`, "", listTree(localPath, 140, 2).join("\n")].join("\n");
 		} else {
-			const text = readMaybe(localPath) ?? (await git(["show", `${resolved.ref}:${resolved.relPath}`], repoDir).catch(() => ""));
+			onProgress?.(`Reading ${resolved.relPath} from ${sourceUrl.owner}/${sourceUrl.repo}...`);
+			const text = readMaybe(localPath) ?? (await git(["show", `${resolved.ref}:${resolved.relPath}`], repoDir, signal).catch(() => ""));
 			preview = [`File: ${resolved.relPath}`, `Ref: ${resolved.ref}`, `Local path: ${localPath}`, "", text.slice(0, 20000)].join("\n");
 		}
 

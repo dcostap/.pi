@@ -32,7 +32,7 @@ const MIN_CHARS_FOR_TLDR = 5000;
 
 type GitHubModule = {
 	parseGitHubUrl: (url: string) => unknown;
-	handleGitHubUrl: (config: ExtensionConfig, url: string) => Promise<any>;
+	handleGitHubUrl: (config: ExtensionConfig, url: string, onProgress?: (message: string) => void, signal?: AbortSignal) => Promise<any>;
 };
 
 async function loadGitHubModule(): Promise<GitHubModule> {
@@ -388,7 +388,12 @@ export async function fetchUrl(
 	const github = githubModule.parseGitHubUrl(url);
 	if (github) {
 		onUpdate?.({ content: [{ type: "text", text: "Handling GitHub URL..." }] });
-		const gh = await githubModule.handleGitHubUrl(config, url);
+		const gh = await githubModule.handleGitHubUrl(
+			config,
+			url,
+			(message: string) => onUpdate?.({ content: [{ type: "text", text: message }] }),
+			signal,
+		);
 		const details = {
 			method: gh.kind,
 			url,
@@ -409,7 +414,9 @@ export async function fetchUrl(
 
 	let result: FetchResult;
 	try {
+		onUpdate?.({ content: [{ type: "text", text: "Fetching URL locally..." }] });
 		result = (await localFetch(url, config, signal)) as FetchResult;
+		onUpdate?.({ content: [{ type: "text", text: "Extracted local content. Assessing quality..." }] });
 	} catch (error) {
 		const artifactDir = makeArtifactDir(config.fetchesDir, "fetch", url);
 		result = {
@@ -451,6 +458,7 @@ export async function fetchUrl(
 		headers: (result.meta?.headers as Record<string, string> | undefined) || undefined,
 	};
 
+	onUpdate?.({ content: [{ type: "text", text: prompt ? "Answering focused question from extracted content..." : "Summarizing extracted content..." }] });
 	let processed = await processExtractedContentWithSpark(result.content, ctx, manualReasons, signal, prompt, sparkContext);
 	result.quality = processed.quality;
 	result.qualityReason = processed.reason;
