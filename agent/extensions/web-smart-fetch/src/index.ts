@@ -47,6 +47,27 @@ function textOutput(result: any): string {
 		.join("\n");
 }
 
+type FirecrawlModule = {
+	getFirecrawlClient: (config: ReturnType<typeof loadConfig>) => unknown;
+	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
+	searchWithFirecrawl: (client: unknown, query: string, limit?: number) => Promise<unknown>;
+	crawlWithFirecrawl: (client: unknown, url: string, limit?: number) => Promise<unknown>;
+};
+
+async function loadFirecrawlModule(): Promise<FirecrawlModule> {
+	const mod: any = await import("./firecrawl.ts");
+	const exports = mod?.getFirecrawlClient ? mod : mod?.default?.getFirecrawlClient ? mod.default : undefined;
+	if (
+		typeof exports?.getFirecrawlClient !== "function" ||
+		typeof exports?.scrapeWithFirecrawl !== "function" ||
+		typeof exports?.searchWithFirecrawl !== "function" ||
+		typeof exports?.crawlWithFirecrawl !== "function"
+	) {
+		throw new Error("Firecrawl support failed to load: missing expected helper exports");
+	}
+	return exports as FirecrawlModule;
+}
+
 function renderErrorResult(result: any, theme: any, context: any): Text | undefined {
 	if (!context.isError && !result?.isError) return undefined;
 	const message =
@@ -87,7 +108,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "The URL to fetch" }),
-			prompt: Type.Optional(Type.String({ description: "Optional focused question about the page. When provided and Firecrawl is configured, fetch_url uses Firecrawl's question format." })),
+			prompt: Type.Optional(Type.String({ description: "Optional focused question about the page. fetch_url answers it from extracted content; weak extraction may still use Firecrawl fallback if configured." })),
 		}),
 		renderCall(args, theme, context) {
 			const label = theme.fg("toolTitle", theme.bold("fetch_url"));
@@ -172,7 +193,8 @@ export default function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		}, 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const { getFirecrawlClient, searchWithFirecrawl } = await import("./firecrawl.ts");
+			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
+			const { getFirecrawlClient, searchWithFirecrawl } = await loadFirecrawlModule();
 			const client = getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Searching with Firecrawl..." }] });
@@ -229,7 +251,8 @@ export default function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		},
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const { crawlWithFirecrawl, getFirecrawlClient } = await import("./firecrawl.ts");
+			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
+			const { crawlWithFirecrawl, getFirecrawlClient } = await loadFirecrawlModule();
 			const client = getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Crawling with Firecrawl..." }] });

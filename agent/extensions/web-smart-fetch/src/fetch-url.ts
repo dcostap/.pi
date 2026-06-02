@@ -1,5 +1,5 @@
 import { Readability } from "@mozilla/readability";
-import { JSDOM } from "jsdom";
+import { JSDOM, VirtualConsole } from "jsdom";
 import pdf from "pdf-parse";
 import TurndownService from "turndown";
 import { execFile } from "node:child_process";
@@ -7,12 +7,22 @@ import { readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionConfig } from "./config.ts";
-import { getFirecrawlClient, scrapeWithFirecrawl } from "./firecrawl.ts";
 import { processExtractedContentWithSpark } from "./summarize.ts";
 import { makeArtifactDir, saveBuffer, saveText, safeName, stripMarkdown } from "./utils.ts";
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const execFileAsync = promisify(execFile);
+
+function createQuietDom(html: string, url: string): JSDOM {
+	// jsdom forwards parse/runtime diagnostics to the real console by default.
+	// Some sites (notably Reddit) include CSS that jsdom cannot parse, and the
+	// resulting jsdomError prints an enormous raw stylesheet into pi's terminal.
+	// Use a private virtual console so extraction failures stay in tool metadata
+	// instead of leaking noisy page internals into the TUI.
+	const virtualConsole = new VirtualConsole();
+	virtualConsole.on("jsdomError", () => undefined);
+	return new JSDOM(html, { url, virtualConsole });
+}
 
 type FetchResult = {
 	method: "github" | "direct" | "jina" | "firecrawl";
@@ -35,6 +45,11 @@ type GitHubModule = {
 	handleGitHubUrl: (config: ExtensionConfig, url: string, onProgress?: (message: string) => void, signal?: AbortSignal) => Promise<any>;
 };
 
+type FirecrawlModule = {
+	getFirecrawlClient: (config: ExtensionConfig) => unknown;
+	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
+};
+
 async function loadGitHubModule(): Promise<GitHubModule> {
 	const mod: any = await import("./github.ts");
 	const githubExports = mod?.parseGitHubUrl ? mod : mod?.default;
@@ -44,6 +59,17 @@ async function loadGitHubModule(): Promise<GitHubModule> {
 		throw new Error("GitHub fetch support failed to load: missing parseGitHubUrl/handleGitHubUrl exports");
 	}
 	return { parseGitHubUrl, handleGitHubUrl };
+}
+
+async function loadFirecrawlModule(): Promise<FirecrawlModule> {
+	const mod: any = await import("./firecrawl.ts");
+	const firecrawlExports = mod?.getFirecrawlClient ? mod : mod?.default?.getFirecrawlClient ? mod.default : undefined;
+	const getFirecrawlClient = firecrawlExports?.getFirecrawlClient;
+	const scrapeWithFirecrawl = firecrawlExports?.scrapeWithFirecrawl;
+	if (typeof getFirecrawlClient !== "function" || typeof scrapeWithFirecrawl !== "function") {
+		throw new Error("Firecrawl support failed to load: missing getFirecrawlClient/scrapeWithFirecrawl exports");
+	}
+	return { getFirecrawlClient, scrapeWithFirecrawl };
 }
 
 function isProbablyPdf(contentType: string, url: string): boolean {
@@ -263,7 +289,7 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 		}
 		const html = curl.body.toString("utf8");
 		files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
-		const dom = new JSDOM(html, { url: curl.finalUrl });
+		const dom = createQuietDom(html, curl.finalUrl);
 		const reader = new Readability(dom.window.document);
 		const article = reader.parse();
 		const readabilityHtml = article?.content || "";
@@ -329,7 +355,7 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 
 	const html = await res.text();
 	files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
-	const dom = new JSDOM(html, { url: finalUrl });
+	const dom = createQuietDom(html, finalUrl);
 	const reader = new Readability(dom.window.document);
 	const article = reader.parse();
 	const readabilityHtml = article?.content || "";
@@ -410,7 +436,8 @@ export async function fetchUrl(
 		};
 	}
 
-	const client = getFirecrawlClient(config);
+	const firecrawl = config.firecrawlApiKey ? await loadFirecrawlModule() : undefined;
+	const client = firecrawl?.getFirecrawlClient(config);
 
 	let result: FetchResult;
 	try {
@@ -496,9 +523,9 @@ export async function fetchUrl(
 	}
 
 	if (processed.quality === "WEAK") {
-		if (client) {
+		if (client && firecrawl) {
 			onUpdate?.({ content: [{ type: "text", text: "Escalating to Firecrawl..." }] });
-			const scraped: any = await scrapeWithFirecrawl(client, result.url);
+			const scraped: any = await firecrawl.scrapeWithFirecrawl(client, result.url);
 			const fcMarkdown = scraped?.markdown || scraped?.data?.markdown || "";
 			const fcHtml = scraped?.html || scraped?.data?.html || "";
 			const fcTitle = scraped?.metadata?.title || scraped?.data?.metadata?.title;

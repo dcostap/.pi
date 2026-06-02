@@ -2,7 +2,7 @@
 
 Pi extension for:
 
-- `fetch_url` — one smart URL fetch tool with GitHub-special handling and optional Firecrawl question mode
+- `fetch_url` — one smart URL fetch tool with GitHub-special handling and focused-question support
 - `firecrawl_search` — Firecrawl-backed search
 - `firecrawl_crawl` — Firecrawl-backed site crawl
 
@@ -15,7 +15,7 @@ Pi extension for:
   - Firecrawl if configured
 - oversized results auto-summarize with:
   - `openai-codex/gpt-5.3-codex-spark`
-- if `fetch_url` gets a `prompt` and Firecrawl is configured, it uses Firecrawl question format first
+- if `fetch_url` gets a `prompt`, it answers from extracted content; weak extraction escalates to Firecrawl when configured
 - full artifacts always saved locally
 
 ## Config
