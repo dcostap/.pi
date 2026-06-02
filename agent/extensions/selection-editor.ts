@@ -68,6 +68,8 @@ const PASTE_MARKER_LINE_THRESHOLD = 10;
 const PASTE_MARKER_CHAR_THRESHOLD = 1_000;
 const LARGE_PASTE_DIR = join(tmpdir(), "pi-paste-dumps");
 const KEY_DEBUG_LOG = join(tmpdir(), "pi-selection-editor-keys.log");
+const ENABLE_KEY_DEBUG_LOG = process.env.PI_SELECTION_EDITOR_KEY_DEBUG === "1";
+const KEY_DEBUG_PREVIEW_CHARS = 160;
 
 class SelectionEditor extends CustomEditor {
 	private selectionAnchor: Pos | null = null;
@@ -121,9 +123,10 @@ class SelectionEditor extends CustomEditor {
 
 	private insertFilePathAtCursor(filePath: string, pushUndo: boolean): void {
 		const normalizedPath = filePath.replace(/\\/g, "/");
+		const fileReference = `@${normalizedPath}`;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const charBeforeCursor = this.state.cursorCol > 0 ? currentLine[this.state.cursorCol - 1] : "";
-		const textToInsert = charBeforeCursor && /\w/.test(charBeforeCursor) ? ` ${normalizedPath}` : normalizedPath;
+		const textToInsert = charBeforeCursor && !/\s/.test(charBeforeCursor) ? ` ${fileReference}` : fileReference;
 
 		this.i.cancelAutocomplete();
 		if (pushUndo) this.i.pushUndoSnapshot();
@@ -163,6 +166,34 @@ class SelectionEditor extends CustomEditor {
 	private textWithMarkdownSeparators(text: string): string {
 		const normalizedText = text.replace(/\r\n?/g, "\n");
 		return `---\n${normalizedText}\n---`;
+	}
+
+	private handleUnbracketedBulkText(data: string): boolean {
+		// If bracketed paste is unavailable or temporarily disabled, terminals may
+		// deliver a whole paste as one printable chunk. Without this guard the base
+		// editor treats that chunk like one typed character, which can visibly dump
+		// raw pasted text into the prompt.
+		if (!data || data.includes("\x1b")) return false;
+		if (data.length <= PASTE_MARKER_CHAR_THRESHOLD && !data.includes("\n") && !data.includes("\r")) return false;
+
+		let handled = false;
+		if (this.shouldDumpPasteToFile(data)) {
+			try {
+				handled = this.handleBracketedPaste(data);
+			} catch {
+				handled = false;
+			}
+		}
+		if (handled) return true;
+
+		const textToPaste = this.shouldWrapPasteInMarkdownSeparators(data)
+			? this.textWithMarkdownSeparators(data)
+			: data;
+		if (this.hasSelection()) this.deleteSelection(false);
+		this.clearSelection();
+		this.i.handlePaste(textToPaste);
+		this.tui.requestRender();
+		return true;
 	}
 
 	private handleCustomPasteInput(data: string): boolean {
@@ -381,13 +412,17 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	private debugKeyInput(data: string): void {
+		if (!ENABLE_KEY_DEBUG_LOG) return;
 		try {
 			const kittyPrintable = decodeKittyPrintable(data);
+			const preview = data.length > KEY_DEBUG_PREVIEW_CHARS ? `${data.slice(0, KEY_DEBUG_PREVIEW_CHARS)}…` : data;
+			const hex = Buffer.from(data, "utf8").toString("hex");
 			const record = {
 				t: Date.now(),
-				data: JSON.stringify(data),
-				chars: [...data].map((char) => `U+${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`),
-				hex: Buffer.from(data, "utf8").toString("hex"),
+				length: data.length,
+				preview: JSON.stringify(preview),
+				chars: [...preview].map((char) => `U+${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`),
+				hexPreview: hex.length > KEY_DEBUG_PREVIEW_CHARS * 2 ? `${hex.slice(0, KEY_DEBUG_PREVIEW_CHARS * 2)}…` : hex,
 				kittyPrintable,
 				isKeyRelease: isKeyRelease(data),
 				isRawEnye: data === "ñ" || data === "Ñ",
@@ -699,6 +734,7 @@ class SelectionEditor extends CustomEditor {
 		this.debugKeyInput(data);
 		if (isKeyRelease(data)) return;
 		if (this.handleCustomPasteInput(data)) return;
+		if (this.handleUnbracketedBulkText(data)) return;
 		if (this.shouldDropAhkLeakedAltEnye(data)) return;
 		if (this.shouldDropSuppressedRawEnye(data)) return;
 
