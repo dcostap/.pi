@@ -168,34 +168,6 @@ class SelectionEditor extends CustomEditor {
 		return `---\n${normalizedText}\n---`;
 	}
 
-	private handleUnbracketedBulkText(data: string): boolean {
-		// If bracketed paste is unavailable or temporarily disabled, terminals may
-		// deliver a whole paste as one printable chunk. Without this guard the base
-		// editor treats that chunk like one typed character, which can visibly dump
-		// raw pasted text into the prompt.
-		if (!data || data.includes("\x1b")) return false;
-		if (data.length <= PASTE_MARKER_CHAR_THRESHOLD && !data.includes("\n") && !data.includes("\r")) return false;
-
-		let handled = false;
-		if (this.shouldDumpPasteToFile(data)) {
-			try {
-				handled = this.handleBracketedPaste(data);
-			} catch {
-				handled = false;
-			}
-		}
-		if (handled) return true;
-
-		const textToPaste = this.shouldWrapPasteInMarkdownSeparators(data)
-			? this.textWithMarkdownSeparators(data)
-			: data;
-		if (this.hasSelection()) this.deleteSelection(false);
-		this.clearSelection();
-		this.i.handlePaste(textToPaste);
-		this.tui.requestRender();
-		return true;
-	}
-
 	private handleCustomPasteInput(data: string): boolean {
 		if (data.includes("\x1b[200~")) {
 			this.customPasteInProgress = true;
@@ -734,7 +706,6 @@ class SelectionEditor extends CustomEditor {
 		this.debugKeyInput(data);
 		if (isKeyRelease(data)) return;
 		if (this.handleCustomPasteInput(data)) return;
-		if (this.handleUnbracketedBulkText(data)) return;
 		if (this.shouldDropAhkLeakedAltEnye(data)) return;
 		if (this.shouldDropSuppressedRawEnye(data)) return;
 
