@@ -96,3 +96,21 @@ export function readMaybe(path: string): string | undefined {
 export function tempFile(name: string): string {
 	return join(tmpdir(), name);
 }
+
+// Keep a default export as a compatibility shim for loaders/transpilers that
+// rewrite named imports from .ts modules as default-property access.
+export default {
+	sha1,
+	safeName,
+	ensureDir,
+	makeArtifactDir,
+	saveText,
+	saveBuffer,
+	saveJson,
+	truncate,
+	preview,
+	stripMarkdown,
+	listTree,
+	readMaybe,
+	tempFile,
+};

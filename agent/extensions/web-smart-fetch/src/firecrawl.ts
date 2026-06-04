@@ -7,8 +7,15 @@ type FirecrawlConstructor = new (options?: { apiKey?: string | null; apiUrl?: st
 
 function getFirecrawlConstructor(): FirecrawlConstructor {
 	const sdk: any = FirecrawlSdk;
-	const ctor = sdk?.default ?? sdk?.Firecrawl ?? sdk;
-	if (typeof ctor !== "function") {
+	const candidates = [
+		sdk?.Firecrawl,
+		sdk?.default?.Firecrawl,
+		sdk?.default?.default,
+		sdk?.default,
+		sdk,
+	];
+	const ctor = candidates.find((candidate) => typeof candidate === "function");
+	if (!ctor) {
 		throw new Error("Firecrawl SDK failed to load: missing Firecrawl constructor export");
 	}
 	return ctor as FirecrawlConstructor;
