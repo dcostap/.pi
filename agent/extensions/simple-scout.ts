@@ -1,4 +1,4 @@
-import { complete } from "@earendil-works/pi-ai";
+import { stream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -17,6 +17,9 @@ const MODEL_CALL_TIMEOUT_MS = 90_000;
 const HEARTBEAT_MS = 5_000;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_TOTAL_ERRORS = 15;
+const FINAL_PREVIEW_LINES = 18;
+const FINAL_PREVIEW_CHARS = 4_000;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 function clean(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
@@ -32,8 +35,22 @@ function oneLine(value: unknown, max = 100): string {
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+function estimateTokens(text: string): number {
+	return Math.max(0, Math.ceil(text.length / 4));
+}
+
+function formatTokens(tokens: number): string {
+	if (tokens < 1000) return String(Math.round(tokens));
+	const thousands = tokens / 1000;
+	return thousands < 10 ? `${Number(thousands.toFixed(1))}k` : `${Math.round(thousands)}k`;
+}
+
 function firstTextContent(result: any): string {
 	return String(result?.content?.[0]?.text || "").trim();
+}
+
+function spinner(): string {
+	return SPINNER_FRAMES[Math.floor(Date.now() / 120) % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
 }
 
 function scoutHeader(args: any, theme: any, status?: string): string {
@@ -47,6 +64,44 @@ function patchScoutHeader(component: Component | undefined, args: any, theme: an
 	if (component instanceof Text) {
 		component.setText(scoutHeader(args, theme, status));
 	}
+}
+
+function renderFinalOutput(text: string, expanded: boolean, theme: any): string {
+	const trimmed = text.trim();
+	if (expanded) return trimmed;
+	const lines = trimmed.split("\n");
+	let preview = lines.slice(0, FINAL_PREVIEW_LINES).join("\n");
+	if (preview.length > FINAL_PREVIEW_CHARS) preview = `${preview.slice(0, FINAL_PREVIEW_CHARS).trimEnd()}…`;
+	const hiddenLines = Math.max(0, lines.length - preview.split("\n").length);
+	const hiddenChars = Math.max(0, trimmed.length - preview.length);
+	if (hiddenLines > 0 || hiddenChars > 0) {
+		preview += theme.fg("muted", `\n... (${hiddenLines} more lines, ${hiddenChars.toLocaleString()} more chars, Ctrl+O to expand)`);
+	}
+	return preview;
+}
+
+function extractResponseText(content: Array<{ type: string; text?: string }>): string {
+	return clean(content.filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n"));
+}
+
+async function streamScoutResponse(model: any, messages: any[], auth: any, signal: AbortSignal, onDelta: (raw: string) => void): Promise<string> {
+	const events = stream(model, { messages }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: MAX_OUTPUT_TOKENS, reasoningEffort: "minimal", signal } as any);
+	let raw = "";
+	for await (const event of events) {
+		if (event.type === "text_delta") {
+			raw += event.delta;
+			onDelta(raw);
+			continue;
+		}
+		if (event.type === "done") {
+			raw = extractResponseText(event.message.content as any) || raw;
+			break;
+		}
+		if (event.type === "error") {
+			throw new Error(event.error?.errorMessage || "simple_scout stream failed");
+		}
+	}
+	return clean(raw);
 }
 
 function stringifyAnswer(value: unknown): string {
@@ -229,15 +284,21 @@ export default function (pi: ExtensionAPI) {
 			component.setText(scoutHeader(args, theme));
 			return component;
 		},
-		renderResult(result, { isPartial }, theme, context) {
+		renderResult(result, { expanded, isPartial }, theme, context) {
 			const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			if (isPartial) {
-				const status = oneLine(firstTextContent(result) || "simple_scout running…", 180);
-				component.setText(theme.fg("warning", status));
-				patchScoutHeader(context.state?.callComponent as Component | undefined, context.args, theme, `· ${status.replace(/^simple_scout\s*/, "")}`);
+				const rawStatus = firstTextContent(result) || "simple_scout running…";
+				const status = oneLine(rawStatus, 180);
+				const statusWithoutName = status.replace(/^simple_scout\s*/, "");
+				const running = `${theme.fg("accent", spinner())} ${theme.fg("warning", status)}`;
+				component.setText(running);
+				patchScoutHeader(context.state?.callComponent as Component | undefined, context.args, theme, `· ${spinner()} ${statusWithoutName}`);
 			} else {
 				patchScoutHeader(context.state?.callComponent as Component | undefined, context.args, theme);
-				component.setText(`${theme.fg("success", "✓ simple_scout")} ${theme.fg("dim", oneLine(result?.details?.model || MODEL_ID))}\n\n${firstTextContent(result)}`);
+				const output = firstTextContent(result);
+				const outputTokens = estimateTokens(output);
+				const tokenDisplay = outputTokens > 0 ? ` ${theme.fg("dim", `↓${formatTokens(outputTokens)}`)}` : "";
+				component.setText(`${theme.fg("success", "✓ simple_scout")} ${theme.fg("dim", oneLine(result?.details?.model || MODEL_ID))}${tokenDisplay}\n\n${renderFinalOutput(output, expanded, theme)}`);
 			}
 			return component;
 		},
@@ -272,20 +333,25 @@ export default function (pi: ExtensionAPI) {
 			const used = { filesRead: [] as string[], greps: [] as string[], lists: [] as string[] };
 			for (let round = 1; round <= MAX_ROUNDS; round += 1) {
 				const startedAt = Date.now();
-				onUpdate?.({ content: [{ type: "text", text: "simple_scout thinking…" }] });
+				const inputTokens = estimateTokens(JSON.stringify(messages));
+				let lastRawTokens = 0;
+				onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ↑${formatTokens(inputTokens)} ↓0` }] });
 				const heartbeat = setInterval(() => {
 					const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-					onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ${seconds}s` }] });
+					onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ${seconds}s ↑${formatTokens(inputTokens)} ↓${formatTokens(lastRawTokens)}` }] });
 				}, HEARTBEAT_MS);
 				const childSignal = makeChildSignal(signal);
-				let response: any;
+				let raw = "";
 				try {
-					response = await complete(model, { messages }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: MAX_OUTPUT_TOKENS, reasoningEffort: "minimal", signal: childSignal.signal } as any);
+					raw = await streamScoutResponse(model, messages, auth, childSignal.signal, (partialRaw) => {
+						lastRawTokens = estimateTokens(partialRaw);
+						onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ↑${formatTokens(inputTokens)} ↓${formatTokens(lastRawTokens)}` }] });
+					});
 				} finally {
 					clearInterval(heartbeat);
 					childSignal.cleanup();
 				}
-				const raw = clean(response.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n"));
+				if (raw && lastRawTokens > 0) onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ↑${formatTokens(inputTokens)} ↓${formatTokens(lastRawTokens)}` }] });
 				const action = normalizeAction(parseJson(raw));
 				if (!action?.action || !["list", "read", "grep", "final"].includes(String(action.action))) {
 					consecutiveErrors += 1;
