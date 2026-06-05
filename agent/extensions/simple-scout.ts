@@ -13,6 +13,8 @@ const MAX_FILE_CHARS = 24_000;
 const MAX_TOTAL_OBSERVATION_CHARS = 80_000;
 const MAX_GREP_LINES = 80;
 const MAX_OUTPUT_TOKENS = 1_200;
+const MODEL_CALL_TIMEOUT_MS = 90_000;
+const HEARTBEAT_MS = 5_000;
 
 function clean(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
@@ -28,6 +30,38 @@ function oneLine(value: unknown, max = 100): string {
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+function stringifyAnswer(value: unknown): string {
+	if (value == null) return "";
+	if (typeof value === "string") return clean(value);
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	try {
+		return clean(JSON.stringify(value, null, 2));
+	} catch {
+		const text = String(value).trim();
+		return text === "[object Object]" ? "" : text;
+	}
+}
+
+function makeChildSignal(parent?: AbortSignal, timeoutMs = MODEL_CALL_TIMEOUT_MS): { signal: AbortSignal; cleanup: () => void } {
+	const controller = new AbortController();
+	let done = false;
+	const abort = () => {
+		if (!done) controller.abort(parent?.reason);
+	};
+	const timer = setTimeout(() => {
+		if (!done) controller.abort(new Error(`simple_scout model call timed out after ${Math.round(timeoutMs / 1000)}s`));
+	}, timeoutMs);
+	parent?.addEventListener("abort", abort, { once: true });
+	return {
+		signal: controller.signal,
+		cleanup: () => {
+			done = true;
+			clearTimeout(timer);
+			parent?.removeEventListener("abort", abort);
+		},
+	};
+}
+
 function parseJson(text: string): any | undefined {
 	const trimmed = text.trim();
 	const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
@@ -41,6 +75,19 @@ function parseJson(text: string): any | undefined {
 			if (!line.startsWith("{") || !line.endsWith("}")) continue;
 			try { return JSON.parse(line); } catch {}
 		}
+
+		// Spark also sometimes emits a final JSON object with raw newlines/quotes in
+		// answer, which is not valid JSON. Salvage it as a final answer instead of
+		// failing after the scout already did the work.
+		if (/"action"\s*:\s*"final"/.test(candidate) && /"answer"\s*:/.test(candidate)) {
+			const answerKey = candidate.search(/"answer"\s*:/);
+			const firstQuote = candidate.indexOf('"', candidate.indexOf(":", answerKey) + 1);
+			const confidenceMarker = candidate.search(/",\s*"confidence"\s*:/);
+			const lastQuote = confidenceMarker > firstQuote ? confidenceMarker : candidate.lastIndexOf('"');
+			const answer = firstQuote >= 0 && lastQuote > firstQuote ? candidate.slice(firstQuote + 1, lastQuote) : candidate;
+			return { action: "final", answer: answer.replace(/\\n/g, "\n").replace(/\\"/g, '"') };
+		}
+
 		const obj = candidate.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/)?.[0];
 		if (!obj) return undefined;
 		try { return JSON.parse(obj); } catch { return undefined; }
@@ -157,8 +204,20 @@ export default function (pi: ExtensionAPI) {
 			let observations = 0;
 			const used = { filesRead: [] as string[], greps: [] as string[], lists: [] as string[] };
 			for (let round = 1; round <= MAX_ROUNDS; round += 1) {
+				const startedAt = Date.now();
 				onUpdate?.({ content: [{ type: "text", text: "simple_scout thinking…" }] });
-				const response = await complete(model, { messages }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: MAX_OUTPUT_TOKENS, reasoningEffort: "minimal", signal } as any);
+				const heartbeat = setInterval(() => {
+					const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+					onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ${seconds}s` }] });
+				}, HEARTBEAT_MS);
+				const childSignal = makeChildSignal(signal);
+				let response: any;
+				try {
+					response = await complete(model, { messages }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: MAX_OUTPUT_TOKENS, reasoningEffort: "minimal", signal: childSignal.signal } as any);
+				} finally {
+					clearInterval(heartbeat);
+					childSignal.cleanup();
+				}
 				const raw = clean(response.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n"));
 				const action = parseJson(raw);
 				if (action && !action.action && typeof action.answer === "string") action.action = "final";
@@ -171,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 				else if (action.action === "final") onUpdate?.({ content: [{ type: "text", text: "simple_scout finishing…" }] });
 
 				if (action.action === "final") {
-					const answer = clean(String(action.answer || ""));
+					const answer = stringifyAnswer(action.answer);
 					const confidence = ["low", "medium", "high"].includes(String(action.confidence)) ? action.confidence : undefined;
 					return { content: [{ type: "text", text: answer || "Scout finished with no answer." }], details: { model: `${PROVIDER}/${MODEL_ID}`, confidence, ...used } };
 				}
