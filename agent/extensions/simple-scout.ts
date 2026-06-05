@@ -10,9 +10,8 @@ const PROVIDER = "openai-codex";
 const MODEL_ID = "gpt-5.3-codex-spark";
 const MAX_ROUNDS = 50;
 const MAX_FILE_CHARS = 80_000;
-const MAX_TOTAL_OBSERVATION_CHARS = 80_000;
-const MAX_GREP_LINES = 80;
-const MAX_OUTPUT_TOKENS = 1_200;
+const MAX_GREP_LINES = 200;
+const MAX_OUTPUT_TOKENS = 5_000;
 const MODEL_CALL_TIMEOUT_MS = 90_000;
 const HEARTBEAT_MS = 5_000;
 const MAX_CONSECUTIVE_ERRORS = 5;
@@ -168,8 +167,12 @@ function parseJson(text: string): any | undefined {
 			const firstQuote = candidate.indexOf('"', candidate.indexOf(":", answerKey) + 1);
 			const confidenceMarker = candidate.search(/",\s*"confidence"\s*:/);
 			const lastQuote = confidenceMarker > firstQuote ? confidenceMarker : candidate.lastIndexOf('"');
-			const answer = firstQuote >= 0 && lastQuote > firstQuote ? candidate.slice(firstQuote + 1, lastQuote) : candidate;
-			return { action: "final", answer: answer.replace(/\\n/g, "\n").replace(/\\"/g, '"') };
+			let answer = firstQuote >= 0 && lastQuote > firstQuote ? candidate.slice(firstQuote + 1, lastQuote) : candidate;
+			answer = answer.replace(/\\n/g, "\n").replace(/\\"/g, '"');
+			if (!candidate.trimEnd().endsWith("}")) {
+				answer += "\n\n[SCOUT OUTPUT TRUNCATED: the scout's final JSON response was cut off before valid completion.]";
+			}
+			return { action: "final", answer };
 		}
 
 		const obj = candidate.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/)?.[0];
@@ -327,7 +330,6 @@ export default function (pi: ExtensionAPI) {
 				`Task: ${params.task}`,
 			].join("\n") }] }];
 
-			let observations = 0;
 			let consecutiveErrors = 0;
 			let totalErrors = 0;
 			const used = { filesRead: [] as string[], greps: [] as string[], lists: [] as string[] };
@@ -393,8 +395,6 @@ export default function (pi: ExtensionAPI) {
 					observation = errorObservation(`Tool/action error: ${message}. Error ${consecutiveErrors} consecutive, ${totalErrors} total.`);
 				}
 				if (!observation.startsWith("<error>")) consecutiveErrors = 0;
-				observations += observation.length;
-				if (observations > MAX_TOTAL_OBSERVATION_CHARS) observation = `<error>Observation budget exceeded. Produce final answer from what you have.</error>`;
 				messages.push({ role: "assistant", timestamp: Date.now(), content: [{ type: "text", text: raw }] });
 				const nextInstruction = round >= MAX_ROUNDS - 2
 					? "Observation:\n" + observation + "\n\nYou should now produce a final answer from the available observations. Return strict JSON."
