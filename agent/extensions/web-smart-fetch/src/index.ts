@@ -92,6 +92,54 @@ function renderToolOutputBlock(output: string, expanded: boolean, theme: any, ma
 	return text;
 }
 
+function githubPayloadKind(output: string): { label: string; note: string } {
+	const firstLine = output.trimStart().split(/\r?\n/, 1)[0] || "";
+	if (firstLine.startsWith("File: ")) {
+		return {
+			label: "file contents preview",
+			note: "The agent received the file header plus file text from the cached checkout (tool payload capped by fetch_url).",
+		};
+	}
+	if (firstLine.startsWith("Directory: ")) {
+		return {
+			label: "directory listing",
+			note: "The agent received a listing of this folder from the cached checkout, not every file's contents.",
+		};
+	}
+	if (firstLine.startsWith("Repository: ")) {
+		return {
+			label: "repository metadata/path",
+			note: "The agent received repo/ref/local path only, not the repository contents.",
+		};
+	}
+	return {
+		label: "GitHub preview",
+		note: "The agent received the preview shown below.",
+	};
+}
+
+function renderGitHubInjectedBlock(output: string, expanded: boolean, theme: any): string {
+	const trimmed = output.trim();
+	if (!trimmed) return "";
+	const totalLines = trimmed.split("\n").length;
+	const totalChars = trimmed.length;
+	const maxChars = expanded ? 12000 : 2400;
+	const maxLines = expanded ? 160 : 14;
+	const byChars = totalChars > maxChars ? truncate(trimmed, maxChars) : trimmed;
+	const lines = byChars.split("\n");
+	const displayLines = lines.slice(0, maxLines);
+	let displayed = displayLines.join("\n");
+	const lineTruncated = lines.length > displayLines.length;
+	const charTruncated = totalChars > maxChars;
+	if (lineTruncated || charTruncated) {
+		const hint = expanded
+			? `display truncated (${totalLines} lines, ${totalChars} chars in injected payload)`
+			: `display truncated (${totalLines} lines, ${totalChars} chars in injected payload, Ctrl+O to expand)`;
+		displayed += `\n... (${hint})`;
+	}
+	return `\n\n${theme.fg("success", "Injected to agent:")}\n${theme.fg("toolOutput", displayed)}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 
@@ -127,10 +175,15 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("success", "✓");
 			if (d.method) text += ` ${theme.fg("muted", d.method)}`;
 			if (d.method === "github") {
+				const output = textOutput(result);
+				const payload = githubPayloadKind(output);
 				if (d.owner && d.repo) text += `\n${theme.fg("success", "Repository:")} ${theme.fg("accent", `${d.owner}/${d.repo}`)}`;
 				if (d.ref) text += `\n${theme.fg("success", "Ref:")} ${theme.fg("dim", String(d.ref))}`;
 				if (d.localPath) text += `\n${theme.fg("success", "Local path:")} ${theme.fg("dim", String(d.localPath))}`;
 				if (d.requestedPath) text += `\n${theme.fg("success", "Requested path:")} ${theme.fg("dim", String(d.requestedPath))}`;
+				text += `\n${theme.fg("success", "Payload:")} ${theme.fg("accent", payload.label)}`;
+				text += `\n${theme.fg("muted", payload.note)}`;
+				text += renderGitHubInjectedBlock(output, expanded, theme);
 				return renderLine(text, theme, context);
 			}
 			if (d.qualityReason || d.quality) {
