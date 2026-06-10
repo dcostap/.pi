@@ -295,24 +295,32 @@ async function navStr(cdp: CDP, sessionId: string, url?: string) {
   if (!url) throw new Error("url is required for nav");
   await cdp.send("Page.enable", {}, sessionId);
   const loadEvent = cdp.waitForEvent("Page.loadEventFired", 30000);
-  const result = await cdp.send("Page.navigate", { url }, sessionId);
-  if (result.errorText) {
+  try {
+    const result = await cdp.send("Page.navigate", { url }, sessionId);
+    if (result.errorText) throw new Error(result.errorText);
+    if (result.loaderId) await loadEvent.promise;
+    await waitForReady(cdp, sessionId, 5000);
+    return `Navigated to ${url}`;
+  } finally {
+    // If Page.navigate times out or fails before we await loadEvent.promise, cancel
+    // the pending timer/listener. Otherwise its later rejection can become an
+    // uncaught exception and take down pi.
     loadEvent.cancel();
-    throw new Error(result.errorText);
   }
-  if (result.loaderId) await loadEvent.promise;
-  else loadEvent.cancel();
-  await waitForReady(cdp, sessionId, 5000);
-  return `Navigated to ${url}`;
 }
 
 async function reloadStr(cdp: CDP, sessionId: string) {
   await cdp.send("Page.enable", {}, sessionId);
   const loadEvent = cdp.waitForEvent("Page.loadEventFired", 30000);
-  await cdp.send("Page.reload", {}, sessionId);
-  await loadEvent.promise;
-  await waitForReady(cdp, sessionId, 5000);
-  return "Reloaded page";
+  try {
+    await cdp.send("Page.reload", {}, sessionId);
+    await loadEvent.promise;
+    await waitForReady(cdp, sessionId, 5000);
+    return "Reloaded page";
+  } finally {
+    // Same cleanup as navStr: avoid orphaned load-event timers if reload fails.
+    loadEvent.cancel();
+  }
 }
 
 async function shotStr(cdp: CDP, sessionId: string, targetId: string, outputPath?: string) {
