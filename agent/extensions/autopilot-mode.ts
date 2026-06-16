@@ -31,7 +31,12 @@ function getLastAssistantText(messages: unknown[] | undefined): string | undefin
 }
 
 function isDoneMessage(text: string | undefined): boolean {
-	return text !== undefined && DONE_MESSAGES.has(text.trim());
+	if (text === undefined) return false;
+	const trimmed = text.trim();
+	for (const doneMessage of DONE_MESSAGES) {
+		if (trimmed.endsWith(doneMessage)) return true;
+	}
+	return false;
 }
 
 export default function autopilotMode(pi: ExtensionAPI): void {
