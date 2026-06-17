@@ -3,8 +3,46 @@ import { Type } from "typebox";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { Text } from "@earendil-works/pi-tui";
+
 const RUNTIME_DIR = resolve(tmpdir(), "pi-chrome-cdp");
 mkdirSync(RUNTIME_DIR, { recursive: true });
+
+// ── output size guards ──
+const MAX_INLINE_BYTES = 2_000;   // max bytes sent to LLM inline; rest goes to files
+const FIRST_LOOK_BYTES = 1_200;    // preview bytes embedded in the summary for LLM
+const MAX_SNAP_LINES = 80;         // cap AX tree lines
+
+// ── file-dumping (same pattern as web-smart-fetch) ──
+
+function makeDumpFile(label: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const safe = label.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").slice(0, 60);
+  return resolve(RUNTIME_DIR, `cdp_${ts}_${safe}`);
+}
+
+function dumpToFile(label: string, text: string): string {
+  const path = makeDumpFile(label);
+  writeFileSync(path, text, "utf8");
+  return path;
+}
+
+/** If text is larger than MAX_INLINE_BYTES, dump to a file and return a compact
+ *  summary with a first-look preview, metadata, and file path pointing the agent
+ *  to use read/grep for full inspection. Otherwise return the text as-is. */
+function maybeDump(label: string, text: string, extraMeta?: string): string {
+  if (text.length <= MAX_INLINE_BYTES) return text;
+
+  const path = dumpToFile(label, text);
+  const preview = text.slice(0, FIRST_LOOK_BYTES);
+  const lines = text.split("\n").length;
+  const kb = (text.length / 1024).toFixed(1);
+
+  let out = `${preview}\n...\n[Dumped ${kb}KB / ${lines} lines to ${path}`;
+  if (extraMeta) out += ` | ${extraMeta}`;
+  out += `]\nUse read with offset/limit on this file to inspect specific sections.`;
+  return out;
+}
 
 const chromeCdpParams = Type.Object({
   action: Type.Union([
@@ -215,6 +253,33 @@ function resolveTarget(pages: any[], query?: string) {
   throw new Error(`No tab matched '${query}'. Run action=list first.`);
 }
 
+function formatEvalError(exceptionDetails: any, expression: string): string {
+  const exc = exceptionDetails;
+  const parts: string[] = [];
+
+  // Build a meaningful error — "Uncaught" alone is useless
+  const text = typeof exc.text === "string" ? exc.text.trim() : "";
+  const desc = typeof exc.exception?.description === "string" ? exc.exception.description.trim() : "";
+  const className = typeof exc.exception?.className === "string" ? exc.exception.className.trim() : "";
+
+  if (className && className !== text) parts.push(className);
+  if (text && text !== "Uncaught" && text !== className) parts.push(text);
+  if (desc && desc !== text && desc !== className) {
+    // Truncate long descriptions but keep the gist
+    parts.push(desc.length > 400 ? desc.substring(0, 400) + "…" : desc);
+  }
+
+  // Location info
+  if (typeof exc.lineNumber === "number") {
+    const col = typeof exc.columnNumber === "number" ? `:${exc.columnNumber}` : "";
+    parts.push(`line ${exc.lineNumber}${col}`);
+  }
+
+  const detail = parts.length > 0 ? parts.join(" — ") : "Evaluation failed";
+  const exprSnippet = expression.length > 200 ? expression.substring(0, 200) + "…" : expression;
+  return `Eval failed: ${detail}\nExpression: ${exprSnippet}`;
+}
+
 async function evalStr(cdp: CDP, sessionId: string, expression: string) {
   await cdp.send("Runtime.enable", {}, sessionId);
   const result = await cdp.send("Runtime.evaluate", {
@@ -222,7 +287,9 @@ async function evalStr(cdp: CDP, sessionId: string, expression: string) {
     returnByValue: true,
     awaitPromise: true,
   }, sessionId);
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || result.exceptionDetails.exception?.description || "Evaluation failed");
+  if (result.exceptionDetails) {
+    throw new Error(formatEvalError(result.exceptionDetails, expression));
+  }
   const value = result.result?.value;
   return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value ?? "");
 }
@@ -230,31 +297,65 @@ async function evalStr(cdp: CDP, sessionId: string, expression: string) {
 async function snapshotStr(cdp: CDP, sessionId: string) {
   const { nodes } = await cdp.send("Accessibility.getFullAXTree", {}, sessionId);
   const lines: string[] = [];
+  let skipped = 0;
+  let total = 0;
   for (const node of nodes) {
+    total++;
     const role = node.role?.value || "";
     const name = node.name?.value ?? "";
     const value = node.value?.value;
-    if (role === "none" || role === "generic") continue;
-    if (name === "" && (value === "" || value == null)) continue;
+    if (role === "none" || role === "generic") { skipped++; continue; }
+    if (name === "" && (value === "" || value == null)) { skipped++; continue; }
     const depth = Math.min((node.backendDOMNodeId ? 1 : 0) + ((node.childIds?.length || 0) ? 0 : 0), 10);
     let line = `${"  ".repeat(depth)}[${role}]`;
     if (name) line += ` ${name}`;
     if (!(value === "" || value == null)) line += ` = ${JSON.stringify(value)}`;
     lines.push(line);
+    if (lines.length >= MAX_SNAP_LINES) break;
   }
-  return lines.join("\n");
+  const header = `${lines.length} nodes shown` + (total > lines.length ? ` (${total} total, ${skipped} skipped)` : "");
+  return header + "\n" + lines.join("\n");
 }
 
 async function htmlStr(cdp: CDP, sessionId: string, selector?: string) {
   const expr = selector
     ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || 'Element not found'`
     : "document.documentElement.outerHTML";
-  return evalStr(cdp, sessionId, expr);
+  const raw = await evalStr(cdp, sessionId, expr);
+
+  // HTML is always too big — dump to file, return stats + path
+  let stats = "";
+  try {
+    const s = await evalStr(cdp, sessionId,
+      `JSON.stringify({bodyChildren: document.body?.children.length??0, totalElements: document.querySelectorAll('*').length, bodyTextChars: (document.body?.textContent||'').length})`
+    );
+    const parsed = JSON.parse(s);
+    stats = `body:${parsed.bodyChildren} kids, ${parsed.totalElements} elements, ${parsed.bodyTextChars} text chars`;
+  } catch { /* best-effort */ }
+
+  const label = selector ? `html_sel_${selector.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40)}` : "html_full";
+  return maybeDump(label + ".html", raw, stats);
 }
 
 async function netStr(cdp: CDP, sessionId: string) {
-  const raw = await evalStr(cdp, sessionId, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name.substring(0, 160), type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize })))`);
-  return JSON.parse(raw).map((e: any) => `${String(e.duration).padStart(5)}ms  ${String(e.size || '?').padStart(8)}B  ${String(e.type || '').padEnd(12)}  ${e.name}`).join("\n");
+  const raw = await evalStr(cdp, sessionId, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name.substring(0, 200), type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize })))`);
+  const entries: any[] = JSON.parse(raw);
+  if (entries.length === 0) return "No resource entries";
+  const totalSize = entries.reduce((s: number, e: any) => s + (typeof e.size === "number" ? e.size : 0), 0);
+  const totalMs = entries.reduce((s: number, e: any) => s + e.duration, 0);
+  const summary = `${entries.length} resources, ${formatBytes(totalSize)}, ${totalMs.toFixed(0)}ms total`;
+  const table = entries.map((e: any) =>
+    `${String(e.duration).padStart(5)}ms  ${formatBytes(e.size).padStart(8)}  ${String(e.type || "").padEnd(12)}  ${e.name}`
+  ).join("\n");
+  const full = `${summary}\n${table}`;
+  return maybeDump("network.txt", full, `top resources by size/type`);
+}
+
+function formatBytes(n: number | undefined | null): string {
+  if (n == null || n === 0) return "   0 B";
+  if (n < 1024) return `${String(n).padStart(4)} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1).padStart(4)}KB`;
+  return `${(n / 1048576).toFixed(1).padStart(4)}MB`;
 }
 
 async function clickStr(cdp: CDP, sessionId: string, selector?: string) {
@@ -371,19 +472,25 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       "Use chrome_cdp when the user wants to inspect or control their already-open Chrome instance.",
       "Use chrome_cdp action=list before other chrome_cdp actions when you need a tab id.",
       "Use chrome_cdp action=net to inspect resource URLs loaded by the current page.",
+      "chrome_cdp dumps large outputs (>2KB) to temp files to protect context. When you see [Dumped … to C:\\...], use read with offset/limit to inspect the file instead of re-running chrome_cdp.",
     ],
     parameters: chromeCdpParams,
     async execute(_toolCallId, params: ChromeCdpParams) {
       if (params.action === "list") {
+        const started = Date.now();
         const cdp = await getSharedCdp();
         const pages = await getPages(cdp);
         return {
           content: [{ type: "text", text: formatPages(pages) || "No pages found." }],
-          details: { count: pages.length },
+          details: { action: "list", count: pages.length, elapsedMs: Date.now() - started },
         };
       }
 
+      const started = Date.now();
+      let pageMeta: { url: string; title: string } = { url: "", title: "" };
+
       const text = await withTarget(params.target, async (cdp, sessionId, page) => {
+        pageMeta = { url: (page as any).url as string ?? "", title: (page as any).title as string ?? "" };
         switch (params.action) {
           case "snap": return snapshotStr(cdp, sessionId);
           case "html": return htmlStr(cdp, sessionId, params.selector);
@@ -399,10 +506,119 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
         }
       });
 
+      const elapsedMs = Date.now() - started;
+      const rawText = text || "(no output)";
+
+      // Catch-all: if any action produced large output that wasn't already dumped,
+      // dump it now to protect the context window.
+      const capped = rawText.length > MAX_INLINE_BYTES
+        ? maybeDump(`${params.action}.txt`, rawText, `action=${params.action}`)
+        : rawText;
+
       return {
-        content: [{ type: "text", text: text || "(no output)" }],
-        details: { action: params.action, target: params.target },
+        content: [{ type: "text", text: capped }],
+        details: {
+          action: params.action,
+          target: params.target,
+          elapsedMs,
+          pageUrl: pageMeta.url,
+          pageTitle: pageMeta.title,
+          outputBytes: rawText.length,
+          dumped: rawText.length > MAX_INLINE_BYTES,
+        },
       };
+    },
+
+    // ── custom TUI rendering ──
+
+    renderCall(args: ChromeCdpParams, theme: any) {
+      const parts: string[] = [theme.bold("chrome_cdp")];
+      parts.push(theme.fg("muted", args.action));
+
+      if (args.target) {
+        parts.push(theme.fg("dim", args.target.length > 20 ? args.target.slice(0, 20) + "…" : args.target));
+      }
+      if (args.expression) {
+        const short = args.expression.length > 60 ? args.expression.slice(0, 60) + "…" : args.expression;
+        parts.push(theme.fg("dim", short));
+      }
+      if (args.url) {
+        const short = args.url.length > 40 ? args.url.slice(0, 40) + "…" : args.url;
+        parts.push(theme.fg("dim", short));
+      }
+      if (args.selector) {
+        parts.push(theme.fg("dim", args.selector.length > 30 ? args.selector.slice(0, 30) + "…" : args.selector));
+      }
+
+      return new Text(parts.join(" "), 0, 0);
+    },
+
+    renderResult(result: any, { expanded }: { expanded: boolean }, theme: any) {
+      const details = result.details || {};
+      const action = details.action || "?";
+
+      switch (action) {
+        case "list": {
+          const n = details.count ?? 0;
+          return new Text(theme.fg("success", `\u2713 ${n} tab${n === 1 ? "" : "s"}${details.elapsedMs != null ? ` \u00b7 ${(details.elapsedMs / 1000).toFixed(1)}s` : ""}`), 0, 0);
+        }
+        case "eval": {
+          const raw = String(result.content?.[0]?.text ?? "");
+          if (raw.startsWith("Eval failed:")) {
+            const firstLine = raw.split("\n")[0].replace("Eval failed: ", "");
+            return new Text(theme.fg("error", `\u2717 ${firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine}`), 0, 0);
+          }
+          const dumped = details.dumped ?? raw.includes("[Dumped ");
+          if (dumped) {
+            return new Text(theme.fg("info", `\u2713 eval \u2192 file (${formatBytes(details.outputBytes)})`), 0, 0);
+          }
+          const short = raw.length > 120 ? raw.slice(0, 120).replace(/\n/g, " \u00b7 ") + "…" : raw.replace(/\n/g, " \u00b7 ");
+          return new Text(theme.fg("success", `\u2713 ${short}`), 0, 0);
+        }
+        case "snap": {
+          const firstLine = String(result.content?.[0]?.text ?? "").split("\n")[0] || "";
+          const dumped = details.dumped ?? false;
+          return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
+        }
+        case "html": {
+          const bytes = details.outputBytes ?? 0;
+          const selector = details.selector;
+          const dumped = details.dumped ?? false;
+          return new Text(
+            theme.fg(dumped ? "info" : "success", `\u2713 HTML ${formatBytes(bytes)}${selector ? ` (${selector})` : ""}${dumped ? " \u2192 file" : ""}`),
+            0, 0
+          );
+        }
+        case "net": {
+          const firstLine = String(result.content?.[0]?.text ?? "").split("\n")[0] || "";
+          const dumped = details.dumped ?? false;
+          return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
+        }
+        case "nav": {
+          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+        }
+        case "reload": {
+          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+        }
+        case "click":
+        case "clickxy": {
+          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+        }
+        case "type": {
+          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+        }
+        case "shot": {
+          const text = String(result.content?.[0]?.text ?? "");
+          const firstLine = text.split("\n")[0] || "";
+          return new Text(theme.fg("success", `\u2713 ${firstLine}`), 0, 0);
+        }
+        default: {
+          if (result.isError) {
+            return new Text(theme.fg("error", `\u2717 ${String(result.content?.[0]?.text ?? "").split("\n")[0]}`), 0, 0);
+          }
+          return new Text(theme.fg("success", `\u2713 ${action}`), 0, 0);
+        }
+      }
     },
   });
 }
