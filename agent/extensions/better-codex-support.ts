@@ -40,9 +40,18 @@ interface AuthData {
   "openai-codex"?: { access?: string; refresh?: string; expires?: number };
 }
 
+interface ResetCreditData {
+  status?: string;
+  expiresAt?: string;
+  title?: string;
+}
+
 interface UsageData {
   session: number;
   weekly: number;
+  resetCreditsAvailable?: number;
+  resetCredits?: ResetCreditData[];
+  resetCreditsExpireText?: string;
   sessionResetsIn?: string;
   weeklyResetsIn?: string;
   sessionResetAfterSeconds?: number;
@@ -305,7 +314,81 @@ function toIso(timestampMs: number): string {
 
 function readResetAtSeconds(window: any): number | undefined {
   if (typeof window?.reset_at === "number" && Number.isFinite(window.reset_at)) return window.reset_at;
+  if (typeof window?.resets_at === "number" && Number.isFinite(window.resets_at)) return window.resets_at;
   return undefined;
+}
+
+function readAvailableResetCredits(value: unknown): number | undefined {
+  const obj = asObject(value);
+  if (!obj) return undefined;
+  const count = obj.available_count;
+  if (typeof count === "number" && Number.isFinite(count)) return Math.max(0, Math.trunc(count));
+  if (typeof count === "string" && count.trim()) {
+    const parsed = Number(count);
+    if (Number.isFinite(parsed)) return Math.max(0, Math.trunc(parsed));
+  }
+  return undefined;
+}
+
+function readResetCredits(value: unknown): ResetCreditData[] | undefined {
+  const obj = asObject(value);
+  const credits = Array.isArray(obj?.credits) ? obj.credits : undefined;
+  if (!credits) return undefined;
+  return credits
+    .map((item) => {
+      const credit = asObject(item);
+      if (!credit) return undefined;
+      return {
+        status: typeof credit.status === "string" ? credit.status : undefined,
+        expiresAt: typeof credit.expires_at === "string" ? credit.expires_at : undefined,
+        title: typeof credit.title === "string" ? credit.title : undefined,
+      };
+    })
+    .filter((credit): credit is ResetCreditData => !!credit);
+}
+
+function formatResetCreditExpiry(expiresAtMs: number): string {
+  const minutes = Math.round((expiresAtMs - Date.now()) / 60000);
+  if (minutes <= 0) return "expired";
+  if (minutes < 90) return `~${minutes}m`;
+  if (minutes < 60 * 48) return `~${Math.round(minutes / 60)}h`;
+  return `~${Math.round(minutes / 1440)}d`;
+}
+
+function formatResetCreditExpiries(credits: ResetCreditData[] | undefined): string | undefined {
+  const expiring = (credits ?? [])
+    .map((credit) => ({ credit, expiresAtMs: credit.expiresAt ? Date.parse(credit.expiresAt) : Number.NaN }))
+    .filter((item) => Number.isFinite(item.expiresAtMs) && (!item.credit.status || item.credit.status === "available"))
+    .sort((left, right) => left.expiresAtMs - right.expiresAtMs);
+  if (expiring.length === 0) return undefined;
+  const shown = expiring.slice(0, 3).map((item, index) => `#${index + 1} ${formatResetCreditExpiry(item.expiresAtMs)}`);
+  const hidden = expiring.length - shown.length;
+  return `${shown.join(" · ")}${hidden > 0 ? ` · +${hidden}` : ""}`;
+}
+
+function extractJwtAccountId(token: string): string | undefined {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return undefined;
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const claims = asObject(decoded)?.["https://api.openai.com/auth"];
+    const accountId = asObject(claims)?.chatgpt_account_id;
+    return typeof accountId === "string" && accountId.trim() ? accountId.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function codexUsageHeaders(token: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    accept: "application/json",
+    "OAI-Language": "en",
+    originator: "pi",
+  };
+  const accountId = extractJwtAccountId(token);
+  if (accountId) headers["chatgpt-account-id"] = accountId;
+  return headers;
 }
 
 function resetAtMs(window: any): number | undefined {
@@ -394,9 +477,10 @@ function readPercentCandidate(value: unknown): number | null {
 }
 
 async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
+  const headers = codexUsageHeaders(token);
   const result = await requestJson(
     "https://chatgpt.com/backend-api/wham/usage",
-    { headers: { Authorization: `Bearer ${token}` } },
+    { headers },
     config,
   );
 
@@ -404,10 +488,27 @@ async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promi
 
   const primary = result.data?.rate_limit?.primary_window;
   const secondary = result.data?.rate_limit?.secondary_window;
+  let resetCreditsAvailable = readAvailableResetCredits(result.data?.rate_limit_reset_credits);
+  let resetCredits: ResetCreditData[] | undefined;
+
+  if (resetCreditsAvailable === undefined || resetCreditsAvailable > 0) {
+    const resetCreditsResult = await requestJson(
+      "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+      { headers },
+      config,
+    );
+    if (resetCreditsResult.ok) {
+      resetCreditsAvailable = readAvailableResetCredits(resetCreditsResult.data) ?? resetCreditsAvailable;
+      resetCredits = readResetCredits(resetCreditsResult.data);
+    }
+  }
 
   return {
     session: readPercentCandidate(primary?.used_percent) ?? 0,
     weekly: readPercentCandidate(secondary?.used_percent) ?? 0,
+    resetCreditsAvailable,
+    resetCredits,
+    resetCreditsExpireText: formatResetCreditExpiries(resetCredits),
     sessionResetsIn:
       typeof primary?.reset_after_seconds === "number" ? formatDuration(primary.reset_after_seconds) : undefined,
     weeklyResetsIn:
@@ -608,6 +709,18 @@ class UsageSelectorComponent extends Container implements Focusable {
         ),
       );
 
+      const resets = item.data.resetCreditsAvailable;
+      this.listContainer.addChild(
+        new Text(
+          indent +
+            t.fg("muted", "RESETS   ") +
+            (resets === undefined ? t.fg("dim", "unknown") : t.fg(resets > 0 ? "success" : "dim", String(resets))) +
+            (item.data.resetCreditsExpireText ? t.fg("dim", `  expires ${item.data.resetCreditsExpireText}`) : ""),
+          0,
+          0,
+        ),
+      );
+
       if (!(item.data.session > SHOW_THRESHOLD || item.data.weekly > SHOW_THRESHOLD)) {
         this.listContainer.addChild(
           new Text(indent + t.fg("dim", `Footer hidden below ${SHOW_THRESHOLD}% threshold`), 0, 0),
@@ -735,6 +848,11 @@ export default function (pi: ExtensionAPI) {
 
     const sessionReset = data.sessionResetsIn ? theme.fg("dim", ` ⟳ ${data.sessionResetsIn}`) : "";
     const weeklyReset = data.weeklyResetsIn ? theme.fg("dim", ` ⟳ ${data.weeklyResetsIn}`) : "";
+    const resetBank = data.resetCreditsAvailable === undefined
+      ? ""
+      : theme.fg("muted", " RESETS ") +
+        theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable)) +
+        (data.resetCreditsExpireText ? theme.fg("dim", ` exp ${data.resetCreditsExpireText}`) : "");
 
     const status =
       theme.fg("dim", "Codex ") +
@@ -747,7 +865,8 @@ export default function (pi: ExtensionAPI) {
       renderBar(theme, weekly) +
       " " +
       renderPercent(theme, weekly) +
-      weeklyReset;
+      weeklyReset +
+      resetBank;
 
     ctx.ui.setStatus(STATUS_KEY, status);
   }
@@ -892,6 +1011,8 @@ export default function (pi: ExtensionAPI) {
       weeklyResetAfterSeconds: data.weeklyResetAfterSeconds,
       sessionResetAt: data.sessionResetAt,
       weeklyResetAt: data.weeklyResetAt,
+      resetCreditsAvailable: data.resetCreditsAvailable,
+      resetCreditsExpireText: data.resetCreditsExpireText,
       sessionWindowMinutes: data.sessionWindowMinutes,
       weeklyWindowMinutes: data.weeklyWindowMinutes,
     });
@@ -1179,6 +1300,7 @@ export default function (pi: ExtensionAPI) {
                 separator,
                 fitLine(renderSimpleBar("Session", data.session, data.sessionResetsIn, data.sessionResetAfterSeconds, data.sessionWindowMinutes, 300), width),
                 fitLine(renderSimpleBar("Weekly", data.weekly, data.weeklyResetsIn, data.weeklyResetAfterSeconds, data.weeklyWindowMinutes, 7 * 24 * 60), width),
+                fitLine(`${theme.fg("muted", "RESETS".padEnd(8))} ${data.resetCreditsAvailable === undefined ? theme.fg("dim", "unknown") : theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable))}${data.resetCreditsExpireText ? theme.fg("dim", `  expires ${data.resetCreditsExpireText}`) : ""}`, width),
                 separator,
               ];
             },
