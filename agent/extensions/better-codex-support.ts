@@ -46,6 +46,14 @@ interface ResetCreditData {
   title?: string;
 }
 
+type ResetConsumeOutcome = "reset" | "already_redeemed" | "nothing_to_reset" | "no_credit" | "unknown";
+
+interface ResetConsumeResult {
+  outcome: ResetConsumeOutcome;
+  windowsReset?: number;
+  raw: any;
+}
+
 interface UsageData {
   session: number;
   weekly: number;
@@ -391,6 +399,35 @@ function codexUsageHeaders(token: string): Record<string, string> {
   return headers;
 }
 
+function createResetRedeemRequestId(): string {
+  return typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `pi_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
+function parseResetConsumeResult(payload: any): ResetConsumeResult {
+  const root = asObject(payload) ?? {};
+  const code = typeof root.code === "string" ? root.code : undefined;
+  const outcome: ResetConsumeOutcome =
+    code === "reset" || code === "already_redeemed" || code === "nothing_to_reset" || code === "no_credit"
+      ? code
+      : "unknown";
+  const windowsReset = typeof root.windows_reset === "number" && Number.isFinite(root.windows_reset)
+    ? Math.max(0, Math.trunc(root.windows_reset))
+    : undefined;
+  return { outcome, windowsReset, raw: payload };
+}
+
+function formatResetConsumeResult(result: ResetConsumeResult): string {
+  if (result.outcome === "reset") {
+    return `Codex rate limits reset${result.windowsReset === undefined ? "" : ` (${result.windowsReset} window${result.windowsReset === 1 ? "" : "s"})`}.`;
+  }
+  if (result.outcome === "already_redeemed") return "Reset already applied; refreshed usage.";
+  if (result.outcome === "nothing_to_reset") return "No active Codex limit to reset.";
+  if (result.outcome === "no_credit") return "No banked resets available.";
+  return "Reset response was not recognized; refreshed usage.";
+}
+
 function resetAtMs(window: any): number | undefined {
   const resetAtSeconds = readResetAtSeconds(window);
   if (resetAtSeconds !== undefined) return resetAtSeconds * 1000;
@@ -522,6 +559,24 @@ async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promi
     sessionWindowMinutes: typeof primary?.window_minutes === "number" ? primary.window_minutes : undefined,
     weeklyWindowMinutes: typeof secondary?.window_minutes === "number" ? secondary.window_minutes : undefined,
   };
+}
+
+async function consumeCodexResetCredit(token: string, redeemRequestId: string, config: RequestConfig = {}): Promise<ResetConsumeResult> {
+  const result = await requestJson(
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+    {
+      method: "POST",
+      headers: {
+        ...codexUsageHeaders(token),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ redeem_request_id: redeemRequestId }),
+    },
+    config,
+  );
+
+  if (!result.ok) throw new Error(`Reset request failed (${result.status ?? "network"}): ${result.error}`);
+  return parseResetConsumeResult(result.data);
 }
 
 function detectProvider(model: { provider?: string; id?: string; name?: string; api?: string } | undefined | null): ProviderKey | null {
@@ -799,6 +854,8 @@ export default function (pi: ExtensionAPI) {
   let fastActive = false;
   let lastFastInjectedAt: number | undefined;
   let lastFastInjectedModel: string | undefined;
+  let resetInFlight = false;
+  let pendingResetRedeemRequestId: string | undefined;
 
   pi.registerFlag(CODEX_FAST_FLAG, {
     description: "Start with Codex fast mode enabled (service_tier=priority)",
@@ -818,6 +875,69 @@ export default function (pi: ExtensionAPI) {
     const full = "█".repeat(Math.max(0, Math.min(width, filled)));
     const empty = "░".repeat(Math.max(0, width - filled));
     return theme.fg(colorForPercent(v), full) + theme.fg("dim", empty);
+  }
+
+  async function getFreshCodexAccess(): Promise<{ access?: string; error?: string }> {
+    if (!hasCodexCredentials(readAuth())) return { error: "missing Codex credentials (try /login openai-codex)" };
+    const refreshed = await ensureFreshCodexAuth();
+    const access = refreshed.auth?.["openai-codex"]?.access;
+    if (access) return { access };
+    const refreshError = refreshed.refreshErrors["openai-codex"];
+    return { error: refreshError ? `auth refresh failed (${refreshError})` : "missing access token (try /login again)" };
+  }
+
+  async function confirmUsageReset(_ctx: ExtensionContext, data: UsageData): Promise<boolean> {
+    if (!_ctx.hasUI) return false;
+
+    return _ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
+      let input = "";
+      const fitLine = (line: string, width: number): string => truncateToWidth(line, Math.max(0, width), "");
+      const renderUsage = () =>
+        `Current usage: session ${clampPercent(data.session)}%, weekly ${clampPercent(data.weekly)}%`;
+      const renderResets = () => {
+        const count = data.resetCreditsAvailable === undefined ? "unknown" : String(data.resetCreditsAvailable);
+        return `Banked resets: ${count}${data.resetCreditsExpireText ? ` (expires ${data.resetCreditsExpireText})` : ""}`;
+      };
+
+      return {
+        render(width: number) {
+          const separator = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
+          return [
+            separator,
+            fitLine(theme.bold("Confirm Codex usage reset"), width),
+            fitLine(theme.fg("warning", "This will redeem exactly one banked Codex rate-limit reset."), width),
+            fitLine(theme.fg("dim", "There is no automatic retry. On network failure, the same redeem id is reused."), width),
+            "",
+            fitLine(renderUsage(), width),
+            fitLine(renderResets(), width),
+            "",
+            fitLine("Type yes and press Enter to perform the reset, or Esc/Ctrl-C to cancel.", width),
+            fitLine(`${theme.fg("muted", "> ")}${input}`, width),
+            separator,
+          ];
+        },
+        invalidate() {},
+        handleInput(keyData: string) {
+          if (keyData === "\x03" || keyData === "escape" || keyData.includes("\x1b")) {
+            done(false);
+            return;
+          }
+          if (keyData === "\r" || keyData === "\n" || keyData === "enter") {
+            done(input.trim() === "yes");
+            return;
+          }
+          if (keyData === "\b" || keyData === "\x7f" || keyData === "backspace") {
+            input = input.slice(0, -1);
+            tui.requestRender();
+            return;
+          }
+          if (keyData.length === 1 && keyData >= " " && keyData !== "\x7f") {
+            input += keyData;
+            tui.requestRender();
+          }
+        },
+      };
+    });
   }
 
   function updateStatus() {
@@ -1212,6 +1332,70 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("fast", {
     description: "Toggle Codex fast mode",
     handler: handleFastCommand,
+  });
+
+  pi.registerCommand("usage-reset", {
+    description: "Redeem one banked Codex usage reset after typed confirmation",
+    handler: async (_args, _ctx) => {
+      ctx = _ctx;
+      updateProviderFrom(_ctx.model);
+
+      if (!_ctx.hasUI) return;
+      if (resetInFlight) {
+        _ctx.ui.notify("A Codex reset check is already in progress.", "warning");
+        return;
+      }
+
+      resetInFlight = true;
+      try {
+        const auth = await getFreshCodexAccess();
+        if (!auth.access) {
+          _ctx.ui.notify(auth.error ?? "missing Codex access token", "error");
+          return;
+        }
+
+        const data = await fetchCodexUsage(auth.access);
+        state.codex = data;
+        state.lastPoll = Date.now();
+        updateStatus();
+
+        if (data.error) {
+          _ctx.ui.notify(data.error, "error");
+          return;
+        }
+
+        if (data.resetCreditsAvailable === undefined) {
+          _ctx.ui.notify("Could not verify banked Codex resets; no reset was attempted.", "error");
+          return;
+        }
+
+        if (data.resetCreditsAvailable <= 0) {
+          pendingResetRedeemRequestId = undefined;
+          _ctx.ui.notify("No banked Codex resets are available.", "info");
+          return;
+        }
+
+        const confirmed = await confirmUsageReset(_ctx, data);
+        if (!confirmed) {
+          _ctx.ui.notify("Codex reset cancelled. No reset was attempted.", "info");
+          return;
+        }
+
+        const redeemRequestId = pendingResetRedeemRequestId ?? createResetRedeemRequestId();
+        pendingResetRedeemRequestId = redeemRequestId;
+        const result = await consumeCodexResetCredit(auth.access, redeemRequestId);
+        pendingResetRedeemRequestId = undefined;
+        _ctx.ui.notify(formatResetConsumeResult(result), result.outcome === "reset" || result.outcome === "already_redeemed" ? "info" : "warning");
+        await poll("usage_reset", true);
+      } catch (error) {
+        const retryHint = pendingResetRedeemRequestId
+          ? " No automatic retry was made; run /usage-reset again to retry the same redeem request after checking usage."
+          : " No reset was attempted.";
+        _ctx.ui.notify(`${toErrorMessage(error)}${retryHint}`, "error");
+      } finally {
+        resetInFlight = false;
+      }
+    },
   });
 
   pi.registerCommand("usage", {
