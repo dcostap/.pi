@@ -1334,7 +1334,7 @@ export default function (pi: ExtensionAPI) {
     handler: handleFastCommand,
   });
 
-  pi.registerCommand("usage-reset", {
+  pi.registerCommand("codex-reset-usages", {
     description: "Redeem one banked Codex usage reset after typed confirmation",
     handler: async (_args, _ctx) => {
       ctx = _ctx;
@@ -1389,7 +1389,7 @@ export default function (pi: ExtensionAPI) {
         await poll("usage_reset", true);
       } catch (error) {
         const retryHint = pendingResetRedeemRequestId
-          ? " No automatic retry was made; run /usage-reset again to retry the same redeem request after checking usage."
+          ? " No automatic retry was made; run /codex-reset-usages again to retry the same redeem request after checking usage."
           : " No reset was attempted.";
         _ctx.ui.notify(`${toErrorMessage(error)}${retryHint}`, "error");
       } finally {
