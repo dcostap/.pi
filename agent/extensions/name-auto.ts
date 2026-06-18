@@ -15,8 +15,11 @@ const SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 const STATUS_KEY = "name-auto";
 
 const OUTPUT_MAX_TOKENS = 40;
-const PROMPT_SAFETY_MARGIN_TOKENS = 8_000;
-const MIN_CONTEXT_BUDGET_TOKENS = 4_000;
+// Spark rejects a little before the advertised window once provider-side framing is added.
+// Naming does not need a full transcript, so keep a large reserve and a hard input cap.
+const PROMPT_SAFETY_MARGIN_TOKENS = 24_000;
+const MAX_CONVERSATION_TOKENS = 80_000;
+const MIN_CONTEXT_BUDGET_TOKENS = 1_000;
 const MAX_NAME_CHARS = 72;
 const TARGET_NAME_WORDS = "3-7 words";
 
@@ -32,7 +35,8 @@ const SYSTEM_PROMPT = [
 type AgentMessageLike = Record<string, unknown>;
 
 function estimateTokens(text: string): number {
-	return Math.ceil(text.length / 4);
+	// Intentionally conservative: mixed code/JSON/tool logs often tokenize denser than 4 chars/token.
+	return Math.ceil(text.length / 3);
 }
 
 function cleanText(text: string): string {
@@ -193,10 +197,13 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 				}
 
 				const fixedPromptTokens = estimateTokens(SYSTEM_PROMPT) + estimateTokens(buildPrompt("", args.trim() || undefined));
-				const conversationBudget = Math.max(
-					MIN_CONTEXT_BUDGET_TOKENS,
-					model.contextWindow - PROMPT_SAFETY_MARGIN_TOKENS - OUTPUT_MAX_TOKENS - fixedPromptTokens,
-				);
+				const availableContextTokens = model.contextWindow - PROMPT_SAFETY_MARGIN_TOKENS - OUTPUT_MAX_TOKENS - fixedPromptTokens;
+				const conversationBudget = Math.min(MAX_CONVERSATION_TOKENS, Math.max(0, availableContextTokens));
+				if (conversationBudget < MIN_CONTEXT_BUDGET_TOKENS) {
+					throw new Error(
+						`Model context window too small after safety padding (${conversationBudget.toLocaleString()} tokens available)`,
+					);
+				}
 				const clamped = clampConversationDump(fullDump, conversationBudget);
 				const prompt = buildPrompt(clamped.text, args.trim() || undefined);
 
