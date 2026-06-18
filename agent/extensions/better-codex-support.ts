@@ -906,7 +906,6 @@ export default function (pi: ExtensionAPI) {
             separator,
             fitLine(theme.bold("Confirm Codex usage reset"), width),
             fitLine(theme.fg("warning", "This will redeem exactly one banked Codex rate-limit reset."), width),
-            fitLine(theme.fg("dim", "There is no automatic retry. On network failure, the same redeem id is reused."), width),
             "",
             fitLine(renderUsage(), width),
             fitLine(renderResets(), width),
