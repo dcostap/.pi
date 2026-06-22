@@ -83,9 +83,22 @@ export default function (pi: ExtensionAPI) {
     description:
       "Copy all previous user/assistant messages and summaries in this thread to the clipboard",
     handler: async (_args, ctx) => {
-      await ctx.waitForIdle();
+      let branchEntries = ctx.sessionManager.getBranch();
 
-      const branchEntries = ctx.sessionManager.getBranch();
+      // If copy-all is invoked while the agent is still working, copy only the
+      // already-completed conversation. The active turn is still WIP and may not
+      // be fully persisted yet, so ignore everything from the latest user
+      // message onward.
+      if (!ctx.isIdle()) {
+        for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
+          const entry = branchEntries[index];
+          if (entry?.type === "message" && entry.message.role === "user") {
+            branchEntries = branchEntries.slice(0, index);
+            break;
+          }
+        }
+      }
+
       const sections = branchEntries
         .map((entry) => {
           if (entry.type === "message") {
