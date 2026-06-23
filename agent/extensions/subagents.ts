@@ -11,6 +11,7 @@ import { Type } from "typebox";
 const TOOL_NAME = "launch_review_subagents";
 const MAX_SUBAGENTS = 4;
 const SESSION_PREFIX = "[Review Subagent]";
+const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' conclusions and statements; be discerning, analytical, and self-reliant. You make your own conclusions.";
 const WORKER_ENV = "PI_SUBAGENT_ROLE";
 const WORKER_ENV_VALUE = "worker";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -796,7 +797,7 @@ function buildFinalToolResult(results: ChildResult[]) {
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
 	return {
-		content: [{ type: "text" as const, text: sections.join("\n\n") }],
+		content: [{ type: "text" as const, text: [...sections, FINAL_RESULT_DISCLAIMER].join("\n\n") }],
 		details: {
 			failures,
 			results: results.map((result) => ({
