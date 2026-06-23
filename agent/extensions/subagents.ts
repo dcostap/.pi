@@ -8,31 +8,34 @@ import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const TOOL_NAME = "launch_subagents";
+const TOOL_NAME = "launch_review_subagents";
 const MAX_SUBAGENTS = 4;
-const SESSION_PREFIX = "[Subagent]";
+const SESSION_PREFIX = "[Review Subagent]";
 const WORKER_ENV = "PI_SUBAGENT_ROLE";
 const WORKER_ENV_VALUE = "worker";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-type TaskParams = {
+type ReviewerParams = {
 	description: string;
-	prompt: string;
+	focus?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
 };
 
 type LaunchParams = {
-	tasks: TaskParams[];
+	what_to_review: string;
+	reviewers: ReviewerParams[];
 };
 
-type ResolvedTask = TaskParams & {
+type ResolvedTask = ReviewerParams & {
 	index: number;
 	sessionName: string;
 	sandboxDir: string;
 	systemPromptPath: string;
+	whatToReview: string;
+	focus?: string;
 	modelRef?: string;
 	thinking?: ThinkingLevel;
 };
@@ -235,9 +238,116 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
+const REVIEW_RUBRIC = `# Review Guidelines
+
+You are acting as an independent code reviewer. The caller will provide the review target separately.
+
+## What to flag
+
+Flag issues that:
+1. Meaningfully affect correctness, robustness, data safety, security, performance, maintainability, or user-visible behavior.
+2. Are discrete, actionable, and specific.
+3. Are within the reviewed scope and not unrelated pre-existing issues.
+4. The author would likely fix if they understood the issue.
+5. Are supported by concrete code evidence, not speculation.
+6. Do not demand rigor inconsistent with the rest of the codebase.
+7. Are not merely style preferences unless they obscure meaning or violate explicit project standards.
+
+Do not report unrelated pre-existing issues. Do not assume a bug exists; prove the failing path from code.
+
+## Review method
+
+1. Inspect the full relevant file/diff set before drawing conclusions.
+2. Read enough surrounding code to understand intent, call flow, data ownership, and lifecycle boundaries.
+3. Treat tests as supporting evidence only; passing tests do not prove correctness.
+4. Pay special attention to:
+   - error handling and recovery paths
+   - persistence, migration, cleanup, and destructive operations
+   - stale state, race/order problems, duplicate execution, and idempotence
+   - security boundaries and untrusted input
+   - performance, backpressure, and resource usage
+   - compatibility with project conventions and documented policies
+5. Prefer concrete bugs over broad rewrites.
+6. Do not implement fixes unless explicitly asked; this is review only.
+
+## Priority tags
+
+Use exactly one priority tag for each finding title:
+
+- [P0] Critical. Blocks release/use immediately; broad data loss, security compromise, or total breakage.
+- [P1] High. Should be fixed before merge/use; likely bug, data-loss risk, serious lifecycle issue, or major regression.
+- [P2] Medium. Real issue that should be fixed, but not necessarily blocking all use.
+- [P3] Low. Minor but actionable issue, maintainability concern, or useful test gap.
+
+Use [P0] sparingly.
+
+## Finding format
+
+Each finding should be concise and structured like this:
+
+### [P1] Short problem title
+
+Location: \`path/to/file.ext:line\` or \`path/to/file.ext:line-line\`
+
+Explain what changed, why it is wrong or risky, the concrete scenario where it fails, and the likely fix direction. Keep each finding focused on one issue. Prefer short line ranges. If a code snippet is useful, keep it under 3 lines.
+
+## Output format
+
+Structure the final review exactly like this:
+
+## Review Scope
+
+Briefly state what you reviewed and any neutral focus provided by the caller.
+
+## Summary
+
+Short overall assessment.
+
+## Findings
+
+List findings in descending severity order.
+
+If there are no qualifying findings, write:
+
+- No blocking findings.
+
+## Verification Notes
+
+Mention commands or checks you ran. If you did not run tests, say so.
+
+## Verdict
+
+Choose one:
+
+- \`correct\` — no blocking findings.
+- \`needs attention\` — one or more findings should be addressed.
+
+## Human Reviewer Callouts (Non-Blocking)
+
+Include only applicable informational callouts. If none apply, write \`- (none)\`.
+
+Possible callouts:
+- **This change adds or changes persistence/storage format:** <details>
+- **This change adds or changes migration/recovery behavior:** <details>
+- **This change introduces a new dependency:** <details>
+- **This change changes public API/config/schema/contract:** <details>
+- **This change modifies auth/permission/security behavior:** <details>
+- **This change includes destructive or irreversible operations:** <details>
+- **This change has notable performance/backpressure implications:** <details>
+
+## Tone and constraints
+
+- Be direct, specific, and matter-of-fact.
+- Avoid praise filler.
+- Avoid nitpicks.
+- Do not include speculative issues without a concrete failing path.
+- Do not produce a full patch.
+- Do not stop at the first issue; report every qualifying finding.
+`;
+
 function buildSubagentInstructions(task: ResolvedTask, cwd: string): string {
 	return [
-		"You are a Pi subagent launched by the main agent.",
+		"You are a Pi review subagent launched by the main agent.",
 		"You are working from the same cwd as the main agent:",
 		cwd,
 		"",
@@ -247,11 +357,11 @@ function buildSubagentInstructions(task: ResolvedTask, cwd: string): string {
 		"You may freely create, edit, run, and inspect temporary scripts/files inside that sandbox.",
 		"Prefer the sandbox for scratch work, experiments, temporary logs, and throwaway scripts.",
 		"Do not treat the project cwd itself as scratch space.",
-		"Do not make durable project changes unless the parent task explicitly asks you to do so.",
-		"If you believe a durable project change is necessary but it was not explicitly requested, explain that recommendation in your final answer instead of doing it.",
+		"Do not make durable project changes. This is review only.",
+		"If you believe a durable project change is necessary, explain that recommendation in your final answer instead of doing it.",
 		"",
 		"You do not have access to launching further subagents from here.",
-		"Focus only on the assigned task. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
+		"Perform an independent code review of the assigned review target. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
 	].join("\n");
 }
 
@@ -260,26 +370,41 @@ function buildSubagentInstructionsFile(task: ResolvedTask, cwd: string): string 
 }
 
 function buildSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
-	return [
-		"<persistent_subagent_instructions>",
+	const parts = [
+		"<persistent_review_subagent_instructions>",
 		buildSubagentInstructions(task, cwd),
-		"</persistent_subagent_instructions>",
+		"</persistent_review_subagent_instructions>",
 		"",
-		"<assigned_task>",
-		task.prompt,
-		"</assigned_task>",
-	].join("\n");
+		"<review_rubric>",
+		REVIEW_RUBRIC,
+		"</review_rubric>",
+		"",
+		"<review_target>",
+		task.whatToReview,
+		"</review_target>",
+	];
+	if (task.focus) {
+		parts.push("", "<neutral_focus>", task.focus, "</neutral_focus>");
+	}
+	parts.push(
+		"",
+		"Important: follow the rubric above. The caller supplied only the review target and optional neutral focus; do not infer suspected findings from the wording. Report only concrete, actionable issues you can prove from the code.",
+	);
+	return parts.join("\n");
 }
 
 function buildMainSystemPromptAddition(): string {
 	return [
-		"Subagents:",
-		`- You have a ${TOOL_NAME} tool that launches fresh same-cwd Pi subagent sessions in parallel.`,
-		"- Only launch subagents when the user explicitly asks you to use subagents/parallel agents, or unmistakably asks you to delegate work to other agents.",
-		`- You may launch at most ${MAX_SUBAGENTS} subagents in one tool call. If the user asks for multiple, use one parallel tool call rather than sequential calls when possible.`,
-		"- Each subagent is a brand-new session named `[Subagent] <description>`. Choose short, distinctive descriptions; if repeating a similar task, add your own suffix like `#2`.",
-		"- The tool returns only each subagent's final answer to your context. Synthesize those answers for the user.",
-		"- By default subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-task `model` and/or `thinking`.",
+		"Review subagents:",
+		`- You have a ${TOOL_NAME} tool that launches fresh same-cwd Pi review subagent sessions in parallel.`,
+		"- Only launch review subagents when the user explicitly asks for subagents/parallel agents to review something, or unmistakably asks you to delegate review work to other agents.",
+		`- You may launch at most ${MAX_SUBAGENTS} review subagents in one tool call. If the user asks for multiple reviewers, use one parallel tool call rather than sequential calls when possible.`,
+		"- The tool already injects the standard review rubric and output format into each review subagent prompt.",
+		"- When calling the tool, specify only what to review and optional neutral focus areas. Do not paste review instructions, formatting requirements, expected verdicts, or suspected findings into the review target.",
+		"- Avoid biasing review subagents. Do not tell them what bugs you expect unless the user explicitly asked to verify a specific concern; if so, label it as user-provided focus.",
+		"- Each review subagent is a brand-new session named `[Review Subagent] <description>`. Choose short, distinctive descriptions; if repeating a similar review, add your own suffix like `#2`.",
+		"- The tool returns only each review subagent's final answer to your context. Synthesize those answers for the user, deduplicate findings, and call out disagreements or uncertainty.",
+		"- By default review subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-reviewer `model` and/or `thinking`.",
 		"- Model overrides may be loose names, but you should resolve ambiguity before launching when possible. If a name could refer to multiple providers/models, ask the user which provider/model they mean instead of guessing. You can inspect models with `pi --list-models <query>` if needed.",
 	].join("\n");
 }
@@ -511,8 +636,10 @@ function applyEventToState(state: RuntimeState, event: any): void {
 
 async function prepareTasks(params: LaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<{ tasks?: ResolvedTask[]; errors?: string[] }> {
 	const errors: string[] = [];
-	if (!Array.isArray(params.tasks) || params.tasks.length === 0) errors.push("tasks must contain at least one subagent task");
-	if (Array.isArray(params.tasks) && params.tasks.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} subagents may be launched at once`);
+	const whatToReview = cleanText(params.what_to_review || "");
+	if (!whatToReview) errors.push("what_to_review is required and should describe only the review target");
+	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one review subagent");
+	if (Array.isArray(params.reviewers) && params.reviewers.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} review subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
 
 	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
@@ -520,23 +647,22 @@ async function prepareTasks(params: LaunchParams, ctx: ExtensionContext, pi: Ext
 	const currentThinking = pi.getThinkingLevel() as ThinkingLevel;
 	const resolved: Array<Omit<ResolvedTask, "sandboxDir" | "systemPromptPath">> = [];
 
-	params.tasks.forEach((task, index) => {
-		const description = sanitizeDescription(task.description || "");
-		const prompt = cleanText(task.prompt || "");
-		if (!description) errors.push(`task ${index + 1}: description is required`);
-		if (!prompt) errors.push(`task ${index + 1}: prompt is required`);
+	params.reviewers.forEach((reviewer, index) => {
+		const description = sanitizeDescription(reviewer.description || "");
+		const focus = cleanText(reviewer.focus || "");
+		if (!description) errors.push(`reviewer ${index + 1}: description is required`);
 
-		let modelOverride = task.model?.trim();
-		let thinking = task.thinking ?? currentThinking;
-		let explicitThinking = Boolean(task.thinking);
+		let modelOverride = reviewer.model?.trim();
+		let thinking = reviewer.thinking ?? currentThinking;
+		let explicitThinking = Boolean(reviewer.thinking);
 		let modelRefForTask = currentModelRef;
 
 		if (modelOverride) {
 			const parsed = parseModelSpec(modelOverride);
 			modelOverride = parsed.query;
 			if (parsed.thinking) {
-				if (task.thinking && task.thinking !== parsed.thinking) {
-					errors.push(`task ${index + 1}: model override includes :${parsed.thinking} but thinking is also set to ${task.thinking}`);
+				if (reviewer.thinking && reviewer.thinking !== parsed.thinking) {
+					errors.push(`reviewer ${index + 1}: model override includes :${parsed.thinking} but thinking is also set to ${reviewer.thinking}`);
 				} else {
 					thinking = parsed.thinking;
 					explicitThinking = true;
@@ -545,18 +671,19 @@ async function prepareTasks(params: LaunchParams, ctx: ExtensionContext, pi: Ext
 
 			const match = resolveModelOverride(modelOverride, availableModels);
 			if (!match.ok) {
-				errors.push(`task ${index + 1} (${description}): ${match.message}`);
+				errors.push(`reviewer ${index + 1} (${description}): ${match.message}`);
 			} else {
 				modelRefForTask = modelRef(match.model);
 				const thinkingError = validateRequestedThinking(match.model, thinking, explicitThinking);
-				if (thinkingError) errors.push(`task ${index + 1} (${description}): ${thinkingError}`);
+				if (thinkingError) errors.push(`reviewer ${index + 1} (${description}): ${thinkingError}`);
 			}
 		}
 
 		resolved.push({
-			...task,
+			...reviewer,
 			description,
-			prompt,
+			focus: focus || undefined,
+			whatToReview,
 			index,
 			sessionName: `${SESSION_PREFIX} ${description}`,
 			modelRef: modelRefForTask,
@@ -573,7 +700,7 @@ async function prepareTasks(params: LaunchParams, ctx: ExtensionContext, pi: Ext
 		const unique = `${slugify(task.description)}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 		const sandboxDir = path.join(sandboxRoot, unique);
 		await mkdir(sandboxDir, { recursive: true });
-		const systemPromptPath = path.join(sandboxDir, "SUBAGENT_SYSTEM_PROMPT.md");
+		const systemPromptPath = path.join(sandboxDir, "REVIEW_SUBAGENT_SYSTEM_PROMPT.md");
 		const finalTask = { ...task, sandboxDir, systemPromptPath };
 		await writeFile(systemPromptPath, buildSubagentInstructionsFile(finalTask, ctx.cwd), "utf8");
 		withSandboxes.push(finalTask);
@@ -695,24 +822,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: TOOL_NAME,
-		label: "Launch Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi subagents in parallel. Use only when the user explicitly asks for subagents/parallel agents. Returns only each subagent's final answer.`,
+		label: "Launch Review Subagents",
+		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi review subagents in parallel. The extension injects the review rubric and output format; callers should provide only what to review and optional neutral focus areas.`,
 		parameters: Type.Object({
-			tasks: Type.Array(
+			what_to_review: Type.String({ description: "Neutral description of the review target. Specify only what to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
+			reviewers: Type.Array(
 				Type.Object({
-					description: Type.String({ description: "Short session description used as `[Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated tasks." }),
-					prompt: Type.String({ description: "The complete task prompt for this subagent. Include all context it needs." }),
+					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
+					focus: Type.Optional(Type.String({ description: "Optional neutral focus area, such as 'data safety' or 'performance'. Do not include suspected findings unless the user explicitly asked to verify them." })),
 					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
 					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
 				}),
-				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Subagent tasks to launch in parallel, max ${MAX_SUBAGENTS}.` },
+				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Review subagents to launch in parallel, max ${MAX_SUBAGENTS}.` },
 			),
 		}),
 		async execute(_toolCallId, params: LaunchParams, signal, onUpdate, ctx) {
 			const prepared = await prepareTasks(params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
 			if (prepared.errors?.length) {
 				return {
-					content: [{ type: "text", text: [`Subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
+					content: [{ type: "text", text: [`Review subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
 					details: { errors: prepared.errors },
 					isError: true,
 				};
@@ -753,13 +881,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			return buildFinalToolResult(results);
 		},
 		renderCall(args, theme) {
-			const count = Array.isArray((args as any)?.tasks) ? (args as any).tasks.length : 0;
-			const label = `${theme.fg("toolTitle", theme.bold(TOOL_NAME))} ${theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`)}`;
+			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
+			const label = `${theme.fg("toolTitle", theme.bold(TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}`;
 			return new Text(label, 0, 0);
 		},
 		renderResult(result, _options, theme) {
 			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
-			const prefix = result?.isError ? theme.fg("error", "subagents") : theme.fg("success", "subagents");
+			const prefix = result?.isError ? theme.fg("error", "review subagents") : theme.fg("success", "review subagents");
 			return new Text(`${prefix}\n\n${text}`, 0, 0);
 		},
 	});
