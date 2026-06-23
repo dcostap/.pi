@@ -3,9 +3,9 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const TOOL_NAME = "launch_review_subagents";
@@ -56,6 +56,8 @@ type RuntimeState = {
 	description: string;
 	sessionName: string;
 	sandboxDir: string;
+	whatToReview: string;
+	focus?: string;
 	modelRef?: string;
 	thinking?: ThinkingLevel;
 	status: SubagentStatus;
@@ -466,16 +468,32 @@ function statusIcon(status: SubagentStatus): string {
 	}
 }
 
+function buildReviewPromptHeader(states: RuntimeState[]): string {
+	const whatToReview = states.find((state) => state.whatToReview)?.whatToReview;
+	const lines: string[] = [];
+	if (whatToReview) {
+		lines.push("Review target prompt sent to subagents:", "<<<", whatToReview, ">>>");
+	}
+	const focusLines = states
+		.filter((state) => state.focus)
+		.map((state) => `- ${state.sessionName}: ${state.focus}`);
+	if (focusLines.length > 0) lines.push("", "Neutral focus by subagent:", ...focusLines);
+	return lines.join("\n");
+}
+
 function buildToolPartial(states: RuntimeState[]) {
 	const lines = states.map((state) => {
 		const status = fitColumn(`${statusIcon(state.status)} ${state.status}`, 12);
 		const usage = fixedUsage(state.usage);
 		const name = fitColumn(state.sessionName, 56);
+		const model = `model=${state.modelRef ?? "(unknown)"}`;
 		const activity = state.error ?? state.lastActivity;
-		return `${status} ${usage} ${name} ${activity}`;
+		return `${status} ${usage} ${model} ${name} ${activity}`;
 	});
+	const header = buildReviewPromptHeader(states);
+	const text = [header, lines.join("\n")].filter(Boolean).join("\n\n") || "subagents preparing...";
 	return {
-		content: [{ type: "text" as const, text: lines.join("\n") || "subagents preparing..." }],
+		content: [{ type: "text" as const, text }],
 		details: { states },
 	};
 }
@@ -590,6 +608,19 @@ class RpcClient {
 	}
 }
 
+function rpcModelRef(model: any): string | undefined {
+	if (model && typeof model.provider === "string" && typeof model.id === "string") return `${model.provider}/${model.id}`;
+	return undefined;
+}
+
+function applyRpcStateMetadata(state: RuntimeState, data: any): void {
+	if (!data) return;
+	if (typeof data.sessionFile === "string") state.sessionFile = data.sessionFile;
+	const actualModelRef = rpcModelRef(data.model);
+	if (actualModelRef) state.modelRef = actualModelRef;
+	if ((THINKING_LEVELS as readonly string[]).includes(data.thinkingLevel)) state.thinking = data.thinkingLevel;
+}
+
 function applyEventToState(state: RuntimeState, event: any): void {
 	state.updatedAt = Date.now();
 	if (event.type === "agent_start") {
@@ -604,7 +635,7 @@ function applyEventToState(state: RuntimeState, event: any): void {
 			state.lastActivity = "thinking…";
 		} else if (update?.type === "text_delta") {
 			state.status = "running";
-			state.lastActivity = oneLine(update.delta || "writing…", 100);
+			state.lastActivity = "providing final answer…";
 		} else if (update?.type === "toolcall_end" && update.toolCall) {
 			state.status = "tool";
 			state.lastActivity = formatToolActivity(update.toolCall.name, update.toolCall.arguments);
@@ -737,10 +768,10 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 		await client.send("prompt", { message: buildSubagentUserPrompt(task, ctx.cwd) }, 30_000);
 		try {
 			const stateResponse = await client.send("get_state", {}, 5_000);
-			const data = stateResponse.data || {};
-			if (typeof data.sessionFile === "string") state.sessionFile = data.sessionFile;
+			applyRpcStateMetadata(state, stateResponse.data);
+			emit();
 		} catch {
-			// Session path is nice-to-have only.
+			// Session path and actual selected model are nice-to-have only.
 		}
 
 		const completed = await Promise.race([donePromise.then(() => "done" as const), exitPromise.then(() => "exit" as const)]);
@@ -789,15 +820,17 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 function buildFinalToolResult(results: ChildResult[]) {
 	const sections = results.map(({ state }) => {
 		const title = `## ${state.sessionName}`;
+		const modelLine = `Model: ${state.modelRef ?? "(unknown)"}`;
 		if (state.status === "error" || state.status === "aborted") {
 			const body = state.finalAnswer || state.error || "Subagent failed without a final answer.";
-			return `${title}\n\n[${state.status}]\n${body}`;
+			return `${title}\n\n${modelLine}\n\n[${state.status}]\n${body}`;
 		}
-		return `${title}\n\n${state.finalAnswer || "(Subagent finished without a final answer.)"}`;
+		return `${title}\n\n${modelLine}\n\n${state.finalAnswer || "(Subagent finished without a final answer.)"}`;
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
+	const header = buildReviewPromptHeader(results.map((result) => result.state));
 	return {
-		content: [{ type: "text" as const, text: [...sections, FINAL_RESULT_DISCLAIMER].join("\n\n") }],
+		content: [{ type: "text" as const, text: [header, ...sections, FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
 		details: {
 			failures,
 			results: results.map((result) => ({
@@ -806,6 +839,8 @@ function buildFinalToolResult(results: ChildResult[]) {
 				sessionFile: result.state.sessionFile,
 				sandboxDir: result.state.sandboxDir,
 				status: result.state.status,
+				modelRef: result.state.modelRef,
+				thinking: result.state.thinking,
 				error: result.state.error,
 				usage: result.state.usage,
 			})),
@@ -853,6 +888,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				description: task.description,
 				sessionName: task.sessionName,
 				sandboxDir: task.sandboxDir,
+				whatToReview: task.whatToReview,
+				focus: task.focus,
 				modelRef: task.modelRef,
 				thinking: task.thinking,
 				status: "preparing",
@@ -886,10 +923,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const label = `${theme.fg("toolTitle", theme.bold(TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}`;
 			return new Text(label, 0, 0);
 		},
-		renderResult(result, _options, theme) {
+		renderResult(result, { isPartial }, theme) {
 			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
 			const prefix = result?.isError ? theme.fg("error", "review subagents") : theme.fg("success", "review subagents");
-			return new Text(`${prefix}\n\n${text}`, 0, 0);
+			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
+
+			const container = new Container();
+			container.addChild(new Text(prefix, 0, 0));
+			if (text) container.addChild(new Markdown(text, 0, 0, getMarkdownTheme()));
+			return container;
 		},
 	});
 }
