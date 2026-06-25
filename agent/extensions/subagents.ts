@@ -15,6 +15,8 @@ const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' co
 const WORKER_ENV = "PI_SUBAGENT_ROLE";
 const WORKER_ENV_VALUE = "worker";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const MAX_SUBAGENT_ATTEMPTS = 2;
+const SUBAGENT_RETRY_DELAY_MS = 1_000;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
@@ -49,6 +51,7 @@ type UsageStats = {
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
+	latestCacheHitRate?: number;
 };
 
 type RuntimeState = {
@@ -65,7 +68,13 @@ type RuntimeState = {
 	finalAnswer: string;
 	error?: string;
 	sessionFile?: string;
+	contextWindow?: number;
+	contextTokens?: number;
+	contextPercent?: number;
 	usage: UsageStats;
+	attempt: number;
+	maxAttempts: number;
+	previousErrors: string[];
 	startedAt: number;
 	updatedAt: number;
 };
@@ -110,29 +119,51 @@ function formatTokens(count: number): string {
 }
 
 function formatUsage(usage: UsageStats): string {
+	// Match Pi's footer token convention: show cache read/write only when present,
+	// and show CH as the latest response's prompt cache hit rate.
 	const parts: string[] = [];
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
 	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
 	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
 	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	if ((usage.cacheRead > 0 || usage.cacheWrite > 0) && usage.latestCacheHitRate !== undefined) {
+		parts.push(`CH${usage.latestCacheHitRate.toFixed(1)}%`);
+	}
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(3)}`);
 	return parts.join(" ");
 }
 
 function fixedUsage(usage: UsageStats): string {
-	return [
-		`↑${formatTokens(usage.input).padEnd(5)}`,
-		`↓${formatTokens(usage.output).padEnd(5)}`,
-		`R${formatTokens(usage.cacheRead).padEnd(5)}`,
-		`W${formatTokens(usage.cacheWrite).padEnd(5)}`,
-		`$${usage.cost.toFixed(4).padEnd(8)}`,
-	].join(" ");
+	return fitColumn(formatUsage(usage), 36);
+}
+
+function formatContextUsage(state: RuntimeState): string {
+	const contextWindow = state.contextWindow ?? 0;
+	if (contextWindow <= 0) return "";
+	if (state.contextPercent === undefined) return `?/${formatTokens(contextWindow)}`;
+	return `${state.contextPercent.toFixed(1)}%/${formatTokens(contextWindow)}`;
 }
 
 function fitColumn(value: string, width: number): string {
 	const text = value.replace(/\s+/g, " ").trim();
 	if (text.length > width) return `${text.slice(0, Math.max(0, width - 1))}…`;
 	return text.padEnd(width);
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject(new Error("aborted"));
+		let timeout: ReturnType<typeof setTimeout>;
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(new Error("aborted"));
+		};
+		timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 function modelRef(model: Model<any>): string {
@@ -437,11 +468,23 @@ function finalAssistantText(messages: any[]): string {
 function updateUsageFromMessage(state: RuntimeState, message: any): void {
 	const usage = message?.usage;
 	if (!usage) return;
-	state.usage.input += Number(usage.input || 0);
-	state.usage.output += Number(usage.output || 0);
-	state.usage.cacheRead += Number(usage.cacheRead || 0);
-	state.usage.cacheWrite += Number(usage.cacheWrite || 0);
+	const input = Number(usage.input || 0);
+	const output = Number(usage.output || 0);
+	const cacheRead = Number(usage.cacheRead || 0);
+	const cacheWrite = Number(usage.cacheWrite || 0);
+	state.usage.input += input;
+	state.usage.output += output;
+	state.usage.cacheRead += cacheRead;
+	state.usage.cacheWrite += cacheWrite;
 	state.usage.cost += Number(usage.cost?.total || 0);
+	const latestPromptTokens = input + cacheRead + cacheWrite;
+	state.usage.latestCacheHitRate = latestPromptTokens > 0 ? (cacheRead / latestPromptTokens) * 100 : undefined;
+
+	const contextTokens = Number(usage.totalTokens || input + output + cacheRead + cacheWrite);
+	if (contextTokens > 0) {
+		state.contextTokens = contextTokens;
+		if ((state.contextWindow ?? 0) > 0) state.contextPercent = (contextTokens / state.contextWindow!) * 100;
+	}
 }
 
 function formatToolActivity(toolName: string, args: any): string {
@@ -486,9 +529,11 @@ function buildToolPartial(states: RuntimeState[]) {
 		const status = fitColumn(`${statusIcon(state.status)} ${state.status}`, 12);
 		const usage = fixedUsage(state.usage);
 		const name = fitColumn(state.sessionName, 56);
-		const model = `model=${state.modelRef ?? "(unknown)"}`;
+		const context = fitColumn(formatContextUsage(state), 14);
+		const attempt = state.maxAttempts > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
+		const model = `model=${state.modelRef ?? "(unknown)"}${attempt}`;
 		const activity = state.error ?? state.lastActivity;
-		return `${status} ${usage} ${model} ${name} ${activity}`;
+		return `${status} ${usage} ${context} ${model} ${name} ${activity}`;
 	});
 	const header = buildReviewPromptHeader(states);
 	const text = [header, lines.join("\n")].filter(Boolean).join("\n\n") || "subagents preparing...";
@@ -618,6 +663,7 @@ function applyRpcStateMetadata(state: RuntimeState, data: any): void {
 	if (typeof data.sessionFile === "string") state.sessionFile = data.sessionFile;
 	const actualModelRef = rpcModelRef(data.model);
 	if (actualModelRef) state.modelRef = actualModelRef;
+	if (typeof data.model?.contextWindow === "number") state.contextWindow = data.model.contextWindow;
 	if ((THINKING_LEVELS as readonly string[]).includes(data.thinkingLevel)) state.thinking = data.thinkingLevel;
 }
 
@@ -656,13 +702,27 @@ function applyEventToState(state: RuntimeState, event: any): void {
 		updateUsageFromMessage(state, event.message);
 		const text = assistantTextFromMessage(event.message);
 		if (text) state.finalAnswer = text;
+		if (event.message.stopReason === "error" || event.message.errorMessage) {
+			state.status = "error";
+			state.error = event.message.errorMessage || "assistant response ended with an error";
+			state.lastActivity = "failed";
+		}
 		return;
 	}
 	if (event.type === "agent_end") {
 		const text = finalAssistantText(event.messages || []);
-		if (text) state.finalAnswer = text;
-		state.status = "done";
-		state.lastActivity = "finished";
+		if (state.status === "error" || state.status === "aborted") {
+			if (text && !state.finalAnswer) state.finalAnswer = text;
+			return;
+		}
+		if (text) {
+			state.finalAnswer = text;
+			state.status = "done";
+			state.lastActivity = "finished";
+		} else {
+			state.status = "done";
+			state.lastActivity = "finished without final answer";
+		}
 	}
 }
 
@@ -743,7 +803,7 @@ async function prepareTasks(params: LaunchParams, ctx: ExtensionContext, pi: Ext
 
 async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: RuntimeState, emit: () => void, signal?: AbortSignal): Promise<ChildResult> {
 	state.status = "starting";
-	state.lastActivity = "starting pi rpc session…";
+	state.lastActivity = state.attempt > 1 ? `starting retry attempt ${state.attempt}/${state.maxAttempts}…` : "starting pi rpc session…";
 	emit();
 
 	let client: RpcClient | null = null;
@@ -817,15 +877,69 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 	}
 }
 
+function retryReason(state: RuntimeState): string {
+	const parts = [state.error, state.finalAnswer].filter(Boolean);
+	return cleanText(parts.join("\n")) || (state.status === "done" ? "subagent finished without a final answer" : `subagent ended with status ${state.status}`);
+}
+
+function isLikelyTransientSubagentFailure(result: ChildResult, signal?: AbortSignal): boolean {
+	const state = result.state;
+	if (signal?.aborted || state.status === "aborted") return false;
+	if (state.status === "done") return !state.finalAnswer.trim();
+	if (state.status !== "error") return false;
+
+	const reason = retryReason(state);
+	return /WebSocket closed|provider_transport_failure|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network|terminated|stream closed|connection closed|timed out/i.test(reason);
+}
+
+async function runSubagentWithRetries(task: ResolvedTask, ctx: ExtensionContext, state: RuntimeState, emit: () => void, signal?: AbortSignal): Promise<ChildResult> {
+	let lastResult: ChildResult | undefined;
+	for (let attempt = 1; attempt <= state.maxAttempts; attempt++) {
+		state.attempt = attempt;
+		state.error = undefined;
+		state.finalAnswer = "";
+		lastResult = await runSubagent(task, ctx, state, emit, signal);
+		const retryable = isLikelyTransientSubagentFailure(lastResult, signal);
+		if (attempt >= state.maxAttempts || !retryable) {
+			if (!state.finalAnswer.trim() && state.status === "done") {
+				state.status = "error";
+				state.error = retryReason(state);
+				state.lastActivity = "failed";
+				emit();
+			}
+			return lastResult;
+		}
+
+		const reason = retryReason(state);
+		state.previousErrors.push(`attempt ${attempt}: ${reason}`);
+		state.status = "starting";
+		state.error = undefined;
+		state.lastActivity = `retrying after ${oneLine(reason, 90)}`;
+		state.updatedAt = Date.now();
+		emit();
+		try {
+			await delay(SUBAGENT_RETRY_DELAY_MS, signal);
+		} catch {
+			state.status = "aborted";
+			state.error = "aborted by user";
+			state.lastActivity = "aborted";
+			emit();
+			return { state, exitCode: lastResult.exitCode };
+		}
+	}
+	return lastResult ?? { state, exitCode: null };
+}
+
 function buildFinalToolResult(results: ChildResult[]) {
 	const sections = results.map(({ state }) => {
 		const title = `## ${state.sessionName}`;
 		const modelLine = `Model: ${state.modelRef ?? "(unknown)"}`;
+		const retryNote = state.previousErrors.length > 0 ? `\n\nRetried after transient failure:\n${state.previousErrors.map((error) => `- ${oneLine(error, 180)}`).join("\n")}` : "";
 		if (state.status === "error" || state.status === "aborted") {
 			const body = state.finalAnswer || state.error || "Subagent failed without a final answer.";
-			return `${title}\n\n${modelLine}\n\n[${state.status}]\n${body}`;
+			return `${title}\n\n${modelLine}${retryNote}\n\n[${state.status}]\n${body}`;
 		}
-		return `${title}\n\n${modelLine}\n\n${state.finalAnswer || "(Subagent finished without a final answer.)"}`;
+		return `${title}\n\n${modelLine}${retryNote}\n\n${state.finalAnswer || "(Subagent finished without a final answer.)"}`;
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
 	const header = buildReviewPromptHeader(results.map((result) => result.state));
@@ -843,6 +957,11 @@ function buildFinalToolResult(results: ChildResult[]) {
 				thinking: result.state.thinking,
 				error: result.state.error,
 				usage: result.state.usage,
+				contextWindow: result.state.contextWindow,
+				contextTokens: result.state.contextTokens,
+				contextPercent: result.state.contextPercent,
+				attempts: result.state.attempt,
+				previousErrors: result.state.previousErrors,
 			})),
 		},
 		isError: failures === results.length,
@@ -896,6 +1015,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				lastActivity: "prepared",
 				finalAnswer: "",
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				attempt: 1,
+				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
+				previousErrors: [],
 				startedAt: Date.now(),
 				updatedAt: Date.now(),
 			}));
@@ -914,7 +1036,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })));
 			}
 
-			const results = await Promise.all(tasks.map((task, index) => runSubagent(task, ctx, activeStates[index]!, emit, signal)));
+			const results = await Promise.all(tasks.map((task, index) => runSubagentWithRetries(task, ctx, activeStates[index]!, emit, signal)));
 			emit();
 			return buildFinalToolResult(results);
 		},
