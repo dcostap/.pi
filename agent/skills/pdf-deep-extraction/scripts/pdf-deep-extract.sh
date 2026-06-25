@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  pdf-triangulate.sh <input.pdf> [output-dir]
+  pdf-deep-extract.sh <input.pdf> [output-dir]
 
 If output-dir is omitted, creates a non-destructive artifact folder under the user's temp directory.
 The work folder contains:
@@ -86,7 +86,7 @@ if [[ $# -eq 2 ]]; then
   outdir="$(to_msys_path "$2")"
 else
   tmp_root="$(local_temp_root)"
-  outdir="$tmp_root/pi-pdf-visual-triangulation/$slug-$(date +%Y%m%d-%H%M%S)-$$"
+  outdir="$tmp_root/pi-pdf-deep-extraction/$slug-$(date +%Y%m%d-%H%M%S)-$$"
 fi
 
 mkdir -p "$outdir"/{_input,_text,_markitdown,_pages,_summary}
@@ -124,7 +124,7 @@ fi
 pdftoppm -png -r 250 -cropbox "$work_pdf" "$pages_prefix"
 
 {
-  echo "PDF visual triangulation manifest"
+  echo "PDF deep extraction manifest"
   echo "Generated: $(date -Is)"
   echo "Source: $input_pdf"
   echo "Working copy: $work_pdf"

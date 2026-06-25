@@ -1,10 +1,10 @@
 ---
-name: pdf-visual-triangulation
+name: pdf-deep-extraction
 description: Coordinate or execute verified PDF-to-Markdown extraction for tax, finance, brokerage, bank, and other table-heavy PDFs. Use one worker/subagent per PDF when possible. Workers create pdftotext, MarkItDown, and page-image artifacts, then write a verified final file next to the PDF as original.pdf.md.
 compatibility: Windows/MSYS bash with Poppler pdftotext/pdftoppm and uvx or MarkItDown. Tested with uvx --from 'markitdown[pdf]'.
 ---
 
-# PDF Visual Triangulation
+# PDF Deep Extraction
 
 Shared contract for coordinator agents and worker subagents.
 
@@ -13,7 +13,7 @@ Shared contract for coordinator agents and worker subagents.
 For multiple PDFs, launch one generic subagent per PDF, up to 4 in parallel. The prompt can be short:
 
 ```text
-Read/use the global skill `pdf-visual-triangulation`.
+Read/use the global skill `pdf-deep-extraction`.
 Process this PDF in worker mode:
 <PDF_PATH>
 
@@ -32,7 +32,7 @@ Given exactly one PDF:
 3. Run the helper script with a generous timeout, at least 300 seconds:
 
 ```bash
-"$HOME/.pi/agent/skills/pdf-visual-triangulation/scripts/pdf-triangulate.sh" "<PDF_PATH>"
+"$HOME/.pi/agent/skills/pdf-deep-extraction/scripts/pdf-deep-extract.sh" "<PDF_PATH>"
 ```
 
 The helper prints both MSYS paths and Windows paths. When using Pi `read` on Windows, prefer the printed `Output directory Windows` path.
