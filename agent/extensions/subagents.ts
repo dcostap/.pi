@@ -14,8 +14,6 @@ const MAX_SUBAGENTS = 4;
 const REVIEW_SESSION_PREFIX = "[Review Subagent]";
 const GENERIC_SESSION_PREFIX = "[Generic Subagent]";
 const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' conclusions and statements; be discerning, analytical, and self-reliant. You make your own conclusions.";
-const WORKER_ENV = "PI_SUBAGENT_ROLE";
-const WORKER_ENV_VALUE = "worker";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const MAX_SUBAGENT_ATTEMPTS = 2;
 const SUBAGENT_RETRY_DELAY_MS = 1_000;
@@ -105,10 +103,6 @@ type ChildResult = {
 	state: RuntimeState;
 	exitCode: number | null;
 };
-
-function isWorker(): boolean {
-	return process.env[WORKER_ENV] === WORKER_ENV_VALUE;
-}
 
 function cleanText(value: string): string {
 	return value.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
@@ -416,7 +410,6 @@ function buildReviewSubagentInstructions(task: ResolvedTask, cwd: string): strin
 		"Do not make durable project changes. This is code review only.",
 		"If you believe a durable project change is necessary, explain that recommendation in your final answer instead of doing it.",
 		"",
-		"You do not have access to launching further subagents from here.",
 		"Perform an independent code review of the assigned code review target. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
 	].join("\n");
 }
@@ -434,7 +427,6 @@ function buildGenericSubagentInstructions(task: ResolvedTask, cwd: string): stri
 		"Do not treat the project cwd itself as scratch space.",
 		"Do not make durable project changes unless the task explicitly asks you to modify project files.",
 		"",
-		"You do not have access to launching further subagents from here.",
 		"Complete the assigned task independently. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
 	].join("\n");
 }
@@ -643,7 +635,6 @@ class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 			env: {
 				...process.env,
-				[WORKER_ENV]: WORKER_ENV_VALUE,
 				PI_SUBAGENT_SANDBOX: this.task.sandboxDir,
 			},
 		});
@@ -1107,8 +1098,6 @@ function buildFinalToolResult(results: ChildResult[]) {
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-	if (isWorker()) return;
-
 	pi.on("before_agent_start", (event) => ({
 		systemPrompt: `${event.systemPrompt}\n\n${buildMainSystemPromptAddition()}`,
 	}));
