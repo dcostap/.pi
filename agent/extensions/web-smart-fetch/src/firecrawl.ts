@@ -3,7 +3,11 @@ import type FirecrawlDefault from "@mendable/firecrawl-js";
 import type { ExtensionConfig } from "./config.ts";
 
 type FirecrawlClient = FirecrawlDefault;
-type FirecrawlConstructor = new (options?: { apiKey?: string | null; apiUrl?: string | null }) => FirecrawlClient;
+const FIRECRAWL_TIMEOUT_MS = 60_000;
+
+// Firecrawl's SDK default HTTP timeout is 300_000ms. Keep Pi tools responsive by
+// capping long network/scrape waits at one minute.
+type FirecrawlConstructor = new (options?: { apiKey?: string | null; apiUrl?: string | null; timeoutMs?: number }) => FirecrawlClient;
 
 function getFirecrawlConstructor(): FirecrawlConstructor {
 	const seen = new Set<unknown>();
@@ -34,18 +38,20 @@ function getFirecrawlConstructor(): FirecrawlConstructor {
 export function getFirecrawlClient(config: ExtensionConfig): FirecrawlClient | undefined {
 	if (!config.firecrawlApiKey) return undefined;
 	const Firecrawl = getFirecrawlConstructor();
-	return new Firecrawl({ apiKey: config.firecrawlApiKey });
+	return new Firecrawl({ apiKey: config.firecrawlApiKey, timeoutMs: FIRECRAWL_TIMEOUT_MS });
 }
 
 export async function scrapeWithFirecrawl(client: FirecrawlClient, url: string) {
 	return await client.scrape(url, {
 		formats: ["markdown", "html", "links"],
+		timeout: FIRECRAWL_TIMEOUT_MS,
 	});
 }
 
 export async function questionWithFirecrawl(client: FirecrawlClient, url: string, question: string) {
 	return await client.scrape(url, {
 		formats: [{ type: "question", question }, "markdown", "html", "links"],
+		timeout: FIRECRAWL_TIMEOUT_MS,
 	});
 }
 
@@ -56,6 +62,7 @@ export async function searchWithFirecrawl(client: FirecrawlClient, query: string
 export async function crawlWithFirecrawl(client: FirecrawlClient, url: string, limit = 20) {
 	return await client.crawl(url, {
 		limit,
-		scrapeOptions: { formats: ["markdown"] },
+		timeout: FIRECRAWL_TIMEOUT_MS / 1000,
+		scrapeOptions: { formats: ["markdown"], timeout: FIRECRAWL_TIMEOUT_MS },
 	});
 }

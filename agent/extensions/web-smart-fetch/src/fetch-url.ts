@@ -39,6 +39,36 @@ type FetchResult = {
 };
 
 const MIN_CHARS_FOR_TLDR = 5000;
+const NETWORK_STEP_TIMEOUT_MS = 60_000;
+
+function timeoutSignal(parent: AbortSignal | undefined, ms: number, label: string): { signal: AbortSignal; cancel: () => void } {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(new Error(`${label} timed out after ${ms}ms`)), ms);
+	const onAbort = () => controller.abort(parent?.reason || new Error("Operation aborted"));
+	if (parent?.aborted) onAbort();
+	else parent?.addEventListener("abort", onAbort, { once: true });
+	return {
+		signal: controller.signal,
+		cancel: () => {
+			clearTimeout(timeout);
+			parent?.removeEventListener("abort", onAbort);
+		},
+	};
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<T>((_, reject) => {
+				timeout = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+			}),
+		]);
+	} finally {
+		if (timeout) clearTimeout(timeout);
+	}
+}
 
 type GitHubModule = {
 	parseGitHubUrl: (url: string) => unknown;
@@ -441,8 +471,13 @@ export async function fetchUrl(
 
 	let result: FetchResult;
 	try {
-		onUpdate?.({ content: [{ type: "text", text: "Fetching URL locally..." }] });
-		result = (await localFetch(url, config, signal)) as FetchResult;
+		onUpdate?.({ content: [{ type: "text", text: `Fetching URL locally... (timeout ${NETWORK_STEP_TIMEOUT_MS / 1000}s)` }] });
+		const localTimeout = timeoutSignal(signal, NETWORK_STEP_TIMEOUT_MS, "Local URL fetch");
+		try {
+			result = (await localFetch(url, config, localTimeout.signal)) as FetchResult;
+		} finally {
+			localTimeout.cancel();
+		}
 		onUpdate?.({ content: [{ type: "text", text: "Extracted local content. Assessing quality..." }] });
 	} catch (error) {
 		const artifactDir = makeArtifactDir(config.fetchesDir, "fetch", url);
@@ -493,7 +528,13 @@ export async function fetchUrl(
 	if (processed.quality === "WEAK") {
 		onUpdate?.({ content: [{ type: "text", text: `Extraction looked weak (${processed.reason}). Trying Jina Reader...` }] });
 		try {
-			const jinaText = await fetchWithJina(result.url, signal);
+			const jinaTimeout = timeoutSignal(signal, NETWORK_STEP_TIMEOUT_MS, "Jina Reader fetch");
+			let jinaText = "";
+			try {
+				jinaText = await fetchWithJina(result.url, jinaTimeout.signal);
+			} finally {
+				jinaTimeout.cancel();
+			}
 			const jinaReasons = assessWeakness(jinaText, undefined, { apiLike: sparkContext.contentKind === "api" });
 			const jinaProcessed = await processExtractedContentWithSpark(jinaText, ctx, jinaReasons, signal, prompt, {
 				...sparkContext,
@@ -524,8 +565,12 @@ export async function fetchUrl(
 
 	if (processed.quality === "WEAK") {
 		if (client && firecrawl) {
-			onUpdate?.({ content: [{ type: "text", text: "Escalating to Firecrawl..." }] });
-			const scraped: any = await firecrawl.scrapeWithFirecrawl(client, result.url);
+			onUpdate?.({ content: [{ type: "text", text: `Escalating to Firecrawl... (timeout ${NETWORK_STEP_TIMEOUT_MS / 1000}s)` }] });
+			const scraped: any = await withTimeout(
+				firecrawl.scrapeWithFirecrawl(client, result.url),
+				NETWORK_STEP_TIMEOUT_MS,
+				"Firecrawl scrape",
+			);
 			const fcMarkdown = scraped?.markdown || scraped?.data?.markdown || "";
 			const fcHtml = scraped?.html || scraped?.data?.html || "";
 			const fcTitle = scraped?.metadata?.title || scraped?.data?.metadata?.title;
