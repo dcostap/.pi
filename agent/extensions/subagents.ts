@@ -8,9 +8,11 @@ import type { Model } from "@earendil-works/pi-ai";
 import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const TOOL_NAME = "launch_review_subagents";
+const REVIEW_TOOL_NAME = "launch_review_subagents";
+const GENERIC_TOOL_NAME = "launch_generic_subagents";
 const MAX_SUBAGENTS = 4;
-const SESSION_PREFIX = "[Review Subagent]";
+const REVIEW_SESSION_PREFIX = "[Review Subagent]";
+const GENERIC_SESSION_PREFIX = "[Generic Subagent]";
 const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' conclusions and statements; be discerning, analytical, and self-reliant. You make your own conclusions.";
 const WORKER_ENV = "PI_SUBAGENT_ROLE";
 const WORKER_ENV_VALUE = "worker";
@@ -19,26 +21,43 @@ const MAX_SUBAGENT_ATTEMPTS = 2;
 const SUBAGENT_RETRY_DELAY_MS = 1_000;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+type SubagentKind = "review" | "generic";
 
-type ReviewerParams = {
+type CommonSubagentParams = {
 	description: string;
-	focus?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
 };
 
-type LaunchParams = {
+type ReviewerParams = CommonSubagentParams & {
+	focus?: string;
+};
+
+type ReviewLaunchParams = {
 	what_to_review: string;
 	reviewers: ReviewerParams[];
 };
 
-type ResolvedTask = ReviewerParams & {
+type GenericSubagentParams = CommonSubagentParams & {
+	assignment?: string;
+};
+
+type GenericLaunchParams = {
+	task: string;
+	subagents: GenericSubagentParams[];
+};
+
+type ResolvedTask = CommonSubagentParams & {
+	kind: SubagentKind;
 	index: number;
 	sessionName: string;
 	sandboxDir: string;
 	systemPromptPath: string;
-	whatToReview: string;
+	userPrompt: string;
+	mainTask: string;
+	whatToReview?: string;
 	focus?: string;
+	assignment?: string;
 	modelRef?: string;
 	thinking?: ThinkingLevel;
 };
@@ -55,12 +74,15 @@ type UsageStats = {
 };
 
 type RuntimeState = {
+	kind: SubagentKind;
 	index: number;
 	description: string;
 	sessionName: string;
 	sandboxDir: string;
-	whatToReview: string;
+	mainTask: string;
+	whatToReview?: string;
 	focus?: string;
+	assignment?: string;
 	modelRef?: string;
 	thinking?: ThinkingLevel;
 	status: SubagentStatus;
@@ -274,7 +296,7 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 const REVIEW_RUBRIC = `# Review Guidelines
 
-You are acting as an independent code reviewer. The caller will provide the review target separately.
+You are acting as an independent code reviewer. The caller will provide the code review target separately.
 
 ## What to flag
 
@@ -379,9 +401,9 @@ Possible callouts:
 - Do not stop at the first issue; report every qualifying finding.
 `;
 
-function buildSubagentInstructions(task: ResolvedTask, cwd: string): string {
+function buildReviewSubagentInstructions(task: ResolvedTask, cwd: string): string {
 	return [
-		"You are a Pi review subagent launched by the main agent.",
+		"You are a Pi code review subagent launched by the main agent.",
 		"You are working from the same cwd as the main agent:",
 		cwd,
 		"",
@@ -391,55 +413,102 @@ function buildSubagentInstructions(task: ResolvedTask, cwd: string): string {
 		"You may freely create, edit, run, and inspect temporary scripts/files inside that sandbox.",
 		"Prefer the sandbox for scratch work, experiments, temporary logs, and throwaway scripts.",
 		"Do not treat the project cwd itself as scratch space.",
-		"Do not make durable project changes. This is review only.",
+		"Do not make durable project changes. This is code review only.",
 		"If you believe a durable project change is necessary, explain that recommendation in your final answer instead of doing it.",
 		"",
 		"You do not have access to launching further subagents from here.",
-		"Perform an independent code review of the assigned review target. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
+		"Perform an independent code review of the assigned code review target. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
+	].join("\n");
+}
+
+function buildGenericSubagentInstructions(task: ResolvedTask, cwd: string): string {
+	return [
+		"You are a Pi generic subagent launched by the main agent.",
+		"You are working from the same cwd as the main agent:",
+		cwd,
+		"",
+		"Your scratch sandbox is:",
+		task.sandboxDir,
+		"",
+		"Use the sandbox for scratch work, experiments, temporary logs, and throwaway scripts.",
+		"Do not treat the project cwd itself as scratch space.",
+		"Do not make durable project changes unless the task explicitly asks you to modify project files.",
+		"",
+		"You do not have access to launching further subagents from here.",
+		"Complete the assigned task independently. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
 	].join("\n");
 }
 
 function buildSubagentInstructionsFile(task: ResolvedTask, cwd: string): string {
-	return buildSubagentInstructions(task, cwd);
+	return task.kind === "review" ? buildReviewSubagentInstructions(task, cwd) : buildGenericSubagentInstructions(task, cwd);
 }
 
-function buildSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
+function buildReviewSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
 	const parts = [
-		"<persistent_review_subagent_instructions>",
-		buildSubagentInstructions(task, cwd),
-		"</persistent_review_subagent_instructions>",
+		"<persistent_code_review_subagent_instructions>",
+		buildReviewSubagentInstructions(task, cwd),
+		"</persistent_code_review_subagent_instructions>",
 		"",
-		"<review_rubric>",
+		"<code_review_rubric>",
 		REVIEW_RUBRIC,
-		"</review_rubric>",
+		"</code_review_rubric>",
 		"",
-		"<review_target>",
-		task.whatToReview,
-		"</review_target>",
+		"<code_review_target>",
+		task.whatToReview ?? task.mainTask,
+		"</code_review_target>",
 	];
 	if (task.focus) {
 		parts.push("", "<neutral_focus>", task.focus, "</neutral_focus>");
 	}
 	parts.push(
 		"",
-		"Important: follow the rubric above. The caller supplied only the review target and optional neutral focus; do not infer suspected findings from the wording. Report only concrete, actionable issues you can prove from the code.",
+		"Important: follow the code review rubric above. The caller supplied only the code review target and optional neutral focus; do not infer suspected findings from the wording. Report only concrete, actionable code issues you can prove from the code.",
 	);
+	return parts.join("\n");
+}
+
+function buildGenericSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
+	const parts = [
+		"<persistent_generic_subagent_instructions>",
+		buildGenericSubagentInstructions(task, cwd),
+		"</persistent_generic_subagent_instructions>",
+		"",
+		"<task>",
+		task.mainTask,
+		"</task>",
+	];
+	if (task.assignment) {
+		parts.push("", "<subagent_assignment>", task.assignment, "</subagent_assignment>");
+	}
+	parts.push("", "Return a concise, self-contained final answer for the main agent to synthesize.");
 	return parts.join("\n");
 }
 
 function buildMainSystemPromptAddition(): string {
 	return [
 		"Review subagents:",
-		`- You have a ${TOOL_NAME} tool that launches fresh same-cwd Pi review subagent sessions in parallel.`,
-		"- Only launch review subagents when the user explicitly asks for subagents/parallel agents to review something, or unmistakably asks you to delegate review work to other agents.",
+		`- You have a ${REVIEW_TOOL_NAME} tool that launches fresh same-cwd Pi code review subagent sessions in parallel.`,
+		"- Review subagents are specifically for code reviews. Use them for reviewing code, diffs, implementation plans with code impact, or concrete code-review targets.",
+		"- Only launch review subagents when the user explicitly asks for subagents/parallel agents to review code, or unmistakably asks you to delegate code review work to other agents.",
 		`- You may launch at most ${MAX_SUBAGENTS} review subagents in one tool call. If the user asks for multiple reviewers, use one parallel tool call rather than sequential calls when possible.`,
-		"- The tool already injects the standard review rubric and output format into each review subagent prompt.",
-		"- When calling the tool, specify only what to review and optional neutral focus areas. Do not paste review instructions, formatting requirements, expected verdicts, or suspected findings into the review target.",
+		"- The tool already injects the standard code review rubric and output format into each review subagent prompt.",
+		"- When calling the review tool, specify only what code to review and optional neutral focus areas. Do not paste review instructions, formatting requirements, expected verdicts, or suspected findings into the review target.",
 		"- Avoid biasing review subagents. Do not tell them what bugs you expect unless the user explicitly asked to verify a specific concern; if so, label it as user-provided focus.",
 		"- Each review subagent is a brand-new session named `[Review Subagent] <description>`. Choose short, distinctive descriptions; if repeating a similar review, add your own suffix like `#2`.",
 		"- The tool returns only each review subagent's final answer to your context. Synthesize those answers for the user, deduplicate findings, and call out disagreements or uncertainty.",
 		"- By default review subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-reviewer `model` and/or `thinking`.",
 		"- Model overrides may be loose names, but you should resolve ambiguity before launching when possible. If a name could refer to multiple providers/models, ask the user which provider/model they mean instead of guessing. You can inspect models with `pi --list-models <query>` if needed.",
+		"",
+		"Generic subagents:",
+		`- You also have a ${GENERIC_TOOL_NAME} tool that launches fresh same-cwd Pi generic subagent sessions in parallel.`,
+		"- Generic subagents do not receive the code review rubric or any task-specific output format. Provide the complete task and any per-subagent assignment yourself.",
+		"- Use generic subagents only when the user explicitly asks for subagents/parallel agents/delegation, or unmistakably wants independent parallel investigation or exploration.",
+		"- Do not use generic subagents for code review tasks; use the review subagent tool for code reviews.",
+		`- You may launch at most ${MAX_SUBAGENTS} generic subagents in one tool call.`,
+		"- Each generic subagent is a brand-new session named `[Generic Subagent] <description>`. Choose short, distinctive descriptions.",
+		"- The generic tool returns only each subagent's final answer to your context. Synthesize results for the user, deduplicate, and call out disagreements or uncertainty.",
+		"- By default generic subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-subagent `model` and/or `thinking`.",
+		"- Generic subagent model overrides follow the same ambiguity rules as review subagents: ask the user to clarify rather than guessing among multiple possible model matches.",
 	].join("\n");
 }
 
@@ -511,16 +580,21 @@ function statusIcon(status: SubagentStatus): string {
 	}
 }
 
-function buildReviewPromptHeader(states: RuntimeState[]): string {
-	const whatToReview = states.find((state) => state.whatToReview)?.whatToReview;
+function buildSubagentPromptHeader(states: RuntimeState[]): string {
+	const first = states[0];
+	const mainTask = states.find((state) => state.mainTask)?.mainTask;
 	const lines: string[] = [];
-	if (whatToReview) {
-		lines.push("Review target prompt sent to subagents:", "<<<", whatToReview, ">>>");
+	if (mainTask) {
+		lines.push(first?.kind === "generic" ? "Generic task prompt sent to subagents:" : "Code review target prompt sent to subagents:", "<<<", mainTask, ">>>");
 	}
-	const focusLines = states
-		.filter((state) => state.focus)
-		.map((state) => `- ${state.sessionName}: ${state.focus}`);
-	if (focusLines.length > 0) lines.push("", "Neutral focus by subagent:", ...focusLines);
+	const detailLines = states
+		.map((state) => {
+			if (state.kind === "generic" && state.assignment) return `- ${state.sessionName}: ${state.assignment}`;
+			if (state.kind === "review" && state.focus) return `- ${state.sessionName}: ${state.focus}`;
+			return undefined;
+		})
+		.filter((line): line is string => Boolean(line));
+	if (detailLines.length > 0) lines.push("", first?.kind === "generic" ? "Assignment by subagent:" : "Neutral focus by subagent:", ...detailLines);
 	return lines.join("\n");
 }
 
@@ -535,7 +609,7 @@ function buildToolPartial(states: RuntimeState[]) {
 		const activity = state.error ?? state.lastActivity;
 		return `${status} ${usage} ${context} ${model} ${name} ${activity}`;
 	});
-	const header = buildReviewPromptHeader(states);
+	const header = buildSubagentPromptHeader(states);
 	const text = [header, lines.join("\n")].filter(Boolean).join("\n\n") || "subagents preparing...";
 	return {
 		content: [{ type: "text" as const, text }],
@@ -726,79 +800,138 @@ function applyEventToState(state: RuntimeState, event: any): void {
 	}
 }
 
-async function prepareTasks(params: LaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<{ tasks?: ResolvedTask[]; errors?: string[] }> {
-	const errors: string[] = [];
-	const whatToReview = cleanText(params.what_to_review || "");
-	if (!whatToReview) errors.push("what_to_review is required and should describe only the review target");
-	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one review subagent");
-	if (Array.isArray(params.reviewers) && params.reviewers.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} review subagents may be launched at once`);
-	if (errors.length > 0) return { errors };
+type PendingResolvedTask = Omit<ResolvedTask, "sandboxDir" | "systemPromptPath" | "userPrompt">;
 
-	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
-	const currentModelRef = getCurrentModelRef(ctx);
-	const currentThinking = pi.getThinkingLevel() as ThinkingLevel;
-	const resolved: Array<Omit<ResolvedTask, "sandboxDir" | "systemPromptPath">> = [];
+type PreparedTasks = { tasks?: ResolvedTask[]; errors?: string[] };
 
-	params.reviewers.forEach((reviewer, index) => {
-		const description = sanitizeDescription(reviewer.description || "");
-		const focus = cleanText(reviewer.focus || "");
-		if (!description) errors.push(`reviewer ${index + 1}: description is required`);
+function resolveCommonSubagentParams(
+	params: CommonSubagentParams,
+	index: number,
+	label: string,
+	errors: string[],
+	availableModels: Model<any>[],
+	currentModelRef: string | undefined,
+	currentThinking: ThinkingLevel,
+): CommonSubagentParams & { description: string; modelRef?: string; thinking?: ThinkingLevel } {
+	const description = sanitizeDescription(params.description || "");
+	if (!description) errors.push(`${label} ${index + 1}: description is required`);
 
-		let modelOverride = reviewer.model?.trim();
-		let thinking = reviewer.thinking ?? currentThinking;
-		let explicitThinking = Boolean(reviewer.thinking);
-		let modelRefForTask = currentModelRef;
+	let modelOverride = params.model?.trim();
+	let thinking = params.thinking ?? currentThinking;
+	let explicitThinking = Boolean(params.thinking);
+	let modelRefForTask = currentModelRef;
 
-		if (modelOverride) {
-			const parsed = parseModelSpec(modelOverride);
-			modelOverride = parsed.query;
-			if (parsed.thinking) {
-				if (reviewer.thinking && reviewer.thinking !== parsed.thinking) {
-					errors.push(`reviewer ${index + 1}: model override includes :${parsed.thinking} but thinking is also set to ${reviewer.thinking}`);
-				} else {
-					thinking = parsed.thinking;
-					explicitThinking = true;
-				}
-			}
-
-			const match = resolveModelOverride(modelOverride, availableModels);
-			if (!match.ok) {
-				errors.push(`reviewer ${index + 1} (${description}): ${match.message}`);
+	if (modelOverride) {
+		const parsed = parseModelSpec(modelOverride);
+		modelOverride = parsed.query;
+		if (parsed.thinking) {
+			if (params.thinking && params.thinking !== parsed.thinking) {
+				errors.push(`${label} ${index + 1}: model override includes :${parsed.thinking} but thinking is also set to ${params.thinking}`);
 			} else {
-				modelRefForTask = modelRef(match.model);
-				const thinkingError = validateRequestedThinking(match.model, thinking, explicitThinking);
-				if (thinkingError) errors.push(`reviewer ${index + 1} (${description}): ${thinkingError}`);
+				thinking = parsed.thinking;
+				explicitThinking = true;
 			}
 		}
 
-		resolved.push({
-			...reviewer,
-			description,
-			focus: focus || undefined,
-			whatToReview,
-			index,
-			sessionName: `${SESSION_PREFIX} ${description}`,
-			modelRef: modelRefForTask,
-			thinking,
-		});
-	});
+		const match = resolveModelOverride(modelOverride, availableModels);
+		if (match.ok === false) {
+			errors.push(`${label} ${index + 1} (${description}): ${match.message}`);
+		} else {
+			modelRefForTask = modelRef(match.model);
+			const thinkingError = validateRequestedThinking(match.model, thinking, explicitThinking);
+			if (thinkingError) errors.push(`${label} ${index + 1} (${description}): ${thinkingError}`);
+		}
+	}
 
-	if (errors.length > 0) return { errors };
+	return {
+		...params,
+		description,
+		modelRef: modelRefForTask,
+		thinking,
+	};
+}
 
+async function finalizeTasks(
+	pending: PendingResolvedTask[],
+	ctx: ExtensionContext,
+	systemPromptFileName: string,
+	buildUserPrompt: (task: ResolvedTask, cwd: string) => string,
+): Promise<ResolvedTask[]> {
 	const withSandboxes: ResolvedTask[] = [];
-	for (const task of resolved) {
+	for (const task of pending) {
 		const sandboxRoot = path.join(tmpdir(), "pi-subagents");
 		await mkdir(sandboxRoot, { recursive: true });
 		const unique = `${slugify(task.description)}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 		const sandboxDir = path.join(sandboxRoot, unique);
 		await mkdir(sandboxDir, { recursive: true });
-		const systemPromptPath = path.join(sandboxDir, "REVIEW_SUBAGENT_SYSTEM_PROMPT.md");
-		const finalTask = { ...task, sandboxDir, systemPromptPath };
+		const systemPromptPath = path.join(sandboxDir, systemPromptFileName);
+		const finalTask: ResolvedTask = { ...task, sandboxDir, systemPromptPath, userPrompt: "" };
+		finalTask.userPrompt = buildUserPrompt(finalTask, ctx.cwd);
 		await writeFile(systemPromptPath, buildSubagentInstructionsFile(finalTask, ctx.cwd), "utf8");
 		withSandboxes.push(finalTask);
 	}
+	return withSandboxes;
+}
 
-	return { tasks: withSandboxes };
+async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<PreparedTasks> {
+	const errors: string[] = [];
+	const whatToReview = cleanText(params.what_to_review || "");
+	if (!whatToReview) errors.push("what_to_review is required and should describe only the code review target");
+	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one code review subagent");
+	if (Array.isArray(params.reviewers) && params.reviewers.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} code review subagents may be launched at once`);
+	if (errors.length > 0) return { errors };
+
+	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
+	const currentModelRef = getCurrentModelRef(ctx);
+	const currentThinking = pi.getThinkingLevel() as ThinkingLevel;
+	const resolved: PendingResolvedTask[] = [];
+
+	params.reviewers.forEach((reviewer, index) => {
+		const common = resolveCommonSubagentParams(reviewer, index, "reviewer", errors, availableModels, currentModelRef, currentThinking);
+		const focus = cleanText(reviewer.focus || "");
+		resolved.push({
+			...common,
+			kind: "review",
+			index,
+			sessionName: `${REVIEW_SESSION_PREFIX} ${common.description}`,
+			mainTask: whatToReview,
+			whatToReview,
+			focus: focus || undefined,
+		});
+	});
+
+	if (errors.length > 0) return { errors };
+	return { tasks: await finalizeTasks(resolved, ctx, "REVIEW_SUBAGENT_SYSTEM_PROMPT.md", buildReviewSubagentUserPrompt) };
+}
+
+async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<PreparedTasks> {
+	const errors: string[] = [];
+	const task = cleanText(params.task || "");
+	if (!task) errors.push("task is required and should contain the full generic subagent task");
+	if (!Array.isArray(params.subagents) || params.subagents.length === 0) errors.push("subagents must contain at least one generic subagent");
+	if (Array.isArray(params.subagents) && params.subagents.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} generic subagents may be launched at once`);
+	if (errors.length > 0) return { errors };
+
+	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
+	const currentModelRef = getCurrentModelRef(ctx);
+	const currentThinking = pi.getThinkingLevel() as ThinkingLevel;
+	const resolved: PendingResolvedTask[] = [];
+
+	params.subagents.forEach((subagent, index) => {
+		const common = resolveCommonSubagentParams(subagent, index, "subagent", errors, availableModels, currentModelRef, currentThinking);
+		const assignment = cleanText(subagent.assignment || "");
+		resolved.push({
+			...common,
+			kind: "generic",
+			index,
+			sessionName: `${GENERIC_SESSION_PREFIX} ${common.description}`,
+			mainTask: task,
+			assignment: assignment || undefined,
+		});
+	});
+
+	if (errors.length > 0) return { errors };
+	return { tasks: await finalizeTasks(resolved, ctx, "GENERIC_SUBAGENT_SYSTEM_PROMPT.md", buildGenericSubagentUserPrompt) };
 }
 
 async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: RuntimeState, emit: () => void, signal?: AbortSignal): Promise<ChildResult> {
@@ -825,7 +958,7 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 
 		client.start(signal);
 		const exitPromise = client.waitForExit();
-		await client.send("prompt", { message: buildSubagentUserPrompt(task, ctx.cwd) }, 30_000);
+		await client.send("prompt", { message: task.userPrompt }, 30_000);
 		try {
 			const stateResponse = await client.send("get_state", {}, 5_000);
 			applyRpcStateMetadata(state, stateResponse.data);
@@ -845,7 +978,7 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 				state.status = "aborted";
 				state.error = "aborted by user";
 				state.lastActivity = "aborted";
-			} else if (!sawAgentEnd && state.status !== "done") {
+			} else if (!sawAgentEnd && (state.status as SubagentStatus) !== "done") {
 				state.status = "error";
 				state.error = "subagent exited before agent_end";
 				state.lastActivity = "failed";
@@ -859,7 +992,7 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 			state.status = "aborted";
 			state.error = "aborted by user";
 			state.lastActivity = "aborted";
-		} else if (state.status !== "done") {
+		} else if ((state.status as SubagentStatus) !== "done") {
 			state.status = "error";
 			state.error = client.stderr.trim() || `subagent exited before completion with code ${exitCode ?? "unknown"}`;
 			state.lastActivity = "failed";
@@ -942,16 +1075,21 @@ function buildFinalToolResult(results: ChildResult[]) {
 		return `${title}\n\n${modelLine}${retryNote}\n\n${state.finalAnswer || "(Subagent finished without a final answer.)"}`;
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
-	const header = buildReviewPromptHeader(results.map((result) => result.state));
+	const header = buildSubagentPromptHeader(results.map((result) => result.state));
 	return {
 		content: [{ type: "text" as const, text: [header, ...sections, FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
 		details: {
 			failures,
 			results: results.map((result) => ({
+				kind: result.state.kind,
 				description: result.state.description,
 				sessionName: result.state.sessionName,
 				sessionFile: result.state.sessionFile,
 				sandboxDir: result.state.sandboxDir,
+				mainTask: result.state.mainTask,
+				whatToReview: result.state.whatToReview,
+				focus: result.state.focus,
+				assignment: result.state.assignment,
 				status: result.state.status,
 				modelRef: result.state.modelRef,
 				thinking: result.state.thinking,
@@ -976,11 +1114,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	}));
 
 	pi.registerTool({
-		name: TOOL_NAME,
-		label: "Launch Review Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi review subagents in parallel. The extension injects the review rubric and output format; callers should provide only what to review and optional neutral focus areas.`,
+		name: REVIEW_TOOL_NAME,
+		label: "Launch Code Review Subagents",
+		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi code review subagents in parallel. The extension injects the code review rubric and output format; callers should provide only what code to review and optional neutral focus areas.`,
 		parameters: Type.Object({
-			what_to_review: Type.String({ description: "Neutral description of the review target. Specify only what to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
+			what_to_review: Type.String({ description: "Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
 			reviewers: Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
@@ -988,14 +1126,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
 					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
 				}),
-				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Review subagents to launch in parallel, max ${MAX_SUBAGENTS}.` },
+				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Code review subagents to launch in parallel, max ${MAX_SUBAGENTS}.` },
 			),
 		}),
-		async execute(_toolCallId, params: LaunchParams, signal, onUpdate, ctx) {
-			const prepared = await prepareTasks(params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
+		async execute(_toolCallId, params: ReviewLaunchParams, signal, onUpdate, ctx) {
+			const prepared: PreparedTasks = await prepareReviewTasks(params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
 			if (prepared.errors?.length) {
 				return {
-					content: [{ type: "text", text: [`Review subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
+					content: [{ type: "text", text: [`Code review subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
 					details: { errors: prepared.errors },
 					isError: true,
 				};
@@ -1003,12 +1141,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 			const tasks = prepared.tasks ?? [];
 			const activeStates: RuntimeState[] = tasks.map((task) => ({
+				kind: task.kind,
 				index: task.index,
 				description: task.description,
 				sessionName: task.sessionName,
 				sandboxDir: task.sandboxDir,
+				mainTask: task.mainTask,
 				whatToReview: task.whatToReview,
 				focus: task.focus,
+				assignment: task.assignment,
 				modelRef: task.modelRef,
 				thinking: task.thinking,
 				status: "preparing",
@@ -1042,12 +1183,97 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
-			const label = `${theme.fg("toolTitle", theme.bold(TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}`;
+			const label = `${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}`;
 			return new Text(label, 0, 0);
 		},
 		renderResult(result, { isPartial }, theme) {
 			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
-			const prefix = result?.isError ? theme.fg("error", "review subagents") : theme.fg("success", "review subagents");
+			const prefix = result?.isError ? theme.fg("error", "code review subagents") : theme.fg("success", "code review subagents");
+			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
+
+			const container = new Container();
+			container.addChild(new Text(prefix, 0, 0));
+			if (text) container.addChild(new Markdown(text, 0, 0, getMarkdownTheme()));
+			return container;
+		},
+	});
+
+	pi.registerTool({
+		name: GENERIC_TOOL_NAME,
+		label: "Launch Generic Subagents",
+		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi generic subagents in parallel. No code review rubric or task-specific output format is injected; callers must provide the complete task and any per-subagent assignment.`,
+		parameters: Type.Object({
+			task: Type.String({ description: "Complete generic task to give every subagent. Include all relevant context and desired output shape." }),
+			subagents: Type.Array(
+				Type.Object({
+					description: Type.String({ description: "Short session description used as `[Generic Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated subagents." }),
+					assignment: Type.Optional(Type.String({ description: "Optional per-subagent assignment, angle, or scope. This is appended to the shared task." })),
+					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
+					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
+				}),
+				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Generic subagents to launch in parallel, max ${MAX_SUBAGENTS}.` },
+			),
+		}),
+		async execute(_toolCallId, params: GenericLaunchParams, signal, onUpdate, ctx) {
+			const prepared: PreparedTasks = await prepareGenericTasks(params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
+			if (prepared.errors?.length) {
+				return {
+					content: [{ type: "text", text: [`Generic subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
+					details: { errors: prepared.errors },
+					isError: true,
+				};
+			}
+
+			const tasks = prepared.tasks ?? [];
+			const activeStates: RuntimeState[] = tasks.map((task) => ({
+				kind: task.kind,
+				index: task.index,
+				description: task.description,
+				sessionName: task.sessionName,
+				sandboxDir: task.sandboxDir,
+				mainTask: task.mainTask,
+				whatToReview: task.whatToReview,
+				focus: task.focus,
+				assignment: task.assignment,
+				modelRef: task.modelRef,
+				thinking: task.thinking,
+				status: "preparing",
+				lastActivity: "prepared",
+				finalAnswer: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				attempt: 1,
+				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
+				previousErrors: [],
+				startedAt: Date.now(),
+				updatedAt: Date.now(),
+			}));
+
+			const emit = () => {
+				onUpdate?.(buildToolPartial(activeStates));
+			};
+
+			emit();
+
+			if (signal?.aborted) {
+				for (const state of activeStates) {
+					state.status = "aborted";
+					state.error = "aborted before launch";
+				}
+				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })));
+			}
+
+			const results = await Promise.all(tasks.map((task, index) => runSubagentWithRetries(task, ctx, activeStates[index]!, emit, signal)));
+			emit();
+			return buildFinalToolResult(results);
+		},
+		renderCall(args, theme) {
+			const count = Array.isArray((args as any)?.subagents) ? (args as any).subagents.length : 0;
+			const label = `${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `${count} subagent${count === 1 ? "" : "s"}`)}`;
+			return new Text(label, 0, 0);
+		},
+		renderResult(result, { isPartial }, theme) {
+			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
+			const prefix = result?.isError ? theme.fg("error", "generic subagents") : theme.fg("success", "generic subagents");
 			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
 
 			const container = new Container();
