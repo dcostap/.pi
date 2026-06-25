@@ -233,8 +233,8 @@ export default function (pi: ExtensionAPI) {
 			const errorResult = renderErrorResult(result, theme, context);
 			if (errorResult) return errorResult;
 			const d = result.details || {};
-			let text = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", "firecrawl_search")} ${theme.fg("accent", oneLine(d.query || context.args?.query, 100))}`;
-			if (typeof d.count === "number") text += ` · ${d.count} results`;
+			let text = theme.fg("success", "✓");
+			text += typeof d.count === "number" ? ` ${d.count} results` : " search complete";
 			if (Array.isArray(d.topResults) && d.topResults.length > 0) {
 				for (const item of d.topResults) {
 					const title = oneLine(item.title || "Untitled", 92);
