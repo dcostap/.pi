@@ -31,6 +31,37 @@ to_msys_path() {
   fi
 }
 
+to_windows_path() {
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$p"
+  elif [[ "$p" =~ ^/([A-Za-z])/(.*)$ ]]; then
+    local drive="${BASH_REMATCH[1]^^}"
+    local rest="${BASH_REMATCH[2]//\//\\}"
+    printf '%s:\\%s' "$drive" "$rest"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+local_temp_root() {
+  local win_tmp=""
+  if command -v powershell.exe >/dev/null 2>&1; then
+    win_tmp="$(powershell.exe -NoProfile -Command '[System.IO.Path]::GetTempPath()' 2>/dev/null | tr -d '\r\n' || true)"
+  elif command -v pwsh >/dev/null 2>&1; then
+    win_tmp="$(pwsh -NoProfile -Command '[System.IO.Path]::GetTempPath()' 2>/dev/null | tr -d '\r\n' || true)"
+  fi
+
+  local root=""
+  if [[ -n "$win_tmp" ]]; then
+    root="$(to_msys_path "$win_tmp")"
+  else
+    root="$(to_msys_path "${TMPDIR:-${TEMP:-${TMP:-/tmp}}}")"
+  fi
+  root="${root%/}"
+  printf '%s' "$root"
+}
+
 slugify() {
   local s="$1"
   s="${s%.*}"
@@ -54,7 +85,7 @@ slug="$(slugify "$base")"
 if [[ $# -eq 2 ]]; then
   outdir="$(to_msys_path "$2")"
 else
-  tmp_root="$(to_msys_path "${TMPDIR:-${TEMP:-${TMP:-/tmp}}}")"
+  tmp_root="$(local_temp_root)"
   outdir="$tmp_root/pi-pdf-visual-triangulation/$slug-$(date +%Y%m%d-%H%M%S)-$$"
 fi
 
@@ -66,6 +97,12 @@ layout_txt="$outdir/_text/pdftotext-layout.txt"
 markitdown_md="$outdir/_markitdown/markitdown.md"
 pages_prefix="$outdir/_pages/page"
 manifest="$outdir/_summary/manifest.txt"
+outdir_win="$(to_windows_path "$outdir")"
+work_pdf_win="$(to_windows_path "$work_pdf")"
+layout_txt_win="$(to_windows_path "$layout_txt")"
+markitdown_md_win="$(to_windows_path "$markitdown_md")"
+pages_dir_win="$(to_windows_path "$outdir/_pages")"
+manifest_win="$(to_windows_path "$manifest")"
 
 # 1. Deterministic text extraction preserving layout/columns.
 pdftotext -layout -enc UTF-8 "$work_pdf" "$layout_txt"
@@ -91,7 +128,9 @@ pdftoppm -png -r 250 -cropbox "$work_pdf" "$pages_prefix"
   echo "Generated: $(date -Is)"
   echo "Source: $input_pdf"
   echo "Working copy: $work_pdf"
+  echo "Working copy Windows: $work_pdf_win"
   echo "Output dir: $outdir"
+  echo "Output dir Windows: $outdir_win"
   echo
   echo "Tool paths:"
   echo "pdftotext: $(command -v pdftotext)"
@@ -114,7 +153,13 @@ pdftoppm -png -r 250 -cropbox "$work_pdf" "$pages_prefix"
 } > "$manifest"
 
 echo "Done. Output directory: $outdir"
+echo "Done. Output directory Windows: $outdir_win"
 echo "- $layout_txt"
 echo "- $markitdown_md"
 echo "- $outdir/_pages/page-*.png"
 echo "- $manifest"
+echo "Windows paths for Pi read tool:"
+echo "- $layout_txt_win"
+echo "- $markitdown_md_win"
+echo "- $pages_dir_win\\page-*.png"
+echo "- $manifest_win"

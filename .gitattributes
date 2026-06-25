@@ -1,0 +1,5 @@
+# Keep executable shell scripts usable under bash/MSYS on Windows.
+*.sh text eol=lf
+
+# Keep skill docs stable across machines.
+*.md text eol=lf

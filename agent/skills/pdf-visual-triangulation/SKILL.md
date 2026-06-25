@@ -28,12 +28,14 @@ For one PDF, either process directly in worker mode or launch one worker.
 Given exactly one PDF:
 
 1. Do not modify the PDF.
-2. Create artifacts in an appropiate OS local temp folder (away from the user's visible folders).
-3. Run the helper script:
+2. Create artifacts in an appropriate OS local temp folder (away from the user's visible folders).
+3. Run the helper script with a generous timeout, at least 300 seconds:
 
 ```bash
-~/.pi/agent/skills/pdf-visual-triangulation/scripts/pdf-triangulate.sh "<PDF_PATH>"
+"$HOME/.pi/agent/skills/pdf-visual-triangulation/scripts/pdf-triangulate.sh" "<PDF_PATH>"
 ```
+
+The helper prints both MSYS paths and Windows paths. When using Pi `read` on Windows, prefer the printed `Output directory Windows` path.
 
 It creates:
 
@@ -46,14 +48,14 @@ _summary/manifest.txt
 
 4. Use `_markitdown/markitdown.md` as the draft/origin text.
 5. Verify and correct it against `_text/pdftotext-layout.txt` and the rendered page images. Page images are authoritative for numbers, signs, column alignment, totals, and footnotes.
+   - If the PDF has 30 pages or fewer, inspect every rendered page image.
+   - If the PDF has more than 30 pages, warn that there are too many pages to fully inspect manually; process as many pages as practical and report how many were inspected.
 6. Write the final verified Markdown next to the original PDF:
 
 ```text
 example.pdf
 example.pdf.md
 ```
-
-If the PDF has more than 30 pages, WARN the user that there are too many pages, and thus there are too many images to inspect manually. Include that in your final output, but do process as many pages as you can, and include the number you processed in the output, too.
 
 ## Final Markdown requirements
 
