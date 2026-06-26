@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 
 const RUNTIME_DIR = resolve(tmpdir(), "pi-chrome-cdp");
@@ -44,15 +44,53 @@ function maybeDump(label: string, text: string, extraMeta?: string): string {
   return out;
 }
 
+function writeTextOutput(outputPath: string, text: string): string {
+  const out = resolve(outputPath);
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, text, "utf8");
+  return out;
+}
+
+function saveTextResult(outputPath: string, text: string): string {
+  const out = writeTextOutput(outputPath, text);
+  const preview = text.slice(0, FIRST_LOOK_BYTES);
+  const lines = text.split("\n").length;
+  const kb = (text.length / 1024).toFixed(1);
+  return `${preview}${text.length > FIRST_LOOK_BYTES ? "\n..." : ""}\n[Saved ${kb}KB / ${lines} lines to ${out}]`;
+}
+
+function readExpressionFile(expressionPath: string): string {
+  const path = resolve(expressionPath);
+  if (!existsSync(path)) throw new Error(`expressionPath not found: ${path}`);
+  const js = readFileSync(path, "utf8");
+  return `${js}\n//# sourceURL=${path.replace(/\\/g, "/")}`;
+}
+
+function normalizeTimeout(timeoutMs?: number, fallback = 15000) {
+  if (timeoutMs == null) return fallback;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("timeoutMs must be a positive number");
+  return Math.min(Math.max(Math.round(timeoutMs), 100), 10 * 60 * 1000);
+}
+
+function evalExpressionFromParams(params: { expression?: string; expressionPath?: string }) {
+  if (params.expression && params.expressionPath) throw new Error("Provide either expression or expressionPath, not both");
+  return params.expressionPath ? readExpressionFile(params.expressionPath) : (params.expression || "document.title");
+}
+
 const chromeCdpParams = Type.Object({
   action: Type.Union([
     Type.Literal("list"),
     Type.Literal("snap"),
     Type.Literal("html"),
     Type.Literal("eval"),
+    Type.Literal("script"),
+    Type.Literal("wait"),
     Type.Literal("net"),
     Type.Literal("nav"),
     Type.Literal("reload"),
+    Type.Literal("open"),
+    Type.Literal("download"),
+    Type.Literal("raw"),
     Type.Literal("click"),
     Type.Literal("clickxy"),
     Type.Literal("type"),
@@ -60,24 +98,42 @@ const chromeCdpParams = Type.Object({
   ], { description: "CDP action to perform" }),
   target: Type.Optional(Type.String({ description: "Target tab id prefix from list output, or a distinctive substring of the tab URL/title" })),
   selector: Type.Optional(Type.String({ description: "CSS selector for html or click actions" })),
-  expression: Type.Optional(Type.String({ description: "JavaScript expression for eval" })),
-  url: Type.Optional(Type.String({ description: "URL for nav" })),
+  expression: Type.Optional(Type.String({ description: "JavaScript expression for eval/wait" })),
+  expressionPath: Type.Optional(Type.String({ description: "Path to a local JavaScript file to evaluate for eval/script" })),
+  url: Type.Optional(Type.String({ description: "URL for nav/open/download" })),
   text: Type.Optional(Type.String({ description: "Text for type" })),
   x: Type.Optional(Type.Number({ description: "CSS pixel X coordinate for clickxy" })),
   y: Type.Optional(Type.Number({ description: "CSS pixel Y coordinate for clickxy" })),
-  outputPath: Type.Optional(Type.String({ description: "Optional screenshot output path for shot" })),
+  outputPath: Type.Optional(Type.String({ description: "Optional output path for shot, html, eval, net, snap, raw, or download" })),
+  timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds for CDP commands and waits" })),
+  waitForSelector: Type.Optional(Type.String({ description: "CSS selector to wait for after nav or with action=wait" })),
+  waitExpression: Type.Optional(Type.String({ description: "JavaScript predicate/expression to wait for after nav or with action=wait" })),
+  settleMs: Type.Optional(Type.Number({ description: "Optional extra delay after nav/wait, in milliseconds" })),
+  method: Type.Optional(Type.String({ description: "Raw CDP method for action=raw, e.g. DOM.getDocument" })),
+  cdpParams: Type.Optional(Type.Any({ description: "Raw CDP params object for action=raw" })),
+  useBrowserCookies: Type.Optional(Type.Boolean({ description: "For download, include cookies from the selected browser tab" })),
+  headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Optional HTTP headers for download" })),
 });
 
 type ChromeCdpParams = {
-  action: "list" | "snap" | "html" | "eval" | "net" | "nav" | "reload" | "click" | "clickxy" | "type" | "shot";
+  action: "list" | "snap" | "html" | "eval" | "script" | "wait" | "net" | "nav" | "reload" | "open" | "download" | "raw" | "click" | "clickxy" | "type" | "shot";
   target?: string;
   selector?: string;
   expression?: string;
+  expressionPath?: string;
   url?: string;
   text?: string;
   x?: number;
   y?: number;
   outputPath?: string;
+  timeoutMs?: number;
+  waitForSelector?: string;
+  waitExpression?: string;
+  settleMs?: number;
+  method?: string;
+  cdpParams?: any;
+  useBrowserCookies?: boolean;
+  headers?: Record<string, string>;
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -125,7 +181,7 @@ class CDP {
     });
   }
 
-  send(method: string, params: any = {}, sessionId?: string) {
+  send(method: string, params: any = {}, sessionId?: string, timeoutMs = 15000) {
     const id = ++this.#id;
     return new Promise<any>((resolvePromise, rejectPromise) => {
       this.#pending.set(id, { resolve: resolvePromise, reject: rejectPromise });
@@ -135,8 +191,8 @@ class CDP {
       setTimeout(() => {
         if (!this.#pending.has(id)) return;
         this.#pending.delete(id);
-        rejectPromise(new Error(`Timeout: ${method}`));
-      }, 15000);
+        rejectPromise(new Error(`Timeout: ${method} after ${timeoutMs}ms`));
+      }, timeoutMs);
     });
   }
 
@@ -280,13 +336,14 @@ function formatEvalError(exceptionDetails: any, expression: string): string {
   return `Eval failed: ${detail}\nExpression: ${exprSnippet}`;
 }
 
-async function evalStr(cdp: CDP, sessionId: string, expression: string) {
-  await cdp.send("Runtime.enable", {}, sessionId);
+async function evalStr(cdp: CDP, sessionId: string, expression: string, timeoutMs?: number) {
+  const timeout = normalizeTimeout(timeoutMs);
+  await cdp.send("Runtime.enable", {}, sessionId, timeout);
   const result = await cdp.send("Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
-  }, sessionId);
+  }, sessionId, timeout);
   if (result.exceptionDetails) {
     throw new Error(formatEvalError(result.exceptionDetails, expression));
   }
@@ -294,8 +351,8 @@ async function evalStr(cdp: CDP, sessionId: string, expression: string) {
   return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value ?? "");
 }
 
-async function snapshotStr(cdp: CDP, sessionId: string) {
-  const { nodes } = await cdp.send("Accessibility.getFullAXTree", {}, sessionId);
+async function snapshotStr(cdp: CDP, sessionId: string, outputPath?: string, timeoutMs?: number) {
+  const { nodes } = await cdp.send("Accessibility.getFullAXTree", {}, sessionId, normalizeTimeout(timeoutMs));
   const lines: string[] = [];
   let skipped = 0;
   let total = 0;
@@ -314,31 +371,34 @@ async function snapshotStr(cdp: CDP, sessionId: string) {
     if (lines.length >= MAX_SNAP_LINES) break;
   }
   const header = `${lines.length} nodes shown` + (total > lines.length ? ` (${total} total, ${skipped} skipped)` : "");
-  return header + "\n" + lines.join("\n");
+  const text = header + "\n" + lines.join("\n");
+  return outputPath ? saveTextResult(outputPath, text) : text;
 }
 
-async function htmlStr(cdp: CDP, sessionId: string, selector?: string) {
+async function htmlStr(cdp: CDP, sessionId: string, selector?: string, outputPath?: string, timeoutMs?: number) {
   const expr = selector
     ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || 'Element not found'`
     : "document.documentElement.outerHTML";
-  const raw = await evalStr(cdp, sessionId, expr);
+  const raw = await evalStr(cdp, sessionId, expr, timeoutMs);
 
   // HTML is always too big — dump to file, return stats + path
   let stats = "";
   try {
     const s = await evalStr(cdp, sessionId,
-      `JSON.stringify({bodyChildren: document.body?.children.length??0, totalElements: document.querySelectorAll('*').length, bodyTextChars: (document.body?.textContent||'').length})`
+      `JSON.stringify({bodyChildren: document.body?.children.length??0, totalElements: document.querySelectorAll('*').length, bodyTextChars: (document.body?.textContent||'').length})`,
+      timeoutMs
     );
     const parsed = JSON.parse(s);
     stats = `body:${parsed.bodyChildren} kids, ${parsed.totalElements} elements, ${parsed.bodyTextChars} text chars`;
   } catch { /* best-effort */ }
 
+  if (outputPath) return saveTextResult(outputPath, raw);
   const label = selector ? `html_sel_${selector.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40)}` : "html_full";
   return maybeDump(label + ".html", raw, stats);
 }
 
-async function netStr(cdp: CDP, sessionId: string) {
-  const raw = await evalStr(cdp, sessionId, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name.substring(0, 200), type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize })))`);
+async function netStr(cdp: CDP, sessionId: string, outputPath?: string, timeoutMs?: number) {
+  const raw = await evalStr(cdp, sessionId, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name.substring(0, 200), type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize })))`, timeoutMs);
   const entries: any[] = JSON.parse(raw);
   if (entries.length === 0) return "No resource entries";
   const totalSize = entries.reduce((s: number, e: any) => s + (typeof e.size === "number" ? e.size : 0), 0);
@@ -348,7 +408,7 @@ async function netStr(cdp: CDP, sessionId: string) {
     `${String(e.duration).padStart(5)}ms  ${formatBytes(e.size).padStart(8)}  ${String(e.type || "").padEnd(12)}  ${e.name}`
   ).join("\n");
   const full = `${summary}\n${table}`;
-  return maybeDump("network.txt", full, `top resources by size/type`);
+  return outputPath ? saveTextResult(outputPath, full) : maybeDump("network.txt", full, `top resources by size/type`);
 }
 
 function formatBytes(n: number | undefined | null): string {
@@ -382,6 +442,46 @@ async function typeStr(cdp: CDP, sessionId: string, text?: string) {
   return `Typed ${text.length} characters`;
 }
 
+async function waitStr(cdp: CDP, sessionId: string, options: { selector?: string; expression?: string; timeoutMs?: number; settleMs?: number }) {
+  const timeout = normalizeTimeout(options.timeoutMs, 15000);
+  const settleMs = options.settleMs == null ? 0 : Math.max(0, Math.round(options.settleMs));
+  const deadline = Date.now() + timeout;
+  const selector = options.selector;
+  const expression = options.expression;
+  if (!selector && !expression) {
+    await waitForReady(cdp, sessionId, timeout);
+    if (settleMs) await sleep(settleMs);
+    return `Waited for document.readyState === "complete"${settleMs ? ` and settled ${settleMs}ms` : ""}`;
+  }
+
+  let last = "";
+  while (Date.now() < deadline) {
+    try {
+      if (selector) {
+        const found = await evalStr(cdp, sessionId, `!!document.querySelector(${JSON.stringify(selector)})`, Math.min(5000, timeout));
+        last = found;
+        if (found === "true") {
+          if (settleMs) await sleep(settleMs);
+          return `Found selector ${selector}${settleMs ? ` and settled ${settleMs}ms` : ""}`;
+        }
+      }
+      if (expression) {
+        const ok = await evalStr(cdp, sessionId, `(async () => Boolean(await (${expression})))()`, Math.min(5000, timeout));
+        last = ok;
+        if (ok === "true") {
+          if (settleMs) await sleep(settleMs);
+          return `Wait expression became truthy${settleMs ? ` and settled ${settleMs}ms` : ""}`;
+        }
+      }
+    } catch (e: any) {
+      last = e?.message || String(e);
+    }
+    await sleep(200);
+  }
+  const target = selector ? `selector ${selector}` : "expression";
+  throw new Error(`Timed out waiting for ${target}${last ? ` (last: ${last})` : ""}`);
+}
+
 async function waitForReady(cdp: CDP, sessionId: string, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -392,16 +492,28 @@ async function waitForReady(cdp: CDP, sessionId: string, timeoutMs = 30000) {
   throw new Error("Timed out waiting for page to finish loading");
 }
 
-async function navStr(cdp: CDP, sessionId: string, url?: string) {
+async function navStr(cdp: CDP, sessionId: string, options: { url?: string; timeoutMs?: number; waitForSelector?: string; waitExpression?: string; settleMs?: number }) {
+  const { url } = options;
   if (!url) throw new Error("url is required for nav");
-  await cdp.send("Page.enable", {}, sessionId);
-  const loadEvent = cdp.waitForEvent("Page.loadEventFired", 30000);
+  const timeout = normalizeTimeout(options.timeoutMs, 30000);
+  await cdp.send("Page.enable", {}, sessionId, timeout);
+  const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout);
   try {
-    const result = await cdp.send("Page.navigate", { url }, sessionId);
+    const result = await cdp.send("Page.navigate", { url }, sessionId, timeout);
     if (result.errorText) throw new Error(result.errorText);
     if (result.loaderId) await loadEvent.promise;
-    await waitForReady(cdp, sessionId, 5000);
-    return `Navigated to ${url}`;
+    await waitForReady(cdp, sessionId, Math.min(5000, timeout));
+    let suffix = "";
+    if (options.waitForSelector || options.waitExpression || options.settleMs) {
+      const waited = await waitStr(cdp, sessionId, {
+        selector: options.waitForSelector,
+        expression: options.waitExpression,
+        timeoutMs: Math.max(100, timeout - 1000),
+        settleMs: options.settleMs,
+      });
+      suffix = `; ${waited}`;
+    }
+    return `Navigated to ${url}${suffix}`;
   } finally {
     // If Page.navigate times out or fails before we await loadEvent.promise, cancel
     // the pending timer/listener. Otherwise its later rejection can become an
@@ -410,13 +522,14 @@ async function navStr(cdp: CDP, sessionId: string, url?: string) {
   }
 }
 
-async function reloadStr(cdp: CDP, sessionId: string) {
-  await cdp.send("Page.enable", {}, sessionId);
-  const loadEvent = cdp.waitForEvent("Page.loadEventFired", 30000);
+async function reloadStr(cdp: CDP, sessionId: string, timeoutMs?: number) {
+  const timeout = normalizeTimeout(timeoutMs, 30000);
+  await cdp.send("Page.enable", {}, sessionId, timeout);
+  const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout);
   try {
-    await cdp.send("Page.reload", {}, sessionId);
+    await cdp.send("Page.reload", {}, sessionId, timeout);
     await loadEvent.promise;
-    await waitForReady(cdp, sessionId, 5000);
+    await waitForReady(cdp, sessionId, Math.min(5000, timeout));
     return "Reloaded page";
   } finally {
     // Same cleanup as navStr: avoid orphaned load-event timers if reload fails.
@@ -424,12 +537,61 @@ async function reloadStr(cdp: CDP, sessionId: string) {
   }
 }
 
-async function shotStr(cdp: CDP, sessionId: string, targetId: string, outputPath?: string) {
-  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" }, sessionId);
-  const out = outputPath || resolve(RUNTIME_DIR, `screenshot-${targetId.slice(0, 8)}.png`);
+async function shotStr(cdp: CDP, sessionId: string, targetId: string, outputPath?: string, timeoutMs?: number) {
+  const timeout = normalizeTimeout(timeoutMs);
+  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" }, sessionId, timeout);
+  const out = outputPath ? resolve(outputPath) : resolve(RUNTIME_DIR, `screenshot-${targetId.slice(0, 8)}.png`);
+  mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, Buffer.from(data, "base64"));
-  const dpr = parseFloat(await evalStr(cdp, sessionId, "window.devicePixelRatio").catch(() => "1")) || 1;
+  const dpr = parseFloat(await evalStr(cdp, sessionId, "window.devicePixelRatio", timeout).catch(() => "1")) || 1;
   return `${out}\nScreenshot saved. DPR: ${dpr}`;
+}
+
+async function rawStr(cdp: CDP, sessionId: string, method?: string, cdpParams?: any, outputPath?: string, timeoutMs?: number) {
+  if (!method) throw new Error("method is required for raw");
+  const result = await cdp.send(method, cdpParams || {}, sessionId, normalizeTimeout(timeoutMs));
+  const text = JSON.stringify(result, null, 2);
+  return outputPath ? saveTextResult(outputPath, text) : text;
+}
+
+async function openStr(url?: string) {
+  const cdp = await getSharedCdp();
+  const openUrl = url || "about:blank";
+  const { targetId } = await cdp.send("Target.createTarget", { url: openUrl });
+  return `Opened new tab: ${String(targetId).slice(0, 8)}  ${openUrl}`;
+}
+
+function inferDownloadPath(url: string) {
+  let name = "download.bin";
+  try {
+    const parsed = new URL(url);
+    const base = basename(parsed.pathname);
+    if (base) name = decodeURIComponent(base).replace(/[<>:"/\\|?*\x00-\x1F]/g, "-");
+  } catch { /* validated by fetch */ }
+  return resolve(RUNTIME_DIR, name);
+}
+
+async function downloadStr(options: { url?: string; outputPath?: string; headers?: Record<string, string>; cookies?: string; timeoutMs?: number }) {
+  if (!options.url) throw new Error("url is required for download");
+  const headers: Record<string, string> = { ...(options.headers || {}) };
+  if (options.cookies && !headers.cookie && !headers.Cookie) headers.cookie = options.cookies;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), normalizeTimeout(options.timeoutMs, 30000));
+  try {
+    const response = await fetch(options.url, { headers, signal: controller.signal });
+    if (!response.ok) throw new Error(`Download failed: HTTP ${response.status} ${response.statusText}`);
+    const out = options.outputPath ? resolve(options.outputPath) : inferDownloadPath(options.url);
+    mkdirSync(dirname(out), { recursive: true });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    writeFileSync(out, bytes);
+    const type = response.headers.get("content-type") || "unknown type";
+    return `${out}\nDownloaded ${formatBytes(bytes.length)} (${type}) from ${options.url}`;
+  } catch (e: any) {
+    if (e?.name === "AbortError") throw new Error(`Download timed out after ${normalizeTimeout(options.timeoutMs, 30000)}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function withTarget<T>(targetQuery: string | undefined, fn: (cdp: CDP, sessionId: string, page: any) => Promise<T>) {
@@ -466,12 +628,14 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "chrome_cdp",
     label: "Chrome CDP",
-    description: "Inspect and control your already-open local Chrome via Chrome DevTools Protocol. Use it to list tabs, inspect DOM, evaluate JS, inspect network resources, reload, navigate, click, type, and take screenshots.",
+    description: "Inspect and control your already-open local Chrome via Chrome DevTools Protocol. Use it to list/open tabs, inspect DOM, evaluate JS or JS files, wait for page state, inspect network resources, download URLs, reload, navigate, click, type, and take screenshots.",
     promptSnippet: "Inspect and control the user's live Chrome tabs via Chrome DevTools Protocol (CDP)",
     promptGuidelines: [
       "Use chrome_cdp when the user wants to inspect or control their already-open Chrome instance.",
       "Use chrome_cdp action=list before other chrome_cdp actions when you need a tab id.",
       "Use chrome_cdp action=net to inspect resource URLs loaded by the current page.",
+      "Use outputPath for large html/eval/net/snap/raw results when you want a stable file path instead of a temp dump.",
+      "Use expressionPath for reusable JavaScript files and waitForSelector/settleMs after nav when pages lazy-load content.",
       "chrome_cdp dumps large outputs (>2KB) to temp files to protect context. When you see [Dumped … to C:\\...], use read with offset/limit to inspect the file instead of re-running chrome_cdp.",
     ],
     parameters: chromeCdpParams,
@@ -487,21 +651,53 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       }
 
       const started = Date.now();
+
+      if (params.action === "open") {
+        const text = await openStr(params.url);
+        return {
+          content: [{ type: "text", text }],
+          details: { action: "open", elapsedMs: Date.now() - started, url: params.url || "about:blank" },
+        };
+      }
+
+      if (params.action === "download" && !params.useBrowserCookies) {
+        const text = await downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, timeoutMs: params.timeoutMs });
+        return {
+          content: [{ type: "text", text }],
+          details: { action: "download", elapsedMs: Date.now() - started, url: params.url, outputPath: params.outputPath },
+        };
+      }
+
       let pageMeta: { url: string; title: string } = { url: "", title: "" };
 
       const text = await withTarget(params.target, async (cdp, sessionId, page) => {
         pageMeta = { url: (page as any).url as string ?? "", title: (page as any).title as string ?? "" };
         switch (params.action) {
-          case "snap": return snapshotStr(cdp, sessionId);
-          case "html": return htmlStr(cdp, sessionId, params.selector);
-          case "eval": return evalStr(cdp, sessionId, params.expression || "document.title");
-          case "net": return netStr(cdp, sessionId);
-          case "nav": return navStr(cdp, sessionId, params.url);
-          case "reload": return reloadStr(cdp, sessionId);
+          case "snap": return snapshotStr(cdp, sessionId, params.outputPath, params.timeoutMs);
+          case "html": return htmlStr(cdp, sessionId, params.selector, params.outputPath, params.timeoutMs);
+          case "eval": {
+            const result = await evalStr(cdp, sessionId, evalExpressionFromParams(params), params.timeoutMs);
+            return params.outputPath ? saveTextResult(params.outputPath, result) : result;
+          }
+          case "script": {
+            if (!params.expressionPath) throw new Error("expressionPath is required for script");
+            const result = await evalStr(cdp, sessionId, readExpressionFile(params.expressionPath), params.timeoutMs);
+            return params.outputPath ? saveTextResult(params.outputPath, result) : result;
+          }
+          case "wait": return waitStr(cdp, sessionId, { selector: params.waitForSelector || params.selector, expression: params.waitExpression || params.expression, timeoutMs: params.timeoutMs, settleMs: params.settleMs });
+          case "net": return netStr(cdp, sessionId, params.outputPath, params.timeoutMs);
+          case "nav": return navStr(cdp, sessionId, { url: params.url, timeoutMs: params.timeoutMs, waitForSelector: params.waitForSelector, waitExpression: params.waitExpression, settleMs: params.settleMs });
+          case "reload": return reloadStr(cdp, sessionId, params.timeoutMs);
+          case "download": {
+            const { cookies } = await cdp.send("Network.getCookies", { urls: params.url ? [params.url] : [] }, sessionId, normalizeTimeout(params.timeoutMs));
+            const cookieHeader = Array.isArray(cookies) ? cookies.map((c: any) => `${c.name}=${c.value}`).join("; ") : undefined;
+            return downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, cookies: cookieHeader, timeoutMs: params.timeoutMs });
+          }
+          case "raw": return rawStr(cdp, sessionId, params.method, params.cdpParams, params.outputPath, params.timeoutMs);
           case "click": return clickStr(cdp, sessionId, params.selector);
           case "clickxy": return clickXyStr(cdp, sessionId, params.x, params.y);
           case "type": return typeStr(cdp, sessionId, params.text);
-          case "shot": return shotStr(cdp, sessionId, page.targetId, params.outputPath);
+          case "shot": return shotStr(cdp, sessionId, page.targetId, params.outputPath, params.timeoutMs);
           default: throw new Error(`Unsupported action: ${params.action}`);
         }
       });
@@ -524,7 +720,9 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
           pageUrl: pageMeta.url,
           pageTitle: pageMeta.title,
           outputBytes: rawText.length,
-          dumped: rawText.length > MAX_INLINE_BYTES,
+          outputPath: params.outputPath,
+          selector: params.selector,
+          dumped: rawText.length > MAX_INLINE_BYTES || rawText.includes("[Dumped ") || rawText.includes("[Saved "),
         },
       };
     },
@@ -542,12 +740,25 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
         const short = args.expression.length > 60 ? args.expression.slice(0, 60) + "…" : args.expression;
         parts.push(theme.fg("dim", short));
       }
+      if (args.expressionPath) {
+        const short = args.expressionPath.length > 50 ? args.expressionPath.slice(0, 50) + "…" : args.expressionPath;
+        parts.push(theme.fg("dim", short));
+      }
+      if (args.method) {
+        parts.push(theme.fg("dim", args.method));
+      }
       if (args.url) {
         const short = args.url.length > 40 ? args.url.slice(0, 40) + "…" : args.url;
         parts.push(theme.fg("dim", short));
       }
       if (args.selector) {
         parts.push(theme.fg("dim", args.selector.length > 30 ? args.selector.slice(0, 30) + "…" : args.selector));
+      }
+      if (args.waitForSelector) {
+        parts.push(theme.fg("dim", args.waitForSelector.length > 30 ? args.waitForSelector.slice(0, 30) + "…" : args.waitForSelector));
+      }
+      if (args.outputPath) {
+        parts.push(theme.fg("dim", `→ ${args.outputPath.length > 34 ? args.outputPath.slice(0, 34) + "…" : args.outputPath}`));
       }
 
       return new Text(parts.join(" "), 0, 0);
@@ -562,40 +773,51 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
           const n = details.count ?? 0;
           return new Text(theme.fg("success", `\u2713 ${n} tab${n === 1 ? "" : "s"}${details.elapsedMs != null ? ` \u00b7 ${(details.elapsedMs / 1000).toFixed(1)}s` : ""}`), 0, 0);
         }
-        case "eval": {
+        case "eval":
+        case "script": {
           const raw = String(result.content?.[0]?.text ?? "");
           if (raw.startsWith("Eval failed:")) {
             const firstLine = raw.split("\n")[0].replace("Eval failed: ", "");
             return new Text(theme.fg("error", `\u2717 ${firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine}`), 0, 0);
           }
-          const dumped = details.dumped ?? raw.includes("[Dumped ");
+          const dumped = (details.dumped ?? false) || raw.includes("[Dumped ") || raw.includes("[Saved ");
           if (dumped) {
-            return new Text(theme.fg("info", `\u2713 eval \u2192 file (${formatBytes(details.outputBytes)})`), 0, 0);
+            return new Text(theme.fg("info", `\u2713 ${action} \u2192 file (${formatBytes(details.outputBytes)})`), 0, 0);
           }
           const short = raw.length > 120 ? raw.slice(0, 120).replace(/\n/g, " \u00b7 ") + "…" : raw.replace(/\n/g, " \u00b7 ");
           return new Text(theme.fg("success", `\u2713 ${short}`), 0, 0);
         }
         case "snap": {
-          const firstLine = String(result.content?.[0]?.text ?? "").split("\n")[0] || "";
-          const dumped = details.dumped ?? false;
+          const raw = String(result.content?.[0]?.text ?? "");
+          const firstLine = raw.split("\n")[0] || "";
+          const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
           return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
         }
         case "html": {
           const bytes = details.outputBytes ?? 0;
           const selector = details.selector;
-          const dumped = details.dumped ?? false;
+          const raw = String(result.content?.[0]?.text ?? "");
+          const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
           return new Text(
             theme.fg(dumped ? "info" : "success", `\u2713 HTML ${formatBytes(bytes)}${selector ? ` (${selector})` : ""}${dumped ? " \u2192 file" : ""}`),
             0, 0
           );
         }
         case "net": {
-          const firstLine = String(result.content?.[0]?.text ?? "").split("\n")[0] || "";
-          const dumped = details.dumped ?? false;
+          const raw = String(result.content?.[0]?.text ?? "");
+          const firstLine = raw.split("\n")[0] || "";
+          const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
           return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
         }
-        case "nav": {
-          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+        case "nav":
+        case "wait":
+        case "open":
+        case "download":
+        case "raw": {
+          const raw = String(result.content?.[0]?.text ?? "");
+          const firstLine = raw.split("\n")[0] || action;
+          const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
+          return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
         }
         case "reload": {
           return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
