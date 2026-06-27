@@ -151,6 +151,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Fetch a specific URL/page/PDF, or cache an external GitHub repo locally for inspection and return its checkout path.",
 		promptGuidelines: [
 			"Use fetch_url when the user gives a specific URL or asks to inspect one exact page.",
+			"When several URLs are worth fetching, batch 2-4 independent fetch_url calls in parallel; don't fetch whole result lists by default.",
 			"Use fetch_url instead of git clone for external GitHub repos you only need to inspect; it caches locally and returns the checkout path.",
 			"If the user asks you to clone a GitHub repo into the workspace so they can modify it, use normal git/workspace commands instead.",
 		],
