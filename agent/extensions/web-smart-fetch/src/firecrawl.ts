@@ -1,4 +1,4 @@
-import * as FirecrawlSdk from "@mendable/firecrawl-js";
+import { createRequire } from "node:module";
 import type FirecrawlDefault from "@mendable/firecrawl-js";
 import type { ExtensionConfig } from "./config.ts";
 
@@ -9,12 +9,22 @@ const FIRECRAWL_TIMEOUT_MS = 60_000;
 // capping long network/scrape waits at one minute.
 type FirecrawlConstructor = new (options?: { apiKey?: string | null; apiUrl?: string | null; timeoutMs?: number }) => FirecrawlClient;
 
+const requireFromHere = createRequire(import.meta.url);
+let cachedFirecrawlSdk: unknown;
+
+function loadFirecrawlSdk(): unknown {
+	if (cachedFirecrawlSdk) return cachedFirecrawlSdk;
+	cachedFirecrawlSdk = requireFromHere("@mendable/firecrawl-js");
+	return cachedFirecrawlSdk;
+}
+
 function getFirecrawlConstructor(): FirecrawlConstructor {
+	const sdk = loadFirecrawlSdk();
 	const seen = new Set<unknown>();
-	const candidates: unknown[] = [FirecrawlSdk];
+	const candidates: unknown[] = [sdk];
 
 	// @mendable/firecrawl-js has changed its ESM/CJS export shape across versions,
-	// and pi/tsx may resolve either the `import` or `default` conditional export.
+	// and pi's TS runtime may resolve either the ESM or CJS conditional export.
 	// Walk the common wrapper shapes instead of assuming one exact namespace shape.
 	for (let i = 0; i < candidates.length; i++) {
 		const candidate: any = candidates[i];
@@ -26,13 +36,13 @@ function getFirecrawlConstructor(): FirecrawlConstructor {
 		}
 	}
 
-	const sdk: any = FirecrawlSdk;
-	const keys = [
-		`top=[${Object.keys(sdk || {}).join(",")}]`,
-		`sdk.default=${sdk?.default ? typeof sdk.default : "missing"}`,
-		sdk?.default && typeof sdk.default === "object" ? `default=[${Object.keys(sdk.default).join(",")}]` : "",
+	const details = [
+		`sdkType=${typeof sdk}`,
+		sdk && typeof sdk === "object" ? `top=[${Object.keys(sdk as Record<string, unknown>).join(",")}]` : "",
+		`sdk.default=${(sdk as any)?.default ? typeof (sdk as any).default : "missing"}`,
+		(sdk as any)?.default && typeof (sdk as any).default === "object" ? `default=[${Object.keys((sdk as any).default).join(",")}]` : "",
 	].filter(Boolean).join(" ");
-	throw new Error(`Firecrawl SDK failed to load: missing Firecrawl constructor export (${keys})`);
+	throw new Error(`Firecrawl SDK failed to load: missing Firecrawl constructor export (${details})`);
 }
 
 export function getFirecrawlClient(config: ExtensionConfig): FirecrawlClient | undefined {
