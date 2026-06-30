@@ -154,6 +154,14 @@ async function git(args: string[], cwd?: string, signal?: AbortSignal) {
 	return stdout.trim();
 }
 
+async function refreshRepo(repoDir: string, signal?: AbortSignal) {
+	// This checkout is an internal cache, not a user workspace. Treat the remote as
+	// authoritative so moved/recreated tags (common for "nightly" tags) do not make
+	// fetch fail with "would clobber existing tag", and prune refs that disappeared
+	// upstream so ref/path resolution does not use stale cache entries.
+	await git(["fetch", "--all", "--tags", "--prune", "--prune-tags", "--force"], repoDir, signal);
+}
+
 async function ensureRepo(config: ExtensionConfig, owner: string, repo: string, signal?: AbortSignal, onProgress?: ProgressReporter) {
 	const repoDir = ensureDir(join(config.githubCacheDir, owner, repo));
 	if (!existsSync(join(repoDir, ".git"))) {
@@ -169,7 +177,7 @@ async function ensureRepo(config: ExtensionConfig, owner: string, repo: string, 
 		);
 	} else {
 		await cleanupStaleGitIndexLock(repoDir);
-		await withProgress(onProgress, `Refreshing cached GitHub repo ${owner}/${repo}...`, () => git(["fetch", "--all", "--tags", "--prune"], repoDir, signal));
+		await withProgress(onProgress, `Refreshing cached GitHub repo ${owner}/${repo}...`, () => refreshRepo(repoDir, signal));
 	}
 	return repoDir;
 }
