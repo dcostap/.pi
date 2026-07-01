@@ -1,6 +1,6 @@
 ---
 name: pdf-deep-extraction
-description: Page-count-aware PDF-to-Markdown extraction for tax, finance, brokerage, bank, and other table-heavy PDFs. For PDFs under 20 pages, visual verification with rendered page images is allowed; for PDFs with 20+ pages, use programmatic extraction/OCR and only selective image spot-checks.
+description: Page-aware PDF text extraction for tax, finance, brokerage, bank, procurement, and other table-heavy PDFs. Uses big-document mode for PDFs with 50+ pages or large text dumps (>50k chars), producing searchable page-mapped artifacts instead of pretending to fully visually verify huge PDFs.
 compatibility: Windows/MSYS bash with Poppler pdftotext/pdftoppm and uvx or MarkItDown. Optional OCR support uses ocrmypdf or tesseract when installed.
 ---
 
@@ -8,31 +8,43 @@ compatibility: Windows/MSYS bash with Poppler pdftotext/pdftoppm and uvx or Mark
 
 Shared contract for coordinator agents and worker subagents.
 
-## Page-count policy
+## Document-size policy
 
-Always treat the PDF page count as a hard workflow gate:
+Always treat document size as a hard workflow gate. The helper determines `Document mode` in `_summary/manifest.txt`.
 
-- **Small PDFs: fewer than 20 pages**
-  - It is acceptable to render and inspect every page image.
-  - Page images may be used as the authority for numbers, signs, column alignment, totals, and footnotes.
-- **Large PDFs: 20 pages or more**
-  - Do **not** render/open/inspect every page image manually.
-  - Do **not** ask subagents to visually review pages one by one.
-  - Prefer programmatic extraction and auto-OCR: `pdftotext -layout`, MarkItDown, OCR output if needed/available, scripted searches, table/text comparisons, and selective spot checks.
-  - Render or open page images only for a small number of targeted pages: first/last page, pages with extraction failures, ambiguous tables, missing totals, or user-specified pages.
-  - Final notes must say the PDF was processed in large-document/programmatic mode and must not claim full visual verification.
+- **Standard mode** applies only when:
+  - PDF page count is known and below 50 pages, **and**
+  - no generated text dump is larger than approximately 50,000 characters/bytes.
+- **Big-document mode** applies when either:
+  - PDF page count is 50 pages or more, **or**
+  - any generated text dump (`pdftotext`, MarkItDown, OCR) is larger than approximately 50,000 characters/bytes.
+
+### Standard mode
+
+- Full-page image rendering/review is allowed when useful.
+- A curated final Markdown can be produced, verified against text artifacts and page images where practical.
+
+### Big-document mode
+
+- Do **not** claim full visual verification.
+- Do **not** manually inspect all pages or ask subagents to review pages one by one.
+- The primary deliverable is a **page-aware searchable corpus**, not a polished “fully verified” Markdown reconstruction.
+- Treat `_text_pages/page-XXXX.txt` and `_text/pdftotext-layout-paged.txt` as the canonical search/index artifacts.
+- Use MarkItDown as an auxiliary readability/structure source only.
+- Use OCR only when embedded text is sparse and OCR tools are available.
+- Render/open page images only for targeted pages: pages found by search, sparse pages, ambiguous tables, missing totals, first/last page, or user-specified pages.
+- Page numbers in artifacts are **physical PDF pages**. Printed page numbers inside the PDF may differ or reset, especially in signed/bundled PDFs.
 
 ## Coordinator mode
 
-For multiple PDFs, launch one generic subagent per PDF, up to 4 in parallel. Do not split a large PDF into page-by-page visual-review subagents. The prompt can be short:
+For multiple PDFs, launch one generic subagent per PDF, up to 4 in parallel. Do not split a big PDF into page-by-page visual-review subagents. The prompt can be short:
 
 ```text
 Read/use the global skill `pdf-deep-extraction`.
 Process this PDF in worker mode:
 <PDF_PATH>
 
-Write the verified Markdown next to the PDF as `<PDF_PATH>.md`.
-Return only: final md path, artifact folder path, warnings/uncertainties.
+Return only: document mode, primary page-aware artifact path, artifact folder path, warnings/uncertainties.
 ```
 
 For one PDF, either process directly in worker mode or launch one worker.
@@ -43,7 +55,7 @@ Given exactly one PDF:
 
 1. Do not modify the PDF.
 2. Create artifacts in an appropriate OS local temp folder (away from the user's visible folders).
-3. Run the helper script with a generous timeout, at least 300 seconds:
+3. Run the helper script with a generous timeout: at least 300 seconds for ordinary PDFs, and 600+ seconds for known/likely big PDFs because page-aware extraction creates one text file per physical page:
 
 ```bash
 "$HOME/.pi/agent/skills/pdf-deep-extraction/scripts/pdf-deep-extract.sh" "<PDF_PATH>"
@@ -51,53 +63,71 @@ Given exactly one PDF:
 
 The helper prints both MSYS paths and Windows paths. When using Pi `read` on Windows, prefer the printed `Output directory Windows` path.
 
-The helper is page-count-aware. It renders every page only for PDFs under 20 pages. For PDFs with 20+ pages it skips full page-image rendering and creates only sample/targeted images unless explicitly overridden for a special case.
-
-It creates:
+The helper creates:
 
 ```text
-_text/pdftotext-layout.txt
-_markitdown/markitdown.md
-_pages/page-*.png or _pages/sample-page-*.png
-_ocr/ocr*.txt when OCR was needed and OCR tools were available
-_summary/manifest.txt
+_text/pdftotext-layout.txt               # raw full pdftotext dump
+_text/pdftotext-layout-paged.txt         # combined text with explicit physical PDF page headers
+_text/page-line-map.tsv                  # line ranges in the paged combined text -> physical PDF page
+_text/page-text-stats.tsv                # per-page line and non-space character counts
+_text_pages/page-0001.txt ...            # one pdftotext extraction per physical PDF page
+_markitdown/markitdown.md                # auxiliary Markdown-ish extraction
+_pages/page-*.png or sample-page-*.png   # rendered page images; all pages only outside big-doc mode by default
+_ocr/ocr*.txt                            # OCR text when OCR was needed and OCR tools were available
+_summary/manifest.txt                    # tool versions, PDF info, counts, extraction/render modes
+_summary/qa-report.txt                   # page-aware QA, sparse-page report, caveats
 ```
 
-4. Read `_summary/manifest.txt` first. Note page count, image render mode, text density, and OCR availability/output.
-5. Use `_markitdown/markitdown.md` as the draft/origin text, then verify and correct it according to the page-count policy:
-   - **Small PDFs (<20 pages):** verify against `_text/pdftotext-layout.txt` and every rendered page image.
-   - **Large PDFs (20+ pages):** verify primarily with programmatic evidence: `_text/pdftotext-layout.txt`, MarkItDown, OCR output if available/needed, scripted page/table searches, totals checks, and selective image spot-checks only. If the document appears scanned or text extraction is sparse and no OCR artifact exists, try OCR tools if available or report that OCR was unavailable.
-6. Write the final Markdown next to the original PDF:
+4. Read `_summary/manifest.txt` first. Note document mode, page count, mode reason, image render mode, text density, OCR status, and page-aware artifact paths.
+5. Read `_summary/qa-report.txt` second. Note sparse pages and caveats.
+6. If answering questions about a big document:
+   - Search `_text_pages/` first, e.g. `rg -n "flota mínima" _text_pages`.
+   - The matching filename gives the physical PDF page, e.g. `_text_pages/page-0016.txt` = PDF page 16.
+   - Render only the relevant PDF pages when visual/table verification is needed.
+   - Cite or mention physical PDF pages when useful.
+7. If extracting a big document for the user, prefer delivering/copying the page-aware text corpus (`_text/pdftotext-layout-paged.txt`) or raw dump, not a fake fully verified Markdown.
+
+## Final output guidance
+
+### Standard mode
+
+A final Markdown next to the PDF is acceptable:
 
 ```text
 example.pdf
 example.pdf.md
 ```
 
-## Final Markdown requirements
-
 Keep it useful and auditable:
 
-- full extracted content, preserving tables where practical
+- extracted content, preserving tables where practical
 - page breaks/headings where helpful
-- corrected numbers/tables when programmatic sources or spot checks show MarkItDown is wrong or incomplete
-- short `Verification notes` section with artifact folder path, page count, processing mode, OCR status, sampled/spot-checked pages, and uncertainties
+- corrected numbers/tables when text sources or visual checks show extraction errors
+- short `Verification notes` section with artifact folder path, page count, processing mode, OCR status, checked pages, and uncertainties
 
-Return only:
+### Big-document mode
+
+Do not default to a curated full Markdown. Return or provide the page-aware artifacts instead:
 
 ```text
-Final MD: <path>
-Artifacts: <path>
-Warnings: <none or concise list>
+Primary text corpus: <artifact>/_text/pdftotext-layout-paged.txt
+Per-page text dir:  <artifact>/_text_pages
+Page-line map:      <artifact>/_text/page-line-map.tsv
+QA report:          <artifact>/_summary/qa-report.txt
+Artifacts:          <artifact>
+Warnings:           big-document mode; no full visual verification
 ```
+
+If the user explicitly wants a file next to the PDF, copy the requested corpus there (usually `.txt`), and clearly state whether it is raw machine extraction or page-aware extraction.
 
 ## Commands used by the helper
 
 ```bash
 pdfinfo "$PDF"                                # page count and metadata, when available
 pdftotext -layout -enc UTF-8 "$PDF" "$OUT/_text/pdftotext-layout.txt"
+pdftotext -layout -enc UTF-8 -f N -l N "$PDF" "$OUT/_text_pages/page-NNNN.txt"
 uvx --from 'markitdown[pdf]' markitdown "$PDF" -o "$OUT/_markitdown/markitdown.md"
-# Small PDFs only by default:
+# Non-big PDFs only by default:
 pdftoppm -png -r 250 -cropbox "$PDF" "$OUT/_pages/page"
-# Large PDFs: sample/targeted image rendering only; OCR via ocrmypdf/tesseract when needed and available.
+# Big PDFs: sample/targeted image rendering only; OCR via ocrmypdf/tesseract when needed and available.
 ```

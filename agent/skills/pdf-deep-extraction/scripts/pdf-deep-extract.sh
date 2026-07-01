@@ -10,20 +10,28 @@ If output-dir is omitted, creates a non-destructive artifact folder under the us
 The work folder contains:
   _input/                 copied source PDF
   _text/pdftotext-layout.txt
+  _text/pdftotext-layout-paged.txt
+  _text/page-line-map.tsv
+  _text/page-text-stats.tsv
+  _text_pages/page-0001.txt ... page-NNNN.txt
   _markitdown/markitdown.md
-  _pages/                 rendered page images; all pages only for small PDFs by default
+  _pages/                 rendered page images; all pages only for non-big PDFs by default
   _ocr/                   OCR text when OCR was needed and OCR tools were available
   _ocr_pages/             temporary OCR page renders when tesseract OCR is used
   _summary/manifest.txt   tool versions, PDF info, counts, extraction/render modes
+  _summary/qa-report.txt  page-aware extraction QA and caveats
 
 Windows paths such as C:\path\file.pdf and MSYS paths such as /c/path/file.pdf are both accepted.
 
 Environment knobs:
-  PDF_FULL_RENDER_PAGE_LIMIT=19   Render all page images only when page count is <= this value.
+  PDF_BIG_DOC_PAGE_THRESHOLD=50   Enter big-document mode when page count is >= this value.
+  PDF_BIG_DOC_CHAR_THRESHOLD=50000
+                                  Enter big-document mode when any text dump is larger than this many chars.
+  PDF_FULL_RENDER_PAGE_LIMIT=49   Render all page images only when page count is <= this value and not in big-document mode.
   PDF_RENDER_ALL_PAGES=1          Override the page-count gate and render all pages.
-  PDF_SAMPLE_PAGES=1,last         For large PDFs, sample pages to render. Use comma-separated page numbers and/or "last".
-  PDF_IMAGE_DPI_SMALL=250         DPI for full rendering of small PDFs.
-  PDF_IMAGE_DPI_SAMPLE=150        DPI for sample rendering of large PDFs.
+  PDF_SAMPLE_PAGES=1,last         For big PDFs, sample pages to render. Use comma-separated page numbers and/or "last".
+  PDF_IMAGE_DPI_SMALL=250         DPI for full rendering of non-big PDFs.
+  PDF_IMAGE_DPI_SAMPLE=150        DPI for sample rendering of big PDFs.
   PDF_OCR_SPARSE_CHARS_PER_PAGE=100
                                   Run OCR when extracted text is below this density and OCR tools are available.
 EOF
@@ -95,6 +103,96 @@ nonspace_char_count() {
   tr -d '[:space:]' < "$f" | wc -c | tr -d ' '
 }
 
+file_char_count() {
+  local f="$1"
+  if [[ -s "$f" ]]; then wc -c < "$f" | tr -d ' '; else printf '0'; fi
+}
+
+generate_page_text_artifacts() {
+  paged_txt="$outdir/_text/pdftotext-layout-paged.txt"
+  page_line_map="$outdir/_text/page-line-map.tsv"
+  page_text_stats="$outdir/_text/page-text-stats.tsv"
+
+  : > "$paged_txt"
+  printf 'pdf_page\tpage_file\tcombined_start_line\tcombined_end_line\tnonspace_chars\tstatus\n' > "$page_line_map"
+  printf 'pdf_page\tpage_file\tlines\tnonspace_chars\tstatus\n' > "$page_text_stats"
+
+  if ! [[ "$page_count" =~ ^[0-9]+$ && "$page_count" -gt 0 ]]; then
+    printf 'unknown\t\t\t\t\tpage_count_unavailable\n' >> "$page_line_map"
+    printf 'unknown\t\t\t\tpage_count_unavailable\n' >> "$page_text_stats"
+    return 0
+  fi
+
+  local width=${#page_count}
+  if [[ "$width" -lt 4 ]]; then width=4; fi
+
+  local page page_file rel_file status lines chars start_line end_line before_lines after_lines
+  for ((page=1; page<=page_count; page++)); do
+    page_file="$(printf "$outdir/_text_pages/page-%0${width}d.txt" "$page")"
+    rel_file="$(printf "_text_pages/page-%0${width}d.txt" "$page")"
+    status="ok"
+    if ! pdftotext -layout -enc UTF-8 -f "$page" -l "$page" "$work_pdf" "$page_file" 2>"$page_file.stderr.txt"; then
+      status="pdftotext_failed"
+      : > "$page_file"
+    else
+      rm -f "$page_file.stderr.txt"
+    fi
+
+    lines="$(wc -l < "$page_file" | tr -d ' ')"
+    chars="$(nonspace_char_count "$page_file")"
+    before_lines="$(wc -l < "$paged_txt" | tr -d ' ')"
+    start_line=$((before_lines + 1))
+    {
+      printf '===== PDF PAGE %0'"$width"'d / %s =====\n' "$page" "$page_count"
+      cat "$page_file"
+      printf '\n'
+    } >> "$paged_txt"
+    after_lines="$(wc -l < "$paged_txt" | tr -d ' ')"
+    end_line="$after_lines"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$page" "$rel_file" "$start_line" "$end_line" "$chars" "$status" >> "$page_line_map"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$page" "$rel_file" "$lines" "$chars" "$status" >> "$page_text_stats"
+  done
+}
+
+write_qa_report() {
+  qa_report="$outdir/_summary/qa-report.txt"
+  {
+    echo "PDF deep extraction QA report"
+    echo "Generated: $(date -Is)"
+    echo "Source: $input_pdf"
+    echo
+    echo "Mode: $document_mode"
+    echo "Mode reason: $document_mode_reason"
+    echo "Big-document page threshold: $big_doc_page_threshold"
+    echo "Big-document char threshold: $big_doc_char_threshold"
+    echo "Page count: ${page_count:-unknown}"
+    echo "pdftotext chars: $layout_chars"
+    echo "MarkItDown chars: $markitdown_chars"
+    if [[ -n "${ocr_output:-}" ]]; then echo "OCR chars: $(file_char_count "$ocr_output")"; fi
+    echo
+    echo "Page-aware artifacts:"
+    echo "- _text_pages/page-XXXX.txt: one pdftotext extraction per physical PDF page"
+    echo "- _text/pdftotext-layout-paged.txt: combined text with explicit PDF page headers"
+    echo "- _text/page-line-map.tsv: line ranges in the combined paged text"
+    echo "- _text/page-text-stats.tsv: per-page line/non-space character counts"
+    echo
+    if [[ -f "$page_text_stats" ]]; then
+      echo "Sparse pages (non-space chars < $ocr_sparse_chars_per_page; first 200 shown):"
+      awk -F '\t' -v threshold="$ocr_sparse_chars_per_page" 'NR>1 && $4 ~ /^[0-9]+$/ && $4 < threshold { print "- PDF page " $1 ": " $4 " non-space chars (" $2 ")"; count++; if (count>=200) exit } END { if (count==0) print "- none" }' "$page_text_stats"
+    fi
+    echo
+    echo "Caveats:"
+    if [[ "$document_mode" == "big" ]]; then
+      echo "- Big-document mode does not imply full visual verification. Use rg against _text_pages, then render/check only target PDF pages."
+      echo "- Page numbers in artifacts are physical PDF pages; printed page numbers inside bundled/signed documents may differ or reset."
+      echo "- MarkItDown is auxiliary and is not treated as the page-grounded source of truth."
+    else
+      echo "- Non-big mode may support fuller visual review, but PDF text extraction can still misread table structure."
+    fi
+  } > "$qa_report"
+}
+
 render_sample_page() {
   local page="$1"
   [[ "$page" =~ ^[0-9]+$ ]] || return 0
@@ -159,7 +257,9 @@ run_ocr_if_needed() {
 need_cmd pdftotext
 need_cmd pdftoppm
 
-full_render_page_limit="${PDF_FULL_RENDER_PAGE_LIMIT:-19}"
+big_doc_page_threshold="${PDF_BIG_DOC_PAGE_THRESHOLD:-50}"
+big_doc_char_threshold="${PDF_BIG_DOC_CHAR_THRESHOLD:-50000}"
+full_render_page_limit="${PDF_FULL_RENDER_PAGE_LIMIT:-49}"
 render_all_pages="${PDF_RENDER_ALL_PAGES:-0}"
 sample_pages_csv="${PDF_SAMPLE_PAGES:-1,last}"
 image_dpi_small="${PDF_IMAGE_DPI_SMALL:-250}"
@@ -179,21 +279,29 @@ else
   outdir="$tmp_root/pi-pdf-deep-extraction/$slug-$(date +%Y%m%d-%H%M%S)-$$"
 fi
 
-mkdir -p "$outdir"/{_input,_text,_markitdown,_pages,_ocr,_ocr_pages,_summary}
+mkdir -p "$outdir"/{_input,_text,_text_pages,_markitdown,_pages,_ocr,_ocr_pages,_summary}
 work_pdf="$outdir/_input/$base"
 cp -f "$input_pdf" "$work_pdf"
 
 layout_txt="$outdir/_text/pdftotext-layout.txt"
+paged_txt="$outdir/_text/pdftotext-layout-paged.txt"
+page_line_map="$outdir/_text/page-line-map.tsv"
+page_text_stats="$outdir/_text/page-text-stats.tsv"
 markitdown_md="$outdir/_markitdown/markitdown.md"
 pages_prefix="$outdir/_pages/page"
 manifest="$outdir/_summary/manifest.txt"
+qa_report="$outdir/_summary/qa-report.txt"
 outdir_win="$(to_windows_path "$outdir")"
 work_pdf_win="$(to_windows_path "$work_pdf")"
 layout_txt_win="$(to_windows_path "$layout_txt")"
+paged_txt_win="$(to_windows_path "$paged_txt")"
+page_line_map_win="$(to_windows_path "$page_line_map")"
+text_pages_dir_win="$(to_windows_path "$outdir/_text_pages")"
 markitdown_md_win="$(to_windows_path "$markitdown_md")"
 pages_dir_win="$(to_windows_path "$outdir/_pages")"
 ocr_dir_win="$(to_windows_path "$outdir/_ocr")"
 manifest_win="$(to_windows_path "$manifest")"
+qa_report_win="$(to_windows_path "$qa_report")"
 
 page_count="$(pdf_page_count "$work_pdf" || true)"
 page_count="${page_count//$'\r'/}"
@@ -226,15 +334,52 @@ else
   die "MarkItDown unavailable. Install uv/uvx or install Python package markitdown[pdf]."
 fi
 
-# 3. Page-count-aware image rendering. Full visual/model inspection is only
-#    appropriate for small PDFs by default. Large PDFs get sample images only.
+layout_chars="$(file_char_count "$layout_txt")"
+markitdown_chars="$(file_char_count "$markitdown_md")"
+
+document_mode="standard"
+document_mode_reason="below big-document thresholds"
+if [[ "$page_count" =~ ^[0-9]+$ && "$page_count" -ge "$big_doc_page_threshold" ]]; then
+  document_mode="big"
+  document_mode_reason="page count $page_count >= threshold $big_doc_page_threshold"
+elif [[ "$layout_chars" =~ ^[0-9]+$ && "$layout_chars" -gt "$big_doc_char_threshold" ]]; then
+  document_mode="big"
+  document_mode_reason="pdftotext dump chars $layout_chars > threshold $big_doc_char_threshold"
+elif [[ "$markitdown_chars" =~ ^[0-9]+$ && "$markitdown_chars" -gt "$big_doc_char_threshold" ]]; then
+  document_mode="big"
+  document_mode_reason="MarkItDown dump chars $markitdown_chars > threshold $big_doc_char_threshold"
+fi
+
+# 3. Page-aware text artifacts. These are the canonical search/index artifacts,
+#    because each file maps directly to a physical PDF page.
+generate_page_text_artifacts
+
+# 4. OCR, if the embedded/extracted text is sparse. OCR output can itself push
+#    a document into big-document mode before image rendering decisions are made.
+ocr_status="not needed"
+ocr_output=""
+run_ocr_if_needed
+ocr_output_win=""
+ocr_chars="0"
+if [[ -n "$ocr_output" ]]; then
+  ocr_output_win="$(to_windows_path "$ocr_output")"
+  ocr_chars="$(file_char_count "$ocr_output")"
+  if [[ "$document_mode" != "big" && "$ocr_chars" =~ ^[0-9]+$ && "$ocr_chars" -gt "$big_doc_char_threshold" ]]; then
+    document_mode="big"
+    document_mode_reason="OCR dump chars $ocr_chars > threshold $big_doc_char_threshold"
+  fi
+fi
+
+# 5. Page-count/size-aware image rendering. Full visual/model inspection is only
+#    appropriate outside big-document mode by default. Big documents get sample
+#    images only unless explicitly overridden.
 image_render_mode="sample only"
 if [[ "$render_all_pages" == "1" ]]; then
   pdftoppm -png -r "$image_dpi_small" -cropbox "$work_pdf" "$pages_prefix"
   image_render_mode="all pages override"
-elif [[ "$page_count" =~ ^[0-9]+$ && "$page_count" -le "$full_render_page_limit" ]]; then
+elif [[ "$document_mode" != "big" && "$page_count" =~ ^[0-9]+$ && "$page_count" -le "$full_render_page_limit" ]]; then
   pdftoppm -png -r "$image_dpi_small" -cropbox "$work_pdf" "$pages_prefix"
-  image_render_mode="all pages small-pdf"
+  image_render_mode="all pages non-big-pdf"
 else
   IFS=',' read -r -a sample_pages <<< "$sample_pages_csv"
   declare -A seen_samples=()
@@ -248,13 +393,10 @@ else
   done
 fi
 
-ocr_status="not needed"
-ocr_output=""
-run_ocr_if_needed
-ocr_output_win=""
-if [[ -n "$ocr_output" ]]; then ocr_output_win="$(to_windows_path "$ocr_output")"; fi
+write_qa_report
 
 png_count="$(find "$outdir/_pages" -type f -name '*.png' | wc -l | tr -d ' ')"
+text_page_file_count="$(find "$outdir/_text_pages" -type f -name 'page-*.txt' | wc -l | tr -d ' ')"
 ocr_page_png_count="$(find "$outdir/_ocr_pages" -type f -name '*.png' | wc -l | tr -d ' ')"
 
 {
@@ -268,11 +410,18 @@ ocr_page_png_count="$(find "$outdir/_ocr_pages" -type f -name '*.png' | wc -l | 
   echo
   echo "Extraction policy:"
   echo "Page count: ${page_count:-unknown}"
+  echo "Document mode: $document_mode"
+  echo "Document mode reason: $document_mode_reason"
+  echo "Big-document page threshold: $big_doc_page_threshold"
+  echo "Big-document char threshold: $big_doc_char_threshold"
   echo "Full render page limit: $full_render_page_limit"
   echo "Image render mode: $image_render_mode"
   echo "PDF_RENDER_ALL_PAGES: $render_all_pages"
   echo "Sample pages requested: $sample_pages_csv"
   echo "Text non-space chars: $text_nonspace_chars"
+  echo "pdftotext chars: $layout_chars"
+  echo "MarkItDown chars: $markitdown_chars"
+  echo "OCR chars: $ocr_chars"
   echo "Text chars/page: $chars_per_page"
   echo "OCR sparse chars/page threshold: $ocr_sparse_chars_per_page"
   echo "OCR needed: $ocr_needed"
@@ -303,21 +452,41 @@ ocr_page_png_count="$(find "$outdir/_ocr_pages" -type f -name '*.png' | wc -l | 
   echo
   echo "Output counts:"
   echo "pdftotext lines: $(wc -l < "$layout_txt")"
+  echo "paged pdftotext lines: $(wc -l < "$paged_txt")"
+  echo "per-page text files: $text_page_file_count"
   echo "MarkItDown lines: $(wc -l < "$markitdown_md")"
   echo "PNG page/sample images: $png_count"
   echo "OCR page images: $ocr_page_png_count"
+  echo
+  echo "Page-aware artifacts:"
+  echo "paged pdftotext: $paged_txt"
+  echo "paged pdftotext Windows: $paged_txt_win"
+  echo "page-line map: $page_line_map"
+  echo "page-line map Windows: $page_line_map_win"
+  echo "text pages dir: $outdir/_text_pages"
+  echo "text pages dir Windows: $text_pages_dir_win"
+  echo "QA report: $qa_report"
+  echo "QA report Windows: $qa_report_win"
 } > "$manifest"
 
 echo "Done. Output directory: $outdir"
 echo "Done. Output directory Windows: $outdir_win"
 echo "- $layout_txt"
+echo "- $paged_txt"
+echo "- $page_line_map"
+echo "- $outdir/_text_pages/page-*.txt"
 echo "- $markitdown_md"
 echo "- $outdir/_pages/page-*.png or sample-page-*.png"
 echo "- $outdir/_ocr/ocr*.txt (when created)"
 echo "- $manifest"
+echo "- $qa_report"
 echo "Windows paths for Pi read tool:"
 echo "- $layout_txt_win"
+echo "- $paged_txt_win"
+echo "- $page_line_map_win"
+echo "- $text_pages_dir_win\\page-*.txt"
 echo "- $markitdown_md_win"
 echo "- $pages_dir_win\\page-*.png or sample-page-*.png"
 echo "- $ocr_dir_win\\ocr*.txt"
 echo "- $manifest_win"
+echo "- $qa_report_win"
