@@ -28,7 +28,7 @@ set FIRECRAWL_API_KEY=fc-...
 
 Or create:
 
-`C:\Users\Dario Costa\.pi\web-smart-fetch.json`
+`%USERPROFILE%\.pi\web-smart-fetch.json`
 
 ```json
 {
@@ -39,7 +39,7 @@ Or create:
 ## Install deps
 
 ```bash
-cd C:\Users\Dario Costa\.pi\agent\extensions\web-smart-fetch
+cd %USERPROFILE%\.pi\agent\extensions\web-smart-fetch
 npm install
 ```
 
