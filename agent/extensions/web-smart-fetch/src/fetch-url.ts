@@ -76,7 +76,7 @@ type GitHubModule = {
 };
 
 type FirecrawlModule = {
-	getFirecrawlClient: (config: ExtensionConfig) => unknown;
+	getFirecrawlClient: (config: ExtensionConfig) => Promise<unknown>;
 	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
 };
 
@@ -467,7 +467,7 @@ export async function fetchUrl(
 	}
 
 	const firecrawl = config.firecrawlApiKey ? await loadFirecrawlModule() : undefined;
-	const client = firecrawl?.getFirecrawlClient(config);
+	const client = firecrawl ? await firecrawl.getFirecrawlClient(config) : undefined;
 
 	let result: FetchResult;
 	try {

@@ -48,7 +48,7 @@ function textOutput(result: any): string {
 }
 
 type FirecrawlModule = {
-	getFirecrawlClient: (config: ReturnType<typeof loadConfig>) => unknown;
+	getFirecrawlClient: (config: ReturnType<typeof loadConfig>) => Promise<unknown>;
 	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
 	searchWithFirecrawl: (client: unknown, query: string, limit?: number) => Promise<unknown>;
 	crawlWithFirecrawl: (client: unknown, url: string, limit?: number) => Promise<unknown>;
@@ -249,7 +249,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate) {
 			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			const { getFirecrawlClient, searchWithFirecrawl } = await loadFirecrawlModule();
-			const client = getFirecrawlClient(config);
+			const client = await getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Searching with Firecrawl..." }] });
 			const result: any = await searchWithFirecrawl(client, params.query, 10);
@@ -307,7 +307,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate) {
 			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			const { crawlWithFirecrawl, getFirecrawlClient } = await loadFirecrawlModule();
-			const client = getFirecrawlClient(config);
+			const client = await getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Crawling with Firecrawl..." }] });
 			const result: any = await crawlWithFirecrawl(client, params.url, 20);

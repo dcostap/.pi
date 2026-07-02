@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import type FirecrawlDefault from "@mendable/firecrawl-js";
 import type { ExtensionConfig } from "./config.ts";
 
@@ -9,17 +8,24 @@ const FIRECRAWL_TIMEOUT_MS = 60_000;
 // capping long network/scrape waits at one minute.
 type FirecrawlConstructor = new (options?: { apiKey?: string | null; apiUrl?: string | null; timeoutMs?: number }) => FirecrawlClient;
 
-const requireFromHere = createRequire(import.meta.url);
-let cachedFirecrawlSdk: unknown;
+// Cache object avoids TDZ issues when jiti re-enters the module during evaluation.
+const _fcCache: { sdk: unknown; loading: Promise<unknown> | null } = { sdk: undefined, loading: null };
 
-function loadFirecrawlSdk(): unknown {
-	if (cachedFirecrawlSdk) return cachedFirecrawlSdk;
-	cachedFirecrawlSdk = requireFromHere("@mendable/firecrawl-js");
-	return cachedFirecrawlSdk;
+async function loadFirecrawlSdk(): Promise<unknown> {
+	if (_fcCache.sdk) return _fcCache.sdk;
+	if (_fcCache.loading) return _fcCache.loading;
+	_fcCache.loading = import("@mendable/firecrawl-js");
+	try {
+		_fcCache.sdk = await _fcCache.loading;
+		return _fcCache.sdk;
+	} catch (error) {
+		_fcCache.loading = null;
+		throw error;
+	}
 }
 
-function getFirecrawlConstructor(): FirecrawlConstructor {
-	const sdk = loadFirecrawlSdk();
+async function getFirecrawlConstructor(): Promise<FirecrawlConstructor> {
+	const sdk = await loadFirecrawlSdk();
 	const seen = new Set<unknown>();
 	const candidates: unknown[] = [sdk];
 
@@ -45,9 +51,9 @@ function getFirecrawlConstructor(): FirecrawlConstructor {
 	throw new Error(`Firecrawl SDK failed to load: missing Firecrawl constructor export (${details})`);
 }
 
-export function getFirecrawlClient(config: ExtensionConfig): FirecrawlClient | undefined {
+export async function getFirecrawlClient(config: ExtensionConfig): Promise<FirecrawlClient | undefined> {
 	if (!config.firecrawlApiKey) return undefined;
-	const Firecrawl = getFirecrawlConstructor();
+	const Firecrawl = await getFirecrawlConstructor();
 	return new Firecrawl({ apiKey: config.firecrawlApiKey, timeoutMs: FIRECRAWL_TIMEOUT_MS });
 }
 
