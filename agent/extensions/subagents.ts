@@ -1067,8 +1067,11 @@ function buildFinalToolResult(results: ChildResult[]) {
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
 	const header = buildSubagentPromptHeader(results.map((result) => result.state));
+	const priorityLegend = results[0]?.state.kind === "review"
+		? "Priority legend: [P0] critical/blocking, [P1] high/should fix before merge/use, [P2] medium/actionable, [P3] low/minor or test gap."
+		: "";
 	return {
-		content: [{ type: "text" as const, text: [header, ...sections, FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
+		content: [{ type: "text" as const, text: [header, priorityLegend, ...sections, FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
 		details: {
 			failures,
 			results: results.map((result) => ({
