@@ -10,7 +10,7 @@ import { Type } from "typebox";
 
 const REVIEW_TOOL_NAME = "launch_review_subagents";
 const GENERIC_TOOL_NAME = "launch_generic_subagents";
-const MAX_SUBAGENTS = 4;
+const MAX_SUBAGENTS = 20;
 const REVIEW_SESSION_PREFIX = "[Review Subagent]";
 const GENERIC_SESSION_PREFIX = "[Generic Subagent]";
 const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' conclusions and statements; be discerning, analytical, and self-reliant. You make your own conclusions.";
