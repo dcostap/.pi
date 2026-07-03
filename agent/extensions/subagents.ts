@@ -596,7 +596,7 @@ function buildToolPartial(states: RuntimeState[]) {
 		const usage = fixedUsage(state.usage);
 		const name = fitColumn(state.sessionName, 56);
 		const context = fitColumn(formatContextUsage(state), 14);
-		const attempt = state.maxAttempts > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
+		const attempt = state.maxAttempts > 1 && state.attempt > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
 		const model = `model=${state.modelRef ?? "(unknown)"}${attempt}`;
 		const activity = state.error ?? state.lastActivity;
 		return `${status} ${usage} ${context} ${model} ${name} ${activity}`;
@@ -625,6 +625,7 @@ class RpcClient {
 
 	start(signal?: AbortSignal): void {
 		const args = ["--mode", "rpc", "--name", this.task.sessionName];
+		if (this.state.attempt > 1 && this.state.sessionFile) args.push("--session", this.state.sessionFile);
 		if (this.task.modelRef) args.push("--model", this.task.modelRef);
 		if (this.task.thinking) args.push("--thinking", this.task.thinking);
 
@@ -925,6 +926,19 @@ async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionCo
 	return { tasks: await finalizeTasks(resolved, ctx, "GENERIC_SUBAGENT_SYSTEM_PROMPT.md", buildGenericSubagentUserPrompt) };
 }
 
+function buildSubagentRetryPrompt(task: ResolvedTask, state: RuntimeState): string {
+	const reason = state.previousErrors.at(-1) ?? state.error ?? "the previous subagent attempt failed before completing";
+	return [
+		"The previous attempt for this subagent appears to have failed due to a transient/runtime error.",
+		`Failure note: ${reason}`,
+		"",
+		"You are being resumed in the same subagent session. Continue the assigned work from the existing conversation and any scratch files in your sandbox.",
+		"Do not start over unless the prior context is unusable. If needed, briefly inspect relevant files/state, then finish the original assignment.",
+		"",
+		`Original assignment summary: ${task.assignment || task.focus || task.whatToReview || task.mainTask}`,
+	].join("\n");
+}
+
 async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: RuntimeState, emit: () => void, signal?: AbortSignal): Promise<ChildResult> {
 	state.status = "starting";
 	state.lastActivity = state.attempt > 1 ? `starting retry attempt ${state.attempt}/${state.maxAttempts}…` : "starting pi rpc session…";
@@ -949,7 +963,8 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 
 		client.start(signal);
 		const exitPromise = client.waitForExit();
-		await client.send("prompt", { message: task.userPrompt }, 30_000);
+		const prompt = state.attempt > 1 && state.sessionFile ? buildSubagentRetryPrompt(task, state) : task.userPrompt;
+		await client.send("prompt", { message: prompt }, 30_000);
 		try {
 			const stateResponse = await client.send("get_state", {}, 5_000);
 			applyRpcStateMetadata(state, stateResponse.data);
