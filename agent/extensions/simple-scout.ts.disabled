@@ -5,7 +5,7 @@ import { Type } from "typebox";
 import { promises as fs } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
-import { FAST_CHEAP_ROLE, resolveModelRole } from "./_shared/model-roles";
+import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, resolveModelRole } from "./_shared/model-roles";
 const MAX_ROUNDS = 50;
 const MAX_FILE_CHARS = 80_000;
 const MAX_GREP_LINES = 200;
@@ -82,7 +82,7 @@ function extractResponseText(content: Array<{ type: string; text?: string }>): s
 }
 
 async function streamScoutResponse(model: any, messages: any[], auth: any, options: { reasoningEffort?: string; maxTokens?: number }, signal: AbortSignal, onDelta: (raw: string) => void): Promise<string> {
-	const events = stream(model, { messages }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(options.maxTokens ?? MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS), reasoningEffort: options.reasoningEffort ?? "minimal", signal } as any);
+	const events = stream(model, { messages }, { apiKey: auth.apiKey, headers: auth.headers, ...options, signal } as any);
 	let raw = "";
 	for await (const event of events) {
 		if (event.type === "text_delta") {
@@ -307,6 +307,7 @@ export default function (pi: ExtensionAPI) {
 			const fastModel = await resolveModelRole(ctx, FAST_CHEAP_ROLE);
 			if (!fastModel.ok) throw new Error(fastModel.loudMessage);
 			const { model, auth } = fastModel;
+			const fastModelOptions = getModelRoleRequestOptions(fastModel, { maxTokensCap: MAX_OUTPUT_TOKENS });
 
 			const scopes = Array.isArray(params.paths) && params.paths.length > 0 ? params.paths : ["."];
 			const messages: any[] = [{ role: "user", timestamp: Date.now(), content: [{ type: "text", text: [
@@ -343,7 +344,7 @@ export default function (pi: ExtensionAPI) {
 				const childSignal = makeChildSignal(signal);
 				let raw = "";
 				try {
-					raw = await streamScoutResponse(model, messages, auth, fastModel.config, childSignal.signal, (partialRaw) => {
+					raw = await streamScoutResponse(model, messages, auth, fastModelOptions, childSignal.signal, (partialRaw) => {
 						lastRawTokens = estimateTokens(partialRaw);
 						onUpdate?.({ content: [{ type: "text", text: `simple_scout thinking… ↑${formatTokens(inputTokens)} ↓${formatTokens(lastRawTokens)}` }] });
 					});

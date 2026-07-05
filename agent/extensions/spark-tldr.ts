@@ -2,7 +2,7 @@ import { stream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { FAST_CHEAP_ROLE, resolveModelRole } from "./_shared/model-roles";
+import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, resolveModelRole } from "./_shared/model-roles";
 
 const TLDR_COMMAND = "tldr";
 const TLDR_MESSAGE_TYPE = "spark-tldr";
@@ -424,6 +424,7 @@ async function runTldr(
 		throw new Error(fastModel.loudMessage);
 	}
 	const { model, auth } = fastModel;
+	const fastModelOptions = getModelRoleRequestOptions(fastModel, { maxTokensCap: MAX_OUTPUT_TOKENS });
 
 	const safePromptBudget = Math.max(
 		8_000,
@@ -462,8 +463,7 @@ async function runTldr(
 		{
 			apiKey: auth.apiKey,
 			headers: auth.headers,
-			maxTokens: Math.min(fastModel.config.maxTokens ?? MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS),
-			reasoningEffort: fastModel.config.reasoningEffort ?? "minimal",
+			...fastModelOptions,
 			// Keep TL;DR provider-side/websocket continuation state separate from the
 			// main chat. Reusing the main session id can poison Codex's cached
 			// previous_response_id and make the user's next message fail.

@@ -128,6 +128,33 @@ export async function resolveModelRole(ctx: any, role: ModelRoleName = FAST_CHEA
 	};
 }
 
+export function getModelRoleReasoningEffort(resolved: ResolvedModelRole): string | undefined {
+	const configured = resolved.config.reasoningEffort;
+	if (!configured || configured === "off" || resolved.model?.reasoning === false) return undefined;
+
+	const map = resolved.model?.thinkingLevelMap;
+	if (map && Object.prototype.hasOwnProperty.call(map, configured)) {
+		const mapped = map[configured];
+		return typeof mapped === "string" && mapped.trim() ? mapped : undefined;
+	}
+
+	return configured;
+}
+
+export function getModelRoleRequestOptions(
+	resolved: ResolvedModelRole,
+	options: { maxTokensCap?: number } = {},
+): { maxTokens?: number; reasoningEffort?: string } {
+	const maxTokens = typeof resolved.config.maxTokens === "number"
+		? Math.min(resolved.config.maxTokens, options.maxTokensCap ?? resolved.config.maxTokens)
+		: options.maxTokensCap;
+	const reasoningEffort = getModelRoleReasoningEffort(resolved);
+	return {
+		...(maxTokens ? { maxTokens } : {}),
+		...(reasoningEffort ? { reasoningEffort } : {}),
+	};
+}
+
 export function notifyModelRoleProblem(
 	ctx: any,
 	problem: ModelRoleProblem,

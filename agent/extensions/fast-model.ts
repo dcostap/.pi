@@ -11,7 +11,6 @@ import {
 } from "./_shared/model-roles";
 
 const VISIBLE_PICKER_ROWS = 10;
-const DEFAULT_REASONING_EFFORT = "minimal";
 const DEFAULT_MAX_TOKENS = 2048;
 const FAST_CHEAP_HINTS = [
 	"spark",
@@ -36,7 +35,7 @@ type ModelItem = {
 };
 
 function defaultRoleConfig(config: Pick<ModelRoleConfig, "provider" | "model">): ModelRoleConfig {
-	return { ...config, reasoningEffort: DEFAULT_REASONING_EFFORT, maxTokens: DEFAULT_MAX_TOKENS };
+	return { ...config, maxTokens: DEFAULT_MAX_TOKENS };
 }
 
 function parseProviderModel(value: string): Pick<ModelRoleConfig, "provider" | "model"> | undefined {

@@ -1,5 +1,5 @@
 import { complete } from "@earendil-works/pi-ai";
-import { FAST_CHEAP_ROLE, notifyModelRoleProblem, resolveModelRole } from "../../_shared/model-roles";
+import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, notifyModelRoleProblem, resolveModelRole } from "../../_shared/model-roles";
 
 type SparkProcessedContent = {
 	quality: "OK" | "WEAK";
@@ -86,6 +86,7 @@ export async function processExtractedContentWithSpark(
 			return manualFallback(manualWeakReasons);
 		}
 		const { model, auth } = fastModel;
+		const fastModelOptions = getModelRoleRequestOptions(fastModel);
 
 		const schema = focus
 			? `{
@@ -141,8 +142,7 @@ export async function processExtractedContentWithSpark(
 			{
 				apiKey: auth.apiKey,
 				headers: auth.headers,
-				reasoningEffort: fastModel.config.reasoningEffort ?? "minimal",
-				maxTokens: fastModel.config.maxTokens,
+				...fastModelOptions,
 				signal,
 			},
 		);

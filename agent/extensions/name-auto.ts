@@ -8,7 +8,7 @@
 import { complete, type Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
-import { FAST_CHEAP_ROLE, resolveModelRole } from "./_shared/model-roles";
+import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, resolveModelRole } from "./_shared/model-roles";
 
 const COMMAND = "name_auto";
 const STATUS_KEY = "name-auto";
@@ -186,6 +186,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 					throw new Error(fastModel.loudMessage);
 				}
 				const { model, auth } = fastModel;
+				const fastModelOptions = getModelRoleRequestOptions(fastModel, { maxTokensCap: OUTPUT_MAX_TOKENS });
 
 				const fullDump = buildConversationDump(ctx.sessionManager.getBranch());
 				if (!fullDump.trim()) {
@@ -227,8 +228,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 							{
 								apiKey: auth.apiKey,
 								headers: auth.headers,
-								maxTokens: Math.min(fastModel.config.maxTokens ?? OUTPUT_MAX_TOKENS, OUTPUT_MAX_TOKENS),
-								reasoningEffort: fastModel.config.reasoningEffort ?? "minimal",
+								...fastModelOptions,
 								signal: loader.signal,
 								sessionId: ctx.sessionManager.getSessionId(),
 							},
