@@ -80,7 +80,10 @@ type FirecrawlModule = {
 	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
 };
 
-async function loadGitHubModule(): Promise<GitHubModule> {
+let githubModulePromise: Promise<GitHubModule> | undefined;
+let firecrawlModulePromise: Promise<FirecrawlModule> | undefined;
+
+async function importGitHubModule(): Promise<GitHubModule> {
 	const mod: any = await import("./github.ts");
 	const githubExports = mod?.parseGitHubUrl ? mod : mod?.default;
 	const parseGitHubUrl = githubExports?.parseGitHubUrl;
@@ -91,7 +94,15 @@ async function loadGitHubModule(): Promise<GitHubModule> {
 	return { parseGitHubUrl, handleGitHubUrl };
 }
 
-async function loadFirecrawlModule(): Promise<FirecrawlModule> {
+function loadGitHubModule(): Promise<GitHubModule> {
+	githubModulePromise ??= importGitHubModule().catch((error) => {
+		githubModulePromise = undefined;
+		throw error;
+	});
+	return githubModulePromise;
+}
+
+async function importFirecrawlModule(): Promise<FirecrawlModule> {
 	const mod: any = await import("./firecrawl.ts");
 	const firecrawlExports = mod?.getFirecrawlClient ? mod : mod?.default?.getFirecrawlClient ? mod.default : undefined;
 	const getFirecrawlClient = firecrawlExports?.getFirecrawlClient;
@@ -100,6 +111,14 @@ async function loadFirecrawlModule(): Promise<FirecrawlModule> {
 		throw new Error("Firecrawl support failed to load: missing getFirecrawlClient/scrapeWithFirecrawl exports");
 	}
 	return { getFirecrawlClient, scrapeWithFirecrawl };
+}
+
+function loadFirecrawlModule(): Promise<FirecrawlModule> {
+	firecrawlModulePromise ??= importFirecrawlModule().catch((error) => {
+		firecrawlModulePromise = undefined;
+		throw error;
+	});
+	return firecrawlModulePromise;
 }
 
 function isProbablyPdf(contentType: string, url: string): boolean {

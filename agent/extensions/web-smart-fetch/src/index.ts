@@ -54,7 +54,31 @@ type FirecrawlModule = {
 	crawlWithFirecrawl: (client: unknown, url: string, limit?: number) => Promise<unknown>;
 };
 
-async function loadFirecrawlModule(): Promise<FirecrawlModule> {
+type FetchUrlModule = {
+	fetchUrl: (
+		url: string,
+		config: ReturnType<typeof loadConfig>,
+		ctx: any,
+		prompt?: string,
+		onUpdate?: (update: any) => void,
+		signal?: AbortSignal,
+	) => Promise<{ text: string; details: Record<string, unknown> }>;
+};
+
+let fetchUrlModulePromise: Promise<FetchUrlModule> | undefined;
+let firecrawlModulePromise: Promise<FirecrawlModule> | undefined;
+
+function loadFetchUrlModule(): Promise<FetchUrlModule> {
+	// jiti can corrupt bindings when the same lazy TypeScript module is imported
+	// concurrently by parallel tool calls. Share the first in-flight import.
+	fetchUrlModulePromise ??= (import("./fetch-url.ts") as Promise<FetchUrlModule>).catch((error) => {
+		fetchUrlModulePromise = undefined;
+		throw error;
+	});
+	return fetchUrlModulePromise;
+}
+
+async function importFirecrawlModule(): Promise<FirecrawlModule> {
 	const mod: any = await import("./firecrawl.ts");
 	const exports = mod?.getFirecrawlClient ? mod : mod?.default?.getFirecrawlClient ? mod.default : undefined;
 	if (
@@ -66,6 +90,14 @@ async function loadFirecrawlModule(): Promise<FirecrawlModule> {
 		throw new Error("Firecrawl support failed to load: missing expected helper exports");
 	}
 	return exports as FirecrawlModule;
+}
+
+function loadFirecrawlModule(): Promise<FirecrawlModule> {
+	firecrawlModulePromise ??= importFirecrawlModule().catch((error) => {
+		firecrawlModulePromise = undefined;
+		throw error;
+	});
+	return firecrawlModulePromise;
 }
 
 function renderErrorResult(result: any, theme: any, context: any): Text | undefined {
@@ -206,7 +238,7 @@ export default function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { fetchUrl } = await import("./fetch-url.ts");
+			const { fetchUrl } = await loadFetchUrlModule();
 			const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
 			return {
 				content: [{ type: "text", text: result.text }],
