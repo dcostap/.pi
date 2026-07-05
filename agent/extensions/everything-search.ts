@@ -2,10 +2,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { constants } from "node:fs";
+import { constants, createWriteStream, type WriteStream } from "node:fs";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import { access, readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 
 type EverythingSearchInput = {
 	query: string;
@@ -15,6 +18,7 @@ type EverythingSearchInput = {
 	match_path?: boolean;
 	count?: number;
 	offset?: number;
+	dump_to_file?: boolean;
 	sort?: "name" | "path" | "size" | "date_modified" | "date_created";
 	ascending?: boolean;
 	regex?: boolean;
@@ -81,15 +85,19 @@ const EVERYTHING_SEARCH_SCHEMA = Type.Object({
 	),
 	count: Type.Optional(
 		Type.Number({
-			description: `Maximum results to return. Default 50. Hard cap ${EVERYTHING_MAX_RESULTS}.`,
+			description: `Maximum results to return. In normal mode, default 50 and hard cap ${EVERYTHING_MAX_RESULTS}. With dump_to_file, maximum results to write; omit to dump all results after offset.`,
 			minimum: 1,
-			maximum: EVERYTHING_MAX_RESULTS,
 		}),
 	),
 	offset: Type.Optional(
 		Type.Number({
-			description: "Result offset for pagination.",
+			description: "Result offset for pagination, or start offset when dump_to_file is enabled.",
 			minimum: 0,
+		}),
+	),
+	dump_to_file: Type.Optional(
+		Type.Boolean({
+			description: "Write matching results to a randomly named JSONL file in the OS temp directory instead of returning result lines in context.",
 		}),
 	),
 	sort: Type.Optional(StringEnum(["name", "path", "size", "date_modified", "date_created"] as const)),
@@ -213,9 +221,12 @@ function formatDuration(ms: number): string {
 	return `${minutes}m ${seconds}s`;
 }
 
+function buildFullPath(item: EverythingItem): string {
+	return item.name ? `${item.path || ""}\\${item.name}` : item.path || "";
+}
+
 function buildResultLine(item: EverythingItem): string {
-	const fullPath = item.name ? `${item.path || ""}\\${item.name}` : item.path || "";
-	const parts = [fullPath];
+	const parts = [buildFullPath(item)];
 	if (item.type === "folder") {
 		parts.push("[folder]");
 	} else {
@@ -227,6 +238,18 @@ function buildResultLine(item: EverythingItem): string {
 	return parts.join("  ");
 }
 
+function buildDumpRecord(item: EverythingItem): Record<string, unknown> {
+	return {
+		fullPath: buildFullPath(item),
+		path: item.path,
+		name: item.name,
+		type: item.type,
+		size: item.size,
+		date_modified: item.date_modified,
+		date_modified_iso: filetimeToISO(item.date_modified),
+	};
+}
+
 function formatSearchOptions(params: EverythingSearchInput | undefined): string {
 	if (!params) return "";
 	const searchFullPath = params.search_full_path ?? params.match_path;
@@ -236,6 +259,7 @@ function formatSearchOptions(params: EverythingSearchInput | undefined): string 
 		searchFullPath ? "search-full-path" : undefined,
 		params.count !== undefined ? `count=${params.count}` : undefined,
 		params.offset !== undefined ? `offset=${params.offset}` : undefined,
+		params.dump_to_file ? "dump-to-file" : undefined,
 		params.sort ? `sort=${params.sort}` : undefined,
 		params.ascending === false ? "descending" : undefined,
 		params.regex ? "regex" : undefined,
@@ -351,28 +375,28 @@ async function getEverythingHttpCapabilities(): Promise<EverythingHttpCapabiliti
 	}
 }
 
-async function searchEverything(params: EverythingSearchInput, signal: AbortSignal): Promise<{ summary: string; details: Record<string, unknown> }> {
-	const prepared = normalizeSearchInput(params);
-	const capabilities = await getEverythingHttpCapabilities();
-	if (queryRequiresDiskAccess(prepared.query) && capabilities.allowDiskAccess === false) {
-		const source = capabilities.pluginsIniPath ? ` in ${capabilities.pluginsIniPath}` : "";
-		throw new Error(
-			`Everything HTTP server has allow_disk_access=0${source}, so content: and include-filelist: searches are disabled over HTTP. ` +
-			`Enable allow_disk_access=1 and restart Everything.`,
-		);
-	}
-	if (queryRequiresQueryAccess(prepared.query) && capabilities.allowQueryAccess === false) {
-		const source = capabilities.pluginsIniPath ? ` in ${capabilities.pluginsIniPath}` : "";
-		throw new Error(
-			`Everything HTTP server has allow_query_access=0${source}, so is-open:, online:, and runcount: searches are disabled over HTTP. ` +
-			`Enable allow_query_access=1 and restart Everything.`,
-		);
-	}
+type EverythingPage = {
+	totalResults: number;
+	results: EverythingItem[];
+	elapsedMs: number;
+};
 
+function normalizeOffset(value: number | undefined): number {
+	return Math.max(0, Math.floor(value ?? 0));
+}
+
+function normalizeContextCount(value: number | undefined): number {
+	return Math.min(Math.max(1, Math.floor(value ?? 50)), EVERYTHING_MAX_RESULTS);
+}
+
+function normalizeDumpLimit(value: number | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const limit = Math.floor(value);
+	return Number.isFinite(limit) && limit > 0 ? limit : undefined;
+}
+
+function buildEverythingUrl(params: EverythingSearchInput, prepared: PreparedEverythingSearch, count: number, offset: number): URL {
 	const url = new URL(`http://${EVERYTHING_HOST}:${EVERYTHING_PORT}/`);
-	const count = Math.min(Math.max(1, Math.floor(params.count ?? 50)), EVERYTHING_MAX_RESULTS);
-	const offset = Math.max(0, Math.floor(params.offset ?? 0));
-
 	url.searchParams.set("search", prepared.query);
 	url.searchParams.set("json", "1");
 	url.searchParams.set("count", String(count));
@@ -386,7 +410,17 @@ async function searchEverything(params: EverythingSearchInput, signal: AbortSign
 	if (params.case_sensitive) url.searchParams.set("case", "1");
 	if (params.whole_word) url.searchParams.set("wholeword", "1");
 	if (prepared.searchFullPath) url.searchParams.set("path", "1");
+	return url;
+}
 
+async function fetchEverythingPage(
+	params: EverythingSearchInput,
+	prepared: PreparedEverythingSearch,
+	count: number,
+	offset: number,
+	signal: AbortSignal,
+): Promise<EverythingPage> {
+	const url = buildEverythingUrl(params, prepared, count, offset);
 	const start = performance.now();
 	let response: Response;
 	try {
@@ -404,12 +438,147 @@ async function searchEverything(params: EverythingSearchInput, signal: AbortSign
 	}
 
 	const data = (await response.json()) as EverythingResponse;
+	return {
+		totalResults: Math.max(0, Math.floor(data.totalResults ?? 0)),
+		results: Array.isArray(data.results) ? data.results : [],
+		elapsedMs: performance.now() - start,
+	};
+}
+
+async function assertEverythingQueryAllowed(prepared: PreparedEverythingSearch): Promise<void> {
+	const capabilities = await getEverythingHttpCapabilities();
+	if (queryRequiresDiskAccess(prepared.query) && capabilities.allowDiskAccess === false) {
+		const source = capabilities.pluginsIniPath ? ` in ${capabilities.pluginsIniPath}` : "";
+		throw new Error(
+			`Everything HTTP server has allow_disk_access=0${source}, so content: and include-filelist: searches are disabled over HTTP. ` +
+			`Enable allow_disk_access=1 and restart Everything.`,
+		);
+	}
+	if (queryRequiresQueryAccess(prepared.query) && capabilities.allowQueryAccess === false) {
+		const source = capabilities.pluginsIniPath ? ` in ${capabilities.pluginsIniPath}` : "";
+		throw new Error(
+			`Everything HTTP server has allow_query_access=0${source}, so is-open:, online:, and runcount: searches are disabled over HTTP. ` +
+			`Enable allow_query_access=1 and restart Everything.`,
+		);
+	}
+}
+
+async function waitForDrain(stream: WriteStream): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		const cleanup = () => {
+			stream.off("drain", onDrain);
+			stream.off("error", onError);
+		};
+		const onDrain = () => {
+			cleanup();
+			resolve();
+		};
+		const onError = (error: unknown) => {
+			cleanup();
+			reject(error instanceof Error ? error : new Error(String(error)));
+		};
+		stream.once("drain", onDrain);
+		stream.once("error", onError);
+	});
+}
+
+async function writeJsonLine(stream: WriteStream, value: unknown, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) throw new Error("Cancelled");
+	if (!stream.write(`${JSON.stringify(value)}\n`)) await waitForDrain(stream);
+	if (signal.aborted) throw new Error("Cancelled");
+}
+
+function buildBaseDetails(prepared: PreparedEverythingSearch, offset: number): Record<string, unknown> {
+	return {
+		query: prepared.query,
+		originalQuery: prepared.originalQuery,
+		scope_path: prepared.scopePath,
+		children_only: prepared.childrenOnly,
+		search_full_path: prepared.searchFullPath,
+		warnings: prepared.warnings,
+		offset,
+		endpoint: `http://${EVERYTHING_HOST}:${EVERYTHING_PORT}/`,
+	};
+}
+
+async function dumpEverythingResults(
+	params: EverythingSearchInput,
+	prepared: PreparedEverythingSearch,
+	signal: AbortSignal,
+): Promise<{ summary: string; details: Record<string, unknown> }> {
+	const outputPath = join(tmpdir(), `pi-everything-search-${randomUUID()}.jsonl`);
+	const stream = createWriteStream(outputPath, { encoding: "utf8" });
+	const start = performance.now();
+	const initialOffset = normalizeOffset(params.offset);
+	const limit = normalizeDumpLimit(params.count);
+	let offset = initialOffset;
+	let remaining = limit;
+	let totalResults = 0;
+	let writtenResults = 0;
+
+	try {
+		while (remaining === undefined || remaining > 0) {
+			const pageCount = Math.min(EVERYTHING_MAX_RESULTS, remaining ?? EVERYTHING_MAX_RESULTS);
+			const page = await fetchEverythingPage(params, prepared, pageCount, offset, signal);
+			totalResults = page.totalResults;
+
+			if (page.results.length === 0) break;
+			for (const item of page.results) {
+				await writeJsonLine(stream, buildDumpRecord(item), signal);
+			}
+
+			writtenResults += page.results.length;
+			offset += page.results.length;
+			if (remaining !== undefined) remaining -= page.results.length;
+			if (offset >= totalResults || page.results.length < pageCount) break;
+		}
+
+		stream.end();
+		await finished(stream);
+	} catch (error) {
+		stream.destroy();
+		throw error;
+	}
+
 	const elapsed = performance.now() - start;
-	const totalResults = Math.max(0, Math.floor(data.totalResults ?? 0));
-	const results = Array.isArray(data.results) ? data.results : [];
+	const startIndex = writtenResults > 0 ? initialOffset + 1 : 0;
+	const endIndex = writtenResults > 0 ? initialOffset + writtenResults : 0;
+	const range = writtenResults > 0 ? ` (showing ${startIndex}-${endIndex})` : "";
+	const lines = [`Found ${totalResults} results. Dumped ${writtenResults} results${range} to ${outputPath} in ${formatDuration(elapsed)}`];
+	if (prepared.warnings.length > 0) {
+		lines.push("");
+		for (const warning of prepared.warnings) lines.push(`Warning: ${warning}`);
+	}
+	lines.push("", "Format: JSONL, one result per line");
+
+	return {
+		summary: lines.join("\n"),
+		details: {
+			...buildBaseDetails(prepared, initialOffset),
+			dump_to_file: true,
+			output_path: outputPath,
+			output_format: "jsonl",
+			count: limit,
+			totalResults,
+			writtenResults,
+			elapsedMs: Math.round(elapsed),
+		},
+	};
+}
+
+async function searchEverything(params: EverythingSearchInput, signal: AbortSignal): Promise<{ summary: string; details: Record<string, unknown> }> {
+	const prepared = normalizeSearchInput(params);
+	await assertEverythingQueryAllowed(prepared);
+	if (params.dump_to_file) return dumpEverythingResults(params, prepared, signal);
+
+	const count = normalizeContextCount(params.count);
+	const offset = normalizeOffset(params.offset);
+	const page = await fetchEverythingPage(params, prepared, count, offset, signal);
+	const totalResults = page.totalResults;
+	const results = page.results;
 	const end = totalResults > 0 ? Math.min(offset + count, totalResults) : 0;
 
-	const lines = [`Found ${totalResults} results (showing ${totalResults > 0 ? offset + 1 : 0}-${end}) in ${formatDuration(elapsed)}`];
+	const lines = [`Found ${totalResults} results (showing ${totalResults > 0 ? offset + 1 : 0}-${end}) in ${formatDuration(page.elapsedMs)}`];
 	if (prepared.warnings.length > 0) {
 		lines.push("");
 		for (const warning of prepared.warnings) lines.push(`Warning: ${warning}`);
@@ -422,17 +591,11 @@ async function searchEverything(params: EverythingSearchInput, signal: AbortSign
 	return {
 		summary: lines.join("\n"),
 		details: {
-			query: prepared.query,
-			originalQuery: prepared.originalQuery,
-			scope_path: prepared.scopePath,
-			children_only: prepared.childrenOnly,
-			search_full_path: prepared.searchFullPath,
-			warnings: prepared.warnings,
+			...buildBaseDetails(prepared, offset),
+			dump_to_file: false,
 			count,
-			offset,
 			totalResults,
-			elapsedMs: Math.round(elapsed),
-			endpoint: `http://${EVERYTHING_HOST}:${EVERYTHING_PORT}/`,
+			elapsedMs: Math.round(page.elapsedMs),
 			results: results.map((item) => ({
 				path: item.path,
 				name: item.name,
@@ -461,6 +624,7 @@ export default async function (pi: ExtensionAPI) {
 			"Use `ext:` to filter by extension; for example `ext:py`, `ext:ts;tsx`, or `ext:jpg;png`.",
 			"Use `file:` or `folder:` to limit results to files only or folders only. Useful with filters such as `dm:today` or `size:>1mb`.",
 			"Common `everything_search` filters: `dm:` for modified date, `dc:` for created date, `size:` for file size, `regex:` to enable regex, and `wholeword:` or `case:` when needed.",
+			"Use `dump_to_file` to write matching results to a temp JSONL file instead of returning result lines in context; with dump_to_file, `count` limits how many results are written and `offset` chooses where to start.",
 			"Use the tool options `count`, `offset`, `sort` (`name`, `path`, `size`, `date_modified`, `date_created`), and `ascending` to control result volume and ordering.",
 		],
 		renderCall(args, theme, context) {
