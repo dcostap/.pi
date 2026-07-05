@@ -1,7 +1,5 @@
 import { complete } from "@earendil-works/pi-ai";
-
-const SUMMARY_PROVIDER = "openai-codex";
-const SUMMARY_MODEL = "gpt-5.3-codex-spark";
+import { FAST_CHEAP_ROLE, notifyModelRoleProblem, resolveModelRole } from "../../_shared/model-roles";
 
 type SparkProcessedContent = {
 	quality: "OK" | "WEAK";
@@ -54,6 +52,8 @@ function manualFallback(manualWeakReasons: string[]): SparkProcessedContent {
 	};
 }
 
+let warnedFastCheapProcessingFailure = false;
+
 function normalizeModelText(value: unknown): string | undefined {
 	if (value == null) return undefined;
 	if (typeof value === "string") {
@@ -80,11 +80,12 @@ export async function processExtractedContentWithSpark(
 	if (!text?.trim()) return { quality: "WEAK", reason: "No extracted content." };
 
 	try {
-		const model = ctx.modelRegistry.find(SUMMARY_PROVIDER, SUMMARY_MODEL);
-		if (!model) return manualFallback(manualWeakReasons);
-
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth?.ok || !auth.apiKey) return manualFallback(manualWeakReasons);
+		const fastModel = await resolveModelRole(ctx, FAST_CHEAP_ROLE);
+		if (!fastModel.ok) {
+			notifyModelRoleProblem(ctx, fastModel, { onceKey: "web-smart-fetch" });
+			return manualFallback(manualWeakReasons);
+		}
+		const { model, auth } = fastModel;
 
 		const schema = focus
 			? `{
@@ -140,7 +141,8 @@ export async function processExtractedContentWithSpark(
 			{
 				apiKey: auth.apiKey,
 				headers: auth.headers,
-				reasoningEffort: "minimal",
+				reasoningEffort: fastModel.config.reasoningEffort ?? "minimal",
+				maxTokens: fastModel.config.maxTokens,
 				signal,
 			},
 		);
@@ -159,9 +161,17 @@ export async function processExtractedContentWithSpark(
 			reason: normalizeModelText(parsed?.reason) || "",
 			promptAnswer: focus && quality === "OK" ? normalizeModelText(parsed?.promptAnswer) : undefined,
 			tldr: quality === "OK" ? normalizeModelText(parsed?.tldr) : undefined,
-			model: `${SUMMARY_PROVIDER}/${SUMMARY_MODEL}`,
+			model: fastModel.label,
 		};
-	} catch {
+	} catch (error) {
+		if (!warnedFastCheapProcessingFailure) {
+			warnedFastCheapProcessingFailure = true;
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui?.notify?.(
+				`FAST CHEAP MODEL PROBLEM: WEB-SMART-FETCH FAST CHEAP PROCESSING FAILED; CONTINUING WITH MANUAL FALLBACK: ${message.toUpperCase()}`,
+				"error",
+			);
+		}
 		return manualFallback(manualWeakReasons);
 	}
 }

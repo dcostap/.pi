@@ -14,7 +14,7 @@ Pi extension for:
   - Jina Reader first
   - Firecrawl if configured
 - oversized results auto-summarize with:
-  - `openai-codex/gpt-5.3-codex-spark`
+  - the configured `fastCheap` model role (`/fast-model status`, `/fast-model set provider/model`)
 - if `fetch_url` gets a `prompt`, it answers from extracted content; weak extraction escalates to Firecrawl when configured
 - full artifacts always saved locally
 

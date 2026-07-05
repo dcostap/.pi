@@ -1,0 +1,10 @@
+{
+  "roles": {
+    "fastCheap": {
+      "provider": "openai-codex",
+      "model": "gpt-5.3-codex-spark",
+      "reasoningEffort": "minimal",
+      "maxTokens": 2048
+    }
+  }
+}

@@ -1,17 +1,16 @@
 /**
  * /name_auto extension
  *
- * Uses the hardcoded Codex Spark model to suggest a short session/thread name,
+ * Uses the configured fast cheap model to suggest a short session/thread name,
  * then replaces the editor with `/name <suggestion>` so the user can press Enter.
  */
 
 import { complete, type Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { FAST_CHEAP_ROLE, resolveModelRole } from "./_shared/model-roles";
 
 const COMMAND = "name_auto";
-const SPARK_PROVIDER = "openai-codex";
-const SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 const STATUS_KEY = "name-auto";
 
 const OUTPUT_MAX_TOKENS = 40;
@@ -59,7 +58,7 @@ function clampConversationDump(text: string, maxTokens: number): { text: string;
 	}
 
 	const maxChars = Math.max(0, maxTokens * 4);
-	const marker = "\n\n[... middle of conversation omitted to fit Codex Spark context window ...]\n\n";
+	const marker = "\n\n[... middle of conversation omitted to fit the fast cheap model context window ...]\n\n";
 	if (maxChars <= marker.length + 200) {
 		const tail = normalized.slice(Math.max(0, normalized.length - maxChars));
 		return { text: cleanText(tail), tokens: estimateTokens(tail), truncated: true };
@@ -164,7 +163,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 	let pending = false;
 
 	pi.registerCommand(COMMAND, {
-		description: "Ask Codex Spark for a short thread name and prefill `/name <name>`",
+		description: "Ask the configured fast cheap model for a short thread name and prefill `/name <name>`",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 
@@ -182,14 +181,11 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", "naming…"));
 
 			try {
-				const model = ctx.modelRegistry.find(SPARK_PROVIDER, SPARK_MODEL_ID);
-				if (!model) {
-					throw new Error(`Model not found: ${SPARK_PROVIDER}/${SPARK_MODEL_ID}`);
+				const fastModel = await resolveModelRole(ctx, FAST_CHEAP_ROLE);
+				if (!fastModel.ok) {
+					throw new Error(fastModel.loudMessage);
 				}
-
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-				if (!auth.ok) throw new Error(auth.error);
-				if (!auth.apiKey) throw new Error(`No API key for ${SPARK_PROVIDER}/${SPARK_MODEL_ID}`);
+				const { model, auth } = fastModel;
 
 				const fullDump = buildConversationDump(ctx.sessionManager.getBranch());
 				if (!fullDump.trim()) {
@@ -211,7 +207,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 					const loader = new BorderedLoader(
 						tui,
 						theme,
-						`Asking Codex Spark for a name (${clamped.tokens.toLocaleString()} tok${clamped.truncated ? ", clamped" : ""})...`,
+						`Asking fast cheap model (${fastModel.label}) for a name (${clamped.tokens.toLocaleString()} tok${clamped.truncated ? ", clamped" : ""})...`,
 					);
 					loader.onAbort = () => done(null);
 
@@ -231,7 +227,8 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 							{
 								apiKey: auth.apiKey,
 								headers: auth.headers,
-								maxTokens: OUTPUT_MAX_TOKENS,
+								maxTokens: Math.min(fastModel.config.maxTokens ?? OUTPUT_MAX_TOKENS, OUTPUT_MAX_TOKENS),
+								reasoningEffort: fastModel.config.reasoningEffort ?? "minimal",
 								signal: loader.signal,
 								sessionId: ctx.sessionManager.getSessionId(),
 							},
@@ -239,7 +236,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 
 						if (response.stopReason === "aborted") return null;
 						if (response.stopReason === "error") {
-							throw new Error(response.errorMessage || "Codex Spark request failed");
+							throw new Error(response.errorMessage || "Fast cheap model request failed");
 						}
 
 						return { text: responseText(response) };
@@ -263,14 +260,14 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 
 				const name = sanitizeName(result.text);
 				if (!name) {
-					throw new Error("Codex Spark returned an empty name");
+					throw new Error("Fast cheap model returned an empty name");
 				}
 
 				ctx.ui.setEditorText(`/name ${name}`);
 				ctx.ui.notify("Name suggestion loaded. Press Enter to apply or edit it first.", "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`/name_auto failed: ${message}`, "error");
+				ctx.ui.notify(message.includes("MODEL PROBLEM") ? message : `/name_auto failed: ${message}`, "error");
 			} finally {
 				pending = false;
 				ctx.ui.setStatus(STATUS_KEY, undefined);

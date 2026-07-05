@@ -2,14 +2,13 @@ import { stream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { FAST_CHEAP_ROLE, resolveModelRole } from "./_shared/model-roles";
 
 const TLDR_COMMAND = "tldr";
 const TLDR_MESSAGE_TYPE = "spark-tldr";
 const TLDR_STATUS_KEY = "spark-tldr";
-const TLDR_PROVIDER = "openai-codex";
-const TLDR_MODEL_ID = "gpt-5.3-codex-spark";
 const TLDR_SESSION_SUFFIX = "spark-tldr";
-const MAX_DUMPED_TOKENS = 60_000; // hard cap for what /tldr ever dumps into Spark
+const MAX_DUMPED_TOKENS = 60_000; // hard cap for what /tldr ever sends to the fast cheap model
 const PROMPT_SAFETY_MARGIN_TOKENS = 4_000;
 const MAX_LAST_ASSISTANT_TOKENS = 12_000;
 const MAX_COMPACTION_SUMMARY_TOKENS = 8_000;
@@ -420,18 +419,11 @@ async function runTldr(
 	lastAssistant: AssistantSnapshot,
 	progress?: ProgressState,
 ): Promise<{ answer: string; modelLabel: string; historyTokens: number }> {
-	const model = ctx.modelRegistry.find(TLDR_PROVIDER, TLDR_MODEL_ID);
-	if (!model) {
-		throw new Error(`Model not found: ${TLDR_PROVIDER}/${TLDR_MODEL_ID}`);
+	const fastModel = await resolveModelRole(ctx, FAST_CHEAP_ROLE);
+	if (!fastModel.ok) {
+		throw new Error(fastModel.loudMessage);
 	}
-
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok) {
-		throw new Error(auth.error);
-	}
-	if (!auth.apiKey) {
-		throw new Error(`No API key for ${TLDR_PROVIDER}/${TLDR_MODEL_ID}`);
-	}
+	const { model, auth } = fastModel;
 
 	const safePromptBudget = Math.max(
 		8_000,
@@ -470,7 +462,8 @@ async function runTldr(
 		{
 			apiKey: auth.apiKey,
 			headers: auth.headers,
-			maxTokens: MAX_OUTPUT_TOKENS,
+			maxTokens: Math.min(fastModel.config.maxTokens ?? MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS),
+			reasoningEffort: fastModel.config.reasoningEffort ?? "minimal",
 			// Keep TL;DR provider-side/websocket continuation state separate from the
 			// main chat. Reusing the main session id can poison Codex's cached
 			// previous_response_id and make the user's next message fail.
@@ -500,13 +493,13 @@ async function runTldr(
 		}
 
 		if (event.type === "error") {
-			throw new Error(event.error.errorMessage || "Spark request failed");
+			throw new Error(event.error.errorMessage || "Fast cheap model request failed");
 		}
 	}
 
 	answer = cleanText(answer);
 	if (!answer) {
-		throw new Error("Spark returned no text");
+		throw new Error("Fast cheap model returned no text");
 	}
 
 	return {
@@ -554,7 +547,7 @@ export default function sparkTldrExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand(TLDR_COMMAND, {
-		description: "Ask GPT-5.3 Codex Spark for a compact TL;DR or follow-up explanation of recent chat",
+		description: "Ask the configured fast cheap model for a compact TL;DR or follow-up explanation of recent chat",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 
@@ -601,7 +594,7 @@ export default function sparkTldrExtension(pi: ExtensionAPI) {
 				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`TL;DR failed: ${message}`, "error");
+				ctx.ui.notify(message.includes("MODEL PROBLEM") ? message : `TL;DR failed: ${message}`, "error");
 			} finally {
 				if (progressTimer) {
 					clearInterval(progressTimer);

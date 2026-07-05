@@ -10,6 +10,8 @@
 
 # Hand-picked core config
 !agent/keybindings.json
+!agent/model-roles.example.json
+agent/model-roles.local.json
 
 # Pi customizations
 !agent/extensions/
