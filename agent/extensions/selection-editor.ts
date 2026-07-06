@@ -96,19 +96,9 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	private normalizePastedFileContent(text: string): string {
-		const normalized: string[] = [];
-		for (let i = 0; i < text.length; i++) {
-			const char = text[i]!;
-			if (char === "\r") {
-				if (text[i + 1] === "\n") i++;
-				normalized.push("\n");
-				continue;
-			}
-			if (char === "\n" || char === "\t" || char.charCodeAt(0) >= 32) {
-				normalized.push(char);
-			}
-		}
-		return normalized.join("");
+		// Fast path for huge pastes: avoid per-character array push + join,
+		// which dominates the paste-to-file cost for multi-MB clipboard data.
+		return text.replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 	}
 
 	private shouldDumpPasteToFile(pastedText: string): boolean {
