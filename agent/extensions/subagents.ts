@@ -597,7 +597,7 @@ function buildToolPartial(states: RuntimeState[]) {
 		const name = fitColumn(state.sessionName, 56);
 		const context = fitColumn(formatContextUsage(state), 14);
 		const attempt = state.maxAttempts > 1 && state.attempt > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
-		const model = `model=${state.modelRef ?? "(unknown)"}${attempt}`;
+		const model = `model=${state.modelRef ?? "(unknown)"} [${state.thinking ?? "(unknown)"}]${attempt}`;
 		const activity = state.error ?? state.lastActivity;
 		return `${status} ${usage} ${context} ${model} ${name} ${activity}`;
 	});
