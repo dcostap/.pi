@@ -68,6 +68,7 @@ type UsageStats = {
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
+	turns: number;
 	latestCacheHitRate?: number;
 };
 
@@ -132,6 +133,30 @@ function formatTokens(count: number): string {
 	if (count < 1000) return String(Math.round(count));
 	const thousands = count / 1000;
 	return thousands < 10 ? `${Number(thousands.toFixed(1))}k` : `${Math.round(thousands)}k`;
+}
+
+function formatExactTokens(count: number): string {
+	return Math.round(count).toLocaleString("en-US");
+}
+
+function totalTokens(usage: UsageStats): number {
+	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function formatCost(cost: number): string {
+	if (cost === 0) return "$0.000000";
+	return `$${cost.toFixed(cost < 0.01 ? 6 : 4)}`;
+}
+
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, ms) / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+	const minutes = Math.floor(seconds / 60);
+	return `${minutes}m ${(seconds % 60).toFixed(0)}s`;
+}
+
+function countLabel(count: number, singular: string): string {
+	return `${count} ${singular}${count === 1 ? "" : "s"}`;
 }
 
 function formatUsage(usage: UsageStats): string {
@@ -487,7 +512,7 @@ function buildMainSystemPromptAddition(): string {
 		"- When calling the review tool, specify only what code to review and optional neutral focus areas. Do not paste review instructions, formatting requirements, expected verdicts, or suspected findings into the review target.",
 		"- Avoid biasing review subagents. Do not tell them what bugs you expect unless the user explicitly asked to verify a specific concern; if so, label it as user-provided focus.",
 		"- Each review subagent is a brand-new session named `[Review Subagent] <description>`. Choose short, distinctive descriptions; if repeating a similar review, add your own suffix like `#2`.",
-		"- The tool returns only each review subagent's final answer to your context. Synthesize those answers for the user, deduplicate findings, and call out disagreements or uncertainty.",
+		"- The tool returns a final per-subagent stats summary followed by each review subagent's final answer. Synthesize the answers for the user, deduplicate findings, and call out disagreements or uncertainty.",
 		"- By default review subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-reviewer `model` and/or `thinking`.",
 		"- Model overrides may be loose names, but you should resolve ambiguity before launching when possible. If a name could refer to multiple providers/models, ask the user which provider/model they mean instead of guessing. You can inspect models with `pi --list-models <query>` if needed.",
 		"",
@@ -498,7 +523,7 @@ function buildMainSystemPromptAddition(): string {
 		"- Do not use generic subagents for code review tasks; use the review subagent tool for code reviews.",
 		`- You may launch at most ${MAX_SUBAGENTS} generic subagents in one tool call.`,
 		"- Each generic subagent is a brand-new session named `[Generic Subagent] <description>`. Choose short, distinctive descriptions.",
-		"- The generic tool returns only each subagent's final answer to your context. Synthesize results for the user, deduplicate, and call out disagreements or uncertainty.",
+		"- The generic tool returns a final per-subagent stats summary followed by each subagent's final answer. Synthesize results for the user, deduplicate, and call out disagreements or uncertainty.",
 		"- By default generic subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-subagent `model` and/or `thinking`.",
 		"- Generic subagent model overrides follow the same ambiguity rules as review subagents: ask the user to clarify rather than guessing among multiple possible model matches.",
 	].join("\n");
@@ -538,6 +563,7 @@ function updateUsageFromMessage(state: RuntimeState, message: any): void {
 	state.usage.cacheRead += cacheRead;
 	state.usage.cacheWrite += cacheWrite;
 	state.usage.cost += Number(usage.cost?.total || 0);
+	state.usage.turns++;
 	const latestPromptTokens = input + cacheRead + cacheWrite;
 	state.usage.latestCacheHitRate = latestPromptTokens > 0 ? (cacheRead / latestPromptTokens) * 100 : undefined;
 
@@ -1069,26 +1095,95 @@ async function runSubagentWithRetries(task: ResolvedTask, ctx: ExtensionContext,
 	return lastResult ?? { state, exitCode: null };
 }
 
-function buildFinalToolResult(results: ChildResult[]) {
-	const sections = results.map(({ state }) => {
-		const title = `## ${state.sessionName}`;
-		const modelLine = `Model: ${state.modelRef ?? "(unknown)"}`;
-		const retryNote = state.previousErrors.length > 0 ? `\n\nRetried after transient failure:\n${state.previousErrors.map((error) => `- ${oneLine(error, 180)}`).join("\n")}` : "";
-		if (state.status === "error" || state.status === "aborted") {
-			const body = state.finalAnswer || state.error || "Subagent failed without a final answer.";
-			return `${title}\n\n${modelLine}${retryNote}\n\n[${state.status}]\n${body}`;
+function sumUsage(states: RuntimeState[]): UsageStats {
+	return states.reduce<UsageStats>((total, state) => ({
+		input: total.input + state.usage.input,
+		output: total.output + state.usage.output,
+		cacheRead: total.cacheRead + state.usage.cacheRead,
+		cacheWrite: total.cacheWrite + state.usage.cacheWrite,
+		cost: total.cost + state.usage.cost,
+		turns: total.turns + state.usage.turns,
+	}), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+}
+
+function buildFinalStats(states: RuntimeState[]): { text: string; summary: Record<string, unknown> } {
+	const usage = sumUsage(states);
+	const statusCounts = states.reduce<Record<string, number>>((counts, state) => {
+		counts[state.status] = (counts[state.status] ?? 0) + 1;
+		return counts;
+	}, {});
+	const attempts = states.reduce((total, state) => total + state.attempt, 0);
+	const earliestStart = states.length > 0 ? Math.min(...states.map((state) => state.startedAt)) : 0;
+	const latestFinish = states.length > 0 ? Math.max(...states.map((state) => state.updatedAt)) : earliestStart;
+	const wallDurationMs = Math.max(0, latestFinish - earliestStart);
+	const combinedAgentDurationMs = states.reduce((total, state) => total + Math.max(0, state.updatedAt - state.startedAt), 0);
+	const statusText = Object.entries(statusCounts).map(([status, count]) => `${count} ${status}`).join(", ") || "none";
+
+	const overall = [
+		"# Final Subagent Stats",
+		"",
+		"## Overall",
+		`- **Subagents:** ${states.length} (${statusText})`,
+		`- **Attempts / model turns:** ${countLabel(attempts, "attempt")} · ${countLabel(usage.turns, "turn")}`,
+		`- **Time:** ${formatDuration(wallDurationMs)} wall · ${formatDuration(combinedAgentDurationMs)} combined agent time`,
+		`- **Tokens:** ${formatExactTokens(totalTokens(usage))} total (input ${formatExactTokens(usage.input)} · output ${formatExactTokens(usage.output)} · cache read ${formatExactTokens(usage.cacheRead)} · cache write ${formatExactTokens(usage.cacheWrite)})`,
+		`- **Total cost:** ${formatCost(usage.cost)}`,
+		"",
+		"## Per Subagent",
+	];
+
+	const perSubagent = states.flatMap((state, index) => {
+		const context = formatContextUsage(state) || "unknown";
+		const cacheHit = state.usage.latestCacheHitRate === undefined ? "unknown" : `${state.usage.latestCacheHitRate.toFixed(1)}%`;
+		const lines = [
+			`### ${index + 1}. ${state.sessionName}`,
+			`- **Status:** ${state.status}${state.error ? ` — ${oneLine(state.error, 180)}` : ""}`,
+			`- **Model:** ${state.modelRef ?? "unknown"} · thinking ${state.thinking ?? "unknown"}`,
+			`- **Attempts / model turns:** ${countLabel(state.attempt, "attempt")} · ${countLabel(state.usage.turns, "turn")} · **duration:** ${formatDuration(state.updatedAt - state.startedAt)}`,
+			`- **Tokens:** ${formatExactTokens(totalTokens(state.usage))} total (input ${formatExactTokens(state.usage.input)} · output ${formatExactTokens(state.usage.output)} · cache read ${formatExactTokens(state.usage.cacheRead)} · cache write ${formatExactTokens(state.usage.cacheWrite)})`,
+			`- **Cost:** ${formatCost(state.usage.cost)} · **latest cache hit:** ${cacheHit} · **final context:** ${context}`,
+			`- **Session:** ${state.sessionFile ?? "unavailable"}`,
+		];
+		if (state.previousErrors.length > 0) {
+			lines.push("- **Retry history:**", ...state.previousErrors.map((error) => `  - ${oneLine(error, 180)}`));
 		}
-		return `${title}\n\n${modelLine}${retryNote}\n\n${state.finalAnswer || "(Subagent finished without a final answer.)"}`;
+		return [...lines, ""];
+	});
+
+	return {
+		text: [...overall, ...perSubagent].join("\n").trim(),
+		summary: {
+			count: states.length,
+			statusCounts,
+			attempts,
+			wallDurationMs,
+			combinedAgentDurationMs,
+			usage: { ...usage, totalTokens: totalTokens(usage) },
+		},
+	};
+}
+
+function buildFinalToolResult(results: ChildResult[]) {
+	const states = results.map((result) => result.state);
+	const stats = buildFinalStats(states);
+	const answers = results.map(({ state }, index) => {
+		const title = `## Answer ${index + 1} — ${state.sessionName}`;
+		const metadata = `> **${state.status}** · ${state.modelRef ?? "unknown"} · thinking ${state.thinking ?? "unknown"}`;
+		const body = state.finalAnswer || state.error || (state.status === "done" ? "(Subagent finished without a final answer.)" : "Subagent failed without a final answer.");
+		return `---\n\n${title}\n\n${metadata}\n\n${body}`;
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
-	const header = buildSubagentPromptHeader(results.map((result) => result.state));
+	const header = buildSubagentPromptHeader(states);
+	const assignmentContext = header ? `# Assignment Context\n\n${header}` : "";
 	const priorityLegend = results[0]?.state.kind === "review"
 		? "Priority legend: [P0] critical/blocking, [P1] high/should fix before merge/use, [P2] medium/actionable, [P3] low/minor or test gap."
 		: "";
+	const answersSection = ["# Subagent Answers", priorityLegend, ...answers].filter(Boolean).join("\n\n");
 	return {
-		content: [{ type: "text" as const, text: [header, priorityLegend, ...sections, FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
+		content: [{ type: "text" as const, text: [stats.text, assignmentContext, answersSection, "---", FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
 		details: {
 			failures,
+			summary: stats.summary,
 			results: results.map((result) => ({
 				kind: result.state.kind,
 				description: result.state.description,
@@ -1103,7 +1198,8 @@ function buildFinalToolResult(results: ChildResult[]) {
 				modelRef: result.state.modelRef,
 				thinking: result.state.thinking,
 				error: result.state.error,
-				usage: result.state.usage,
+				usage: { ...result.state.usage, totalTokens: totalTokens(result.state.usage) },
+				durationMs: Math.max(0, result.state.updatedAt - result.state.startedAt),
 				contextWindow: result.state.contextWindow,
 				contextTokens: result.state.contextTokens,
 				contextPercent: result.state.contextPercent,
@@ -1162,7 +1258,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 				attempt: 1,
 				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
 				previousErrors: [],
@@ -1247,7 +1343,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 				attempt: 1,
 				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
 				previousErrors: [],
