@@ -13,6 +13,10 @@
 !agent/model-roles.example.json
 agent/model-roles.local.json
 
+# Shared PowerShell helpers
+!powershell/
+!powershell/**
+
 # Pi customizations
 !agent/extensions/
 !agent/extensions/**
