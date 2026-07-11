@@ -1,5 +1,3 @@
-import { Readability } from "@mozilla/readability";
-import { JSDOM, VirtualConsole } from "jsdom";
 import pdf from "pdf-parse";
 import TurndownService from "turndown";
 import { execFile } from "node:child_process";
@@ -7,21 +5,46 @@ import { readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionConfig } from "./config.ts";
+import { getFirecrawlClient, scrapeWithFirecrawl } from "./firecrawl.ts";
+import { handleGitHubUrl, parseGitHubUrl } from "./github.ts";
 import { processExtractedContentWithSpark } from "./summarize.ts";
 import { makeArtifactDir, saveBuffer, saveText, safeName, stripMarkdown } from "./utils.ts";
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const execFileAsync = promisify(execFile);
 
-function createQuietDom(html: string, url: string): JSDOM {
-	// jsdom forwards parse/runtime diagnostics to the real console by default.
-	// Some sites (notably Reddit) include CSS that jsdom cannot parse, and the
-	// resulting jsdomError prints an enormous raw stylesheet into pi's terminal.
-	// Use a private virtual console so extraction failures stay in tool metadata
-	// instead of leaking noisy page internals into the TUI.
-	const virtualConsole = new VirtualConsole();
-	virtualConsole.on("jsdomError", () => undefined);
-	return new JSDOM(html, { url, virtualConsole });
+function decodeHtmlEntities(text: string): string {
+	const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+	return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (match, entity: string) => {
+		if (entity[0] !== "#") return named[entity.toLowerCase()] ?? match;
+		const hex = entity[1]?.toLowerCase() === "x";
+		const value = Number.parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+		return Number.isFinite(value) ? String.fromCodePoint(value) : match;
+	});
+}
+
+function extractHtmlContent(html: string): { title?: string; content: string; usedReadability: false } {
+	const titleHtml = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+	const title = decodeHtmlEntities(titleHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()) || undefined;
+	const cleaned = html
+		.replace(/<!--([\s\S]*?)-->/g, "")
+		.replace(/<(script|style|noscript|svg|template)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+		.replace(/<(nav|footer)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
+	let markdown = "";
+	try {
+		markdown = turndown.turndown(cleaned).trim();
+	} catch {
+		// Fall through to a conservative tag-stripping extraction.
+	}
+	const plainText = decodeHtmlEntities(
+		cleaned
+			.replace(/<(br|\/p|\/div|\/li|\/h[1-6]|\/tr)>/gi, "\n")
+			.replace(/<[^>]+>/g, " ")
+			.replace(/[ \t]+/g, " ")
+			.replace(/\n\s*\n+/g, "\n")
+			.trim(),
+	);
+	return { title, content: markdown || plainText, usedReadability: false };
 }
 
 type FetchResult = {
@@ -70,56 +93,6 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 	}
 }
 
-type GitHubModule = {
-	parseGitHubUrl: (url: string) => unknown;
-	handleGitHubUrl: (config: ExtensionConfig, url: string, onProgress?: (message: string) => void, signal?: AbortSignal) => Promise<any>;
-};
-
-type FirecrawlModule = {
-	getFirecrawlClient: (config: ExtensionConfig) => Promise<unknown>;
-	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
-};
-
-let githubModulePromise: Promise<GitHubModule> | undefined;
-let firecrawlModulePromise: Promise<FirecrawlModule> | undefined;
-
-async function importGitHubModule(): Promise<GitHubModule> {
-	const mod: any = await import("./github.ts");
-	const githubExports = mod?.parseGitHubUrl ? mod : mod?.default;
-	const parseGitHubUrl = githubExports?.parseGitHubUrl;
-	const handleGitHubUrl = githubExports?.handleGitHubUrl;
-	if (typeof parseGitHubUrl !== "function" || typeof handleGitHubUrl !== "function") {
-		throw new Error("GitHub fetch support failed to load: missing parseGitHubUrl/handleGitHubUrl exports");
-	}
-	return { parseGitHubUrl, handleGitHubUrl };
-}
-
-function loadGitHubModule(): Promise<GitHubModule> {
-	githubModulePromise ??= importGitHubModule().catch((error) => {
-		githubModulePromise = undefined;
-		throw error;
-	});
-	return githubModulePromise;
-}
-
-async function importFirecrawlModule(): Promise<FirecrawlModule> {
-	const mod: any = await import("./firecrawl.ts");
-	const firecrawlExports = mod?.getFirecrawlClient ? mod : mod?.default?.getFirecrawlClient ? mod.default : undefined;
-	const getFirecrawlClient = firecrawlExports?.getFirecrawlClient;
-	const scrapeWithFirecrawl = firecrawlExports?.scrapeWithFirecrawl;
-	if (typeof getFirecrawlClient !== "function" || typeof scrapeWithFirecrawl !== "function") {
-		throw new Error("Firecrawl support failed to load: missing getFirecrawlClient/scrapeWithFirecrawl exports");
-	}
-	return { getFirecrawlClient, scrapeWithFirecrawl };
-}
-
-function loadFirecrawlModule(): Promise<FirecrawlModule> {
-	firecrawlModulePromise ??= importFirecrawlModule().catch((error) => {
-		firecrawlModulePromise = undefined;
-		throw error;
-	});
-	return firecrawlModulePromise;
-}
 
 function isProbablyPdf(contentType: string, url: string): boolean {
 	return contentType.includes("application/pdf") || /\.pdf([?#].*)?$/i.test(url);
@@ -338,14 +311,10 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 		}
 		const html = curl.body.toString("utf8");
 		files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
-		const dom = createQuietDom(html, curl.finalUrl);
-		const reader = new Readability(dom.window.document);
-		const article = reader.parse();
-		const readabilityHtml = article?.content || "";
-		const markdown = readabilityHtml ? turndown.turndown(readabilityHtml) : "";
-		const title = article?.title || dom.window.document.title || undefined;
+		const extracted = extractHtmlContent(html);
+		const title = extracted.title;
 		const nextData = extractNextData(html);
-		const content = markdown.trim() || stripMarkdown(dom.window.document.body?.textContent || "") || nextData || "";
+		const content = extracted.content || nextData || "";
 		files.markdown = saveText(join(artifactDir, "content.md"), content);
 		if (nextData) files.nextData = saveText(join(artifactDir, "next-data.json"), nextData);
 		return {
@@ -362,7 +331,7 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 				contentKind: "html",
 				transport: "curl",
 				weakReasons: assessWeakness(content, html),
-				usedReadability: Boolean(readabilityHtml),
+				usedReadability: extracted.usedReadability,
 			},
 		};
 	}
@@ -404,14 +373,10 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 
 	const html = await res.text();
 	files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
-	const dom = createQuietDom(html, finalUrl);
-	const reader = new Readability(dom.window.document);
-	const article = reader.parse();
-	const readabilityHtml = article?.content || "";
-	const markdown = readabilityHtml ? turndown.turndown(readabilityHtml) : "";
-	const title = article?.title || dom.window.document.title || undefined;
+	const extracted = extractHtmlContent(html);
+	const title = extracted.title;
 	const nextData = extractNextData(html);
-	const content = markdown.trim() || stripMarkdown(dom.window.document.body?.textContent || "") || nextData || "";
+	const content = extracted.content || nextData || "";
 	files.markdown = saveText(join(artifactDir, "content.md"), content);
 	if (nextData) files.nextData = saveText(join(artifactDir, "next-data.json"), nextData);
 
@@ -428,7 +393,7 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 			headers: responseHeaders,
 			contentKind: "html",
 			weakReasons: assessWeakness(content, html),
-			usedReadability: Boolean(readabilityHtml),
+			usedReadability: extracted.usedReadability,
 		},
 	};
 }
@@ -459,11 +424,10 @@ export async function fetchUrl(
 	onUpdate?: (update: any) => void,
 	signal?: AbortSignal,
 ): Promise<{ text: string; details: Record<string, unknown> }> {
-	const githubModule = await loadGitHubModule();
-	const github = githubModule.parseGitHubUrl(url);
+	const github = parseGitHubUrl(url);
 	if (github) {
 		onUpdate?.({ content: [{ type: "text", text: "Handling GitHub URL..." }] });
-		const gh = await githubModule.handleGitHubUrl(
+		const gh = await handleGitHubUrl(
 			config,
 			url,
 			(message: string) => onUpdate?.({ content: [{ type: "text", text: message }] }),
@@ -485,8 +449,7 @@ export async function fetchUrl(
 		};
 	}
 
-	const firecrawl = config.firecrawlApiKey ? await loadFirecrawlModule() : undefined;
-	const client = firecrawl ? await firecrawl.getFirecrawlClient(config) : undefined;
+	const client = config.firecrawlApiKey ? await getFirecrawlClient(config) : undefined;
 
 	let result: FetchResult;
 	try {
@@ -583,10 +546,10 @@ export async function fetchUrl(
 	}
 
 	if (processed.quality === "WEAK") {
-		if (client && firecrawl) {
+		if (client) {
 			onUpdate?.({ content: [{ type: "text", text: `Escalating to Firecrawl... (timeout ${NETWORK_STEP_TIMEOUT_MS / 1000}s)` }] });
 			const scraped: any = await withTimeout(
-				firecrawl.scrapeWithFirecrawl(client, result.url),
+				scrapeWithFirecrawl(client, result.url),
 				NETWORK_STEP_TIMEOUT_MS,
 				"Firecrawl scrape",
 			);
@@ -637,6 +600,7 @@ export async function fetchUrl(
 			quality: result.quality,
 			qualityReason: result.qualityReason,
 			status: result.meta?.status,
+			localFetchError: result.meta?.localFetchError,
 			contentType: result.meta?.contentType,
 			headers: result.meta?.headers,
 			artifactDir: result.artifactDir,

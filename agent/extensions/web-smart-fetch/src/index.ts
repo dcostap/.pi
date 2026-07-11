@@ -2,9 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { hyperlink, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
-// Heavy implementation modules are intentionally lazy-loaded inside execute().
-// This keeps pi startup fast: fetch-url pulls in jsdom/pdf-parse/turndown/pi-ai,
-// and firecrawl pulls in @mendable/firecrawl-js. Tool registration only needs schemas/renderers.
+import { fetchUrl } from "./fetch-url.ts";
+import { crawlWithFirecrawl, getFirecrawlClient, searchWithFirecrawl } from "./firecrawl.ts";
 import { join } from "node:path";
 import { makeArtifactDir, preview, saveJson, saveText, truncate } from "./utils.ts";
 
@@ -47,58 +46,6 @@ function textOutput(result: any): string {
 		.join("\n");
 }
 
-type FirecrawlModule = {
-	getFirecrawlClient: (config: ReturnType<typeof loadConfig>) => Promise<unknown>;
-	scrapeWithFirecrawl: (client: unknown, url: string) => Promise<unknown>;
-	searchWithFirecrawl: (client: unknown, query: string, limit?: number) => Promise<unknown>;
-	crawlWithFirecrawl: (client: unknown, url: string, limit?: number) => Promise<unknown>;
-};
-
-type FetchUrlModule = {
-	fetchUrl: (
-		url: string,
-		config: ReturnType<typeof loadConfig>,
-		ctx: any,
-		prompt?: string,
-		onUpdate?: (update: any) => void,
-		signal?: AbortSignal,
-	) => Promise<{ text: string; details: Record<string, unknown> }>;
-};
-
-let fetchUrlModulePromise: Promise<FetchUrlModule> | undefined;
-let firecrawlModulePromise: Promise<FirecrawlModule> | undefined;
-
-function loadFetchUrlModule(): Promise<FetchUrlModule> {
-	// jiti can corrupt bindings when the same lazy TypeScript module is imported
-	// concurrently by parallel tool calls. Share the first in-flight import.
-	fetchUrlModulePromise ??= (import("./fetch-url.ts") as Promise<FetchUrlModule>).catch((error) => {
-		fetchUrlModulePromise = undefined;
-		throw error;
-	});
-	return fetchUrlModulePromise;
-}
-
-async function importFirecrawlModule(): Promise<FirecrawlModule> {
-	const mod: any = await import("./firecrawl.ts");
-	const exports = mod?.getFirecrawlClient ? mod : mod?.default?.getFirecrawlClient ? mod.default : undefined;
-	if (
-		typeof exports?.getFirecrawlClient !== "function" ||
-		typeof exports?.scrapeWithFirecrawl !== "function" ||
-		typeof exports?.searchWithFirecrawl !== "function" ||
-		typeof exports?.crawlWithFirecrawl !== "function"
-	) {
-		throw new Error("Firecrawl support failed to load: missing expected helper exports");
-	}
-	return exports as FirecrawlModule;
-}
-
-function loadFirecrawlModule(): Promise<FirecrawlModule> {
-	firecrawlModulePromise ??= importFirecrawlModule().catch((error) => {
-		firecrawlModulePromise = undefined;
-		throw error;
-	});
-	return firecrawlModulePromise;
-}
 
 function renderErrorResult(result: any, theme: any, context: any): Text | undefined {
 	if (!context.isError && !result?.isError) return undefined;
@@ -238,7 +185,6 @@ export default function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { fetchUrl } = await loadFetchUrlModule();
 			const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
 			return {
 				content: [{ type: "text", text: result.text }],
@@ -280,7 +226,6 @@ export default function (pi: ExtensionAPI) {
 		}, 
 		async execute(_toolCallId, params, signal, onUpdate) {
 			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
-			const { getFirecrawlClient, searchWithFirecrawl } = await loadFirecrawlModule();
 			const client = await getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Searching with Firecrawl..." }] });
@@ -338,7 +283,6 @@ export default function (pi: ExtensionAPI) {
 		},
 		async execute(_toolCallId, params, signal, onUpdate) {
 			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
-			const { crawlWithFirecrawl, getFirecrawlClient } = await loadFirecrawlModule();
 			const client = await getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Crawling with Firecrawl..." }] });
