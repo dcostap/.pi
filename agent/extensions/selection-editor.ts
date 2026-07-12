@@ -645,7 +645,8 @@ class SelectionEditor extends CustomEditor {
 
 			const rendered = this.renderVisualLine(rawText, vl.logicalLine, vl.startCol, cursorPos, selectionRange, emitCursorMarker);
 			const padding = " ".repeat(Math.max(0, contentWidth - rendered.width));
-			const lineRightPadding = rendered.cursorInPadding && paddingX > 0 ? rightPadding.slice(1) : rightPadding;
+			const cursorOverflowsIntoPadding = rendered.cursorInPadding && rendered.width > contentWidth;
+			const lineRightPadding = cursorOverflowsIntoPadding && paddingX > 0 ? rightPadding.slice(1) : rightPadding;
 			result.push(`${leftPadding}${rendered.text}${padding}${lineRightPadding}`);
 		}
 
