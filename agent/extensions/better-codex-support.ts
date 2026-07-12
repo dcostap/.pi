@@ -55,8 +55,8 @@ interface ResetConsumeResult {
 }
 
 interface UsageData {
-  session: number;
-  weekly: number;
+  session?: number;
+  weekly?: number;
   resetCreditsAvailable?: number;
   resetCredits?: ResetCreditData[];
   resetCreditsExpireText?: string;
@@ -513,6 +513,71 @@ function readPercentCandidate(value: unknown): number | null {
   return null;
 }
 
+type CodexWindowKind = "session" | "weekly";
+
+interface NormalizedCodexWindow {
+  raw: any;
+  usedPercent: number;
+  windowMinutes?: number;
+}
+
+function readWindowMinutes(window: any): number | undefined {
+  if (typeof window?.limit_window_seconds === "number" && Number.isFinite(window.limit_window_seconds)) {
+    return window.limit_window_seconds / 60;
+  }
+  if (typeof window?.window_minutes === "number" && Number.isFinite(window.window_minutes)) {
+    return window.window_minutes;
+  }
+  return undefined;
+}
+
+function normalizeCodexWindow(window: any): NormalizedCodexWindow | undefined {
+  const usedPercent = readPercentCandidate(window?.used_percent);
+  if (usedPercent === null) return undefined;
+  return { raw: window, usedPercent, windowMinutes: readWindowMinutes(window) };
+}
+
+function isApproximateWindow(minutes: number | undefined, expectedMinutes: number): boolean {
+  return minutes !== undefined && minutes >= expectedMinutes * 0.95 && minutes <= expectedMinutes * 1.05;
+}
+
+function classifyCodexWindow(window: NormalizedCodexWindow): CodexWindowKind | undefined {
+  if (isApproximateWindow(window.windowMinutes, 5 * 60)) return "session";
+  if (isApproximateWindow(window.windowMinutes, 7 * 24 * 60)) return "weekly";
+  return undefined;
+}
+
+function identifyCodexWindows(primaryRaw: any, secondaryRaw: any): Partial<Record<CodexWindowKind, NormalizedCodexWindow>> {
+  const primary = normalizeCodexWindow(primaryRaw);
+  const secondary = normalizeCodexWindow(secondaryRaw);
+  const identified: Partial<Record<CodexWindowKind, NormalizedCodexWindow>> = {};
+  const unknown: Array<{ window: NormalizedCodexWindow; position: "primary" | "secondary" }> = [];
+
+  for (const candidate of [
+    primary && { window: primary, position: "primary" as const },
+    secondary && { window: secondary, position: "secondary" as const },
+  ]) {
+    if (!candidate) continue;
+    const kind = classifyCodexWindow(candidate.window);
+    if (kind) {
+      if (!identified[kind]) identified[kind] = candidate.window;
+      continue;
+    }
+    unknown.push(candidate);
+  }
+
+  // Compatibility for older responses that omitted window duration. Duration
+  // always wins; position is only a fallback for the remaining unknown window.
+  for (const candidate of unknown) {
+    if (identified.weekly && !identified.session) identified.session = candidate.window;
+    else if (identified.session && !identified.weekly) identified.weekly = candidate.window;
+    else if (candidate.position === "primary" && !identified.session) identified.session = candidate.window;
+    else if (candidate.position === "secondary" && !identified.weekly) identified.weekly = candidate.window;
+  }
+
+  return identified;
+}
+
 async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
   const headers = codexUsageHeaders(token);
   const result = await requestJson(
@@ -523,8 +588,12 @@ async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promi
 
   if (!result.ok) return { session: 0, weekly: 0, error: result.error };
 
-  const primary = result.data?.rate_limit?.primary_window;
-  const secondary = result.data?.rate_limit?.secondary_window;
+  const windows = identifyCodexWindows(
+    result.data?.rate_limit?.primary_window,
+    result.data?.rate_limit?.secondary_window,
+  );
+  const session = windows.session;
+  const weekly = windows.weekly;
   let resetCreditsAvailable = readAvailableResetCredits(result.data?.rate_limit_reset_credits);
   let resetCredits: ResetCreditData[] | undefined;
 
@@ -541,23 +610,23 @@ async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promi
   }
 
   return {
-    session: readPercentCandidate(primary?.used_percent) ?? 0,
-    weekly: readPercentCandidate(secondary?.used_percent) ?? 0,
+    session: session?.usedPercent,
+    weekly: weekly?.usedPercent,
     resetCreditsAvailable,
     resetCredits,
     resetCreditsExpireText: formatResetCreditExpiries(resetCredits),
     sessionResetsIn:
-      typeof primary?.reset_after_seconds === "number" ? formatDuration(primary.reset_after_seconds) : undefined,
+      typeof session?.raw?.reset_after_seconds === "number" ? formatDuration(session.raw.reset_after_seconds) : undefined,
     weeklyResetsIn:
-      typeof secondary?.reset_after_seconds === "number" ? formatResetAt(secondary.reset_after_seconds) : undefined,
+      typeof weekly?.raw?.reset_after_seconds === "number" ? formatResetAt(weekly.raw.reset_after_seconds) : undefined,
     sessionResetAfterSeconds:
-      typeof primary?.reset_after_seconds === "number" ? primary.reset_after_seconds : undefined,
+      typeof session?.raw?.reset_after_seconds === "number" ? session.raw.reset_after_seconds : undefined,
     weeklyResetAfterSeconds:
-      typeof secondary?.reset_after_seconds === "number" ? secondary.reset_after_seconds : undefined,
-    sessionResetAt: resetAtMs(primary),
-    weeklyResetAt: resetAtMs(secondary),
-    sessionWindowMinutes: typeof primary?.window_minutes === "number" ? primary.window_minutes : undefined,
-    weeklyWindowMinutes: typeof secondary?.window_minutes === "number" ? secondary.window_minutes : undefined,
+      typeof weekly?.raw?.reset_after_seconds === "number" ? weekly.raw.reset_after_seconds : undefined,
+    sessionResetAt: session ? resetAtMs(session.raw) : undefined,
+    weeklyResetAt: weekly ? resetAtMs(weekly.raw) : undefined,
+    sessionWindowMinutes: session?.windowMinutes,
+    weeklyWindowMinutes: weekly?.windowMinutes,
   };
 }
 
@@ -604,7 +673,7 @@ function colorForPercent(value: number): "success" | "warning" | "error" {
 
 function shouldRenderFooter(data: UsageData | null): data is UsageData {
   if (!data || !!data.error) return false;
-  return data.session > SHOW_THRESHOLD || data.weekly > SHOW_THRESHOLD;
+  return (data.session ?? 0) > SHOW_THRESHOLD || (data.weekly ?? 0) > SHOW_THRESHOLD;
 }
 
 class UsageSelectorComponent extends Container implements Focusable {
@@ -728,8 +797,8 @@ class UsageSelectorComponent extends Container implements Focusable {
     } else if (item.data.error) {
       this.listContainer.addChild(new Text(indent + t.fg("error", item.data.error), 0, 0));
     } else {
-      const session = clampPercent(item.data.session);
-      const weekly = clampPercent(item.data.weekly);
+      const session = item.data.session === undefined ? undefined : clampPercent(item.data.session);
+      const weekly = item.data.weekly === undefined ? undefined : clampPercent(item.data.weekly);
 
       const sessionReset = item.data.sessionResetsIn
         ? t.fg("dim", `  resets in ${item.data.sessionResetsIn}`)
@@ -738,31 +807,21 @@ class UsageSelectorComponent extends Container implements Focusable {
         ? t.fg("dim", `  resets in ${item.data.weeklyResetsIn}`)
         : "";
 
-      this.listContainer.addChild(
-        new Text(
-          indent +
-            t.fg("muted", "Session  ") +
-            this.renderBar(session) +
-            " " +
-            t.fg(colorForPercent(session), `${session}%`.padStart(4)) +
-            sessionReset,
-          0,
-          0,
-        ),
-      );
+      this.listContainer.addChild(new Text(
+        indent + t.fg("muted", "Session  ") + (session === undefined
+          ? t.fg("dim", "unavailable")
+          : this.renderBar(session) + " " + t.fg(colorForPercent(session), `${session}%`.padStart(4)) + sessionReset),
+        0,
+        0,
+      ));
 
-      this.listContainer.addChild(
-        new Text(
-          indent +
-            t.fg("muted", "Weekly   ") +
-            this.renderBar(weekly) +
-            " " +
-            t.fg(colorForPercent(weekly), `${weekly}%`.padStart(4)) +
-            weeklyReset,
-          0,
-          0,
-        ),
-      );
+      this.listContainer.addChild(new Text(
+        indent + t.fg("muted", "Weekly   ") + (weekly === undefined
+          ? t.fg("dim", "unavailable")
+          : this.renderBar(weekly) + " " + t.fg(colorForPercent(weekly), `${weekly}%`.padStart(4)) + weeklyReset),
+        0,
+        0,
+      ));
 
       const resets = item.data.resetCreditsAvailable;
       this.listContainer.addChild(
@@ -776,7 +835,7 @@ class UsageSelectorComponent extends Container implements Focusable {
         ),
       );
 
-      if (!(item.data.session > SHOW_THRESHOLD || item.data.weekly > SHOW_THRESHOLD)) {
+      if (!((item.data.session ?? 0) > SHOW_THRESHOLD || (item.data.weekly ?? 0) > SHOW_THRESHOLD)) {
         this.listContainer.addChild(
           new Text(indent + t.fg("dim", `Footer hidden below ${SHOW_THRESHOLD}% threshold`), 0, 0),
         );
@@ -893,7 +952,7 @@ export default function (pi: ExtensionAPI) {
       let input = "";
       const fitLine = (line: string, width: number): string => truncateToWidth(line, Math.max(0, width), "");
       const renderUsage = () =>
-        `Current usage: session ${clampPercent(data.session)}%, weekly ${clampPercent(data.weekly)}%`;
+        `Current usage: session ${data.session === undefined ? "unavailable" : `${clampPercent(data.session)}%`}, weekly ${data.weekly === undefined ? "unavailable" : `${clampPercent(data.weekly)}%`}`;
       const renderResets = () => {
         const count = data.resetCreditsAvailable === undefined ? "unknown" : String(data.resetCreditsAvailable);
         return `Banked resets: ${count}${data.resetCreditsExpireText ? ` (expires ${data.resetCreditsExpireText})` : ""}`;
@@ -962,8 +1021,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const theme = ctx.ui.theme;
-    const session = clampPercent(data.session);
-    const weekly = clampPercent(data.weekly);
+    const session = data.session === undefined ? undefined : clampPercent(data.session);
+    const weekly = data.weekly === undefined ? undefined : clampPercent(data.weekly);
 
     const sessionReset = data.sessionResetsIn ? theme.fg("dim", ` ⟳ ${data.sessionResetsIn}`) : "";
     const weeklyReset = data.weeklyResetsIn ? theme.fg("dim", ` ⟳ ${data.weeklyResetsIn}`) : "";
@@ -973,19 +1032,14 @@ export default function (pi: ExtensionAPI) {
         theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable)) +
         (data.resetCreditsExpireText ? theme.fg("dim", ` exp ${data.resetCreditsExpireText}`) : "");
 
-    const status =
-      theme.fg("dim", "Codex ") +
-      theme.fg("muted", "S ") +
-      renderBar(theme, session) +
-      " " +
-      renderPercent(theme, session) +
-      sessionReset +
-      theme.fg("muted", " W ") +
-      renderBar(theme, weekly) +
-      " " +
-      renderPercent(theme, weekly) +
-      weeklyReset +
-      resetBank;
+    const usageParts: string[] = [];
+    if (session !== undefined) {
+      usageParts.push(theme.fg("muted", "S ") + renderBar(theme, session) + " " + renderPercent(theme, session) + sessionReset);
+    }
+    if (weekly !== undefined) {
+      usageParts.push(theme.fg("muted", "W ") + renderBar(theme, weekly) + " " + renderPercent(theme, weekly) + weeklyReset);
+    }
+    const status = theme.fg("dim", "Codex ") + usageParts.join(" ") + resetBank;
 
     ctx.ui.setStatus(STATUS_KEY, status);
   }
@@ -1479,13 +1533,20 @@ export default function (pi: ExtensionAPI) {
               if (loading) return [separator, fitLine(theme.fg("dim", "Fetching Codex usage…"), width), separator];
               if (!data) return [separator, fitLine(theme.fg("error", "No usage data"), width), separator];
               if (data.error) return [separator, fitLine(theme.fg("error", data.error), width), separator];
-              return [
-                separator,
-                fitLine(renderSimpleBar("Session", data.session, data.sessionResetsIn, data.sessionResetAfterSeconds, data.sessionWindowMinutes, 300), width),
-                fitLine(renderSimpleBar("Weekly", data.weekly, data.weeklyResetsIn, data.weeklyResetAfterSeconds, data.weeklyWindowMinutes, 7 * 24 * 60), width),
-                fitLine(`${theme.fg("muted", "RESETS".padEnd(8))} ${data.resetCreditsAvailable === undefined ? theme.fg("dim", "unknown") : theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable))}${data.resetCreditsExpireText ? theme.fg("dim", `  expires ${data.resetCreditsExpireText}`) : ""}`, width),
+              const lines = [
                 separator,
               ];
+              lines.push(data.session === undefined
+                ? fitLine(`${theme.fg("muted", "Session".padEnd(8))} ${theme.fg("dim", "unavailable")}`, width)
+                : fitLine(renderSimpleBar("Session", data.session, data.sessionResetsIn, data.sessionResetAfterSeconds, data.sessionWindowMinutes, 300), width));
+              lines.push(data.weekly === undefined
+                ? fitLine(`${theme.fg("muted", "Weekly".padEnd(8))} ${theme.fg("dim", "unavailable")}`, width)
+                : fitLine(renderSimpleBar("Weekly", data.weekly, data.weeklyResetsIn, data.weeklyResetAfterSeconds, data.weeklyWindowMinutes, 7 * 24 * 60), width));
+              lines.push(
+                fitLine(`${theme.fg("muted", "RESETS".padEnd(8))} ${data.resetCreditsAvailable === undefined ? theme.fg("dim", "unknown") : theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable))}${data.resetCreditsExpireText ? theme.fg("dim", `  expires ${data.resetCreditsExpireText}`) : ""}`, width),
+                separator,
+              );
+              return lines;
             },
             invalidate() {},
             handleInput(keyData: string) {
