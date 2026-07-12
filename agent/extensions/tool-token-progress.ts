@@ -4,6 +4,7 @@ import {
 	createWriteToolDefinition,
 	type ExtensionAPI,
 	type Theme,
+	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
 
@@ -115,6 +116,17 @@ function toolCallFromEvent(event: AssistantMessageEvent): { id: string; name: st
 }
 
 export default function (pi: ExtensionAPI) {
+	// Allow a separate extension to supply write filesystem operations without
+	// coupling this rendering extension to any platform-specific workaround.
+	let writeOperations: WriteOperations | undefined;
+	pi.events.on("write-operations:available", (operations: unknown) => {
+		const candidate = operations as Partial<WriteOperations> | undefined;
+		if (typeof candidate?.mkdir === "function" && typeof candidate?.writeFile === "function") {
+			writeOperations = candidate as WriteOperations;
+		}
+	});
+	pi.events.emit("write-operations:request", undefined);
+
 	pi.on("agent_start", () => {
 		outputCharsByToolCallId.clear();
 	});
@@ -134,7 +146,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		const baseEdit = createEditToolDefinition(ctx.cwd);
-		const baseWrite = createWriteToolDefinition(ctx.cwd);
+		const baseWrite = createWriteToolDefinition(
+			ctx.cwd,
+			writeOperations ? { operations: writeOperations } : undefined,
+		);
 
 		pi.registerTool({
 			...baseEdit,
