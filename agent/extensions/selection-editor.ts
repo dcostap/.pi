@@ -95,10 +95,20 @@ class SelectionEditor extends CustomEditor {
 		};
 	}
 
+	private decodeTmuxPasteControls(text: string): string {
+		return text.replace(/\x1b\[(\d+);5u/g, (match, code: string) => {
+			const codePoint = Number(code);
+			if (codePoint >= 97 && codePoint <= 122) return String.fromCharCode(codePoint - 96);
+			if (codePoint >= 65 && codePoint <= 90) return String.fromCharCode(codePoint - 64);
+			return match;
+		});
+	}
+
 	private normalizePastedFileContent(text: string): string {
-		// Fast path for huge pastes: avoid per-character array push + join,
-		// which dominates the paste-to-file cost for multi-MB clipboard data.
-		return text.replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+		// Decode tmux's CSI-u control representation before filtering, matching
+		// the base editor's paste handling for newlines and other control bytes.
+		const decodedText = this.decodeTmuxPasteControls(text);
+		return decodedText.replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 	}
 
 	private shouldDumpPasteToFile(pastedText: string): boolean {
