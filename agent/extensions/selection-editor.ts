@@ -954,8 +954,10 @@ class SelectionEditor extends CustomEditor {
 		}
 
 		// Default behavior.
+		const textBeforeInput = this.getText();
 		this.clearSelection();
 		super.handleInput(data);
+		if (this.getText() !== textBeforeInput) this.pruneUnusedPasteMarkers();
 	}
 }
 
