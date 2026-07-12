@@ -33,7 +33,9 @@ import { CURSOR_MARKER, decodeKittyPrintable, isKeyRelease, matchesKey, truncate
 type Pos = { line: number; col: number };
 type Range = { start: Pos; end: Pos };
 type VisualLine = { logicalLine: number; startCol: number; length: number };
-type EditorStateSnapshot = { lines: string[]; cursorLine: number; cursorCol: number };
+type PasteStateSnapshot = { pastes: Map<number, string>; pasteCounter: number };
+type EditorStateSnapshot = { lines: string[]; cursorLine: number; cursorCol: number } & PasteStateSnapshot;
+type PromptBufferState = { text: string } & PasteStateSnapshot;
 
 type EditorInternals = {
 	state: { lines: string[]; cursorLine: number; cursorCol: number };
@@ -79,9 +81,11 @@ class SelectionEditor extends CustomEditor {
 	private customPasteChunks: string[] = [];
 	private customPasteInProgress = false;
 	private promptBufferIndex = -1;
-	private promptBufferTexts = new Map<number, string>();
+	private promptBufferStates = new Map<number, PromptBufferState>();
+	private markerUndoStack: PasteStateSnapshot[] = [];
 	private redoStack: EditorStateSnapshot[] = [];
 	private basePushUndoSnapshot: (() => void) | null = null;
+	private baseUndo: (() => void) | null = null;
 
 	constructor(...args: ConstructorParameters<typeof CustomEditor>) {
 		super(...args);
@@ -91,9 +95,20 @@ class SelectionEditor extends CustomEditor {
 		// push an undo snapshot through `basePushUndoSnapshot` without clearing the
 		// remaining redo chain.
 		this.basePushUndoSnapshot = this.i.pushUndoSnapshot.bind(this);
+		this.baseUndo = this.i.undo.bind(this);
 		this.i.pushUndoSnapshot = () => {
 			this.redoStack.length = 0;
+			this.markerUndoStack.push(this.snapshotPasteState());
 			this.basePushUndoSnapshot?.();
+		};
+		this.i.undo = () => {
+			const undoStack = (this as unknown as { undoStack?: { length: number } }).undoStack;
+			if (!undoStack || undoStack.length === 0) return;
+
+			this.redoStack.push(this.snapshotState());
+			const pasteSnapshot = this.markerUndoStack.pop();
+			this.baseUndo?.();
+			if (pasteSnapshot) this.restorePasteState(pasteSnapshot);
 		};
 	}
 
@@ -237,11 +252,24 @@ class SelectionEditor extends CustomEditor {
 		return this.state.lines.join("\n");
 	}
 
+	private snapshotPasteState(): PasteStateSnapshot {
+		return {
+			pastes: new Map(this.i.pastes),
+			pasteCounter: this.i.pasteCounter,
+		};
+	}
+
+	private restorePasteState(snapshot: PasteStateSnapshot): void {
+		this.i.pastes = new Map(snapshot.pastes);
+		this.i.pasteCounter = snapshot.pasteCounter;
+	}
+
 	private snapshotState(): EditorStateSnapshot {
 		return {
 			lines: [...this.state.lines],
 			cursorLine: this.state.cursorLine,
 			cursorCol: this.state.cursorCol,
+			...this.snapshotPasteState(),
 		};
 	}
 
@@ -252,6 +280,7 @@ class SelectionEditor extends CustomEditor {
 		this.state.cursorLine = Math.max(0, Math.min(snapshot.cursorLine, this.state.lines.length - 1));
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		this.i.setCursorCol(Math.max(0, Math.min(snapshot.cursorCol, currentLine.length)));
+		this.restorePasteState(snapshot);
 		this.i.scrollOffset = 0;
 		this.clearSelection();
 		this.onChange?.(this.getText());
@@ -259,9 +288,6 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	private undoWithRedo(): void {
-		const undoStack = (this as unknown as { undoStack?: { length: number } }).undoStack;
-		if (!undoStack || undoStack.length === 0) return;
-		this.redoStack.push(this.snapshotState());
 		this.clearSelection();
 		this.i.undo();
 		this.tui.requestRender();
@@ -270,16 +296,22 @@ class SelectionEditor extends CustomEditor {
 	private redo(): void {
 		const snapshot = this.redoStack.pop();
 		if (!snapshot) return;
+		this.markerUndoStack.push(this.snapshotPasteState());
 		this.basePushUndoSnapshot?.();
 		this.restoreState(snapshot);
 	}
 
-	private setPromptBufferText(text: string): void {
-		const lines = text.split("\n");
+	private snapshotPromptBufferState(): PromptBufferState {
+		return { text: this.getCurrentRawText(), ...this.snapshotPasteState() };
+	}
+
+	private setPromptBufferState(buffer: PromptBufferState): void {
+		const lines = buffer.text.split("\n");
 		this.i.cancelAutocomplete();
 		this.state.lines = lines.length === 0 ? [""] : lines;
 		this.state.cursorLine = 0;
 		this.i.setCursorCol(0);
+		this.restorePasteState(buffer);
 		this.i.scrollOffset = 0;
 		this.clearSelection();
 		this.onChange?.(this.getText());
@@ -297,20 +329,23 @@ class SelectionEditor extends CustomEditor {
 			this.i.pushUndoSnapshot();
 		}
 
-		this.promptBufferTexts.set(this.promptBufferIndex, this.getCurrentRawText());
+		this.promptBufferStates.set(this.promptBufferIndex, this.snapshotPromptBufferState());
 		this.promptBufferIndex = targetIndex;
 
-		const nextText =
-			targetIndex === -1
-				? (this.promptBufferTexts.get(-1) ?? "")
-				: (this.promptBufferTexts.get(targetIndex) ?? history[targetIndex] ?? "");
-		this.setPromptBufferText(nextText);
+		const savedBuffer = this.promptBufferStates.get(targetIndex);
+		const nextBuffer = savedBuffer ?? {
+			text: targetIndex === -1 ? "" : (history[targetIndex] ?? ""),
+			pastes: new Map<number, string>(),
+			pasteCounter: 0,
+		};
+		this.setPromptBufferState(nextBuffer);
 		return true;
 	}
 
 	resetAfterSubmit(): void {
 		this.promptBufferIndex = -1;
-		this.promptBufferTexts.clear();
+		this.promptBufferStates.clear();
+		this.markerUndoStack.length = 0;
 		this.redoStack.length = 0;
 	}
 
@@ -364,6 +399,18 @@ class SelectionEditor extends CustomEditor {
 		return text.replace(PASTE_MARKER_REGEX, (marker, idText: string) => {
 			return this.i.pastes.get(Number(idText)) ?? marker;
 		});
+	}
+
+	private pruneUnusedPasteMarkers(): void {
+		const referencedIds = new Set<number>();
+		for (const line of this.state.lines) {
+			for (const match of line.matchAll(PASTE_MARKER_REGEX)) {
+				referencedIds.add(Number(match[1]));
+			}
+		}
+		for (const id of this.i.pastes.keys()) {
+			if (!referencedIds.has(id)) this.i.pastes.delete(id);
+		}
 	}
 
 	private clonePasteMarkers(text: string, cursorCol: number): { text: string; cursorCol: number } {
@@ -484,6 +531,7 @@ class SelectionEditor extends CustomEditor {
 
 		this.state.cursorLine = range.start.line;
 		this.i.setCursorCol(range.start.col);
+		this.pruneUnusedPasteMarkers();
 		this.clearSelection();
 		this.onChange?.(this.getText());
 		this.tui.requestRender();
@@ -546,6 +594,7 @@ class SelectionEditor extends CustomEditor {
 			this.i.setCursorCol(Math.min(this.state.cursorCol, currentLine.length));
 		}
 
+		this.pruneUnusedPasteMarkers();
 		this.clearSelection();
 		this.onChange?.(this.getText());
 		this.tui.requestRender();
