@@ -112,6 +112,24 @@ class SelectionEditor extends CustomEditor {
 		};
 	}
 
+	setText(text: string): void {
+		const previousText = this.getText();
+		const previousPasteState = this.snapshotPasteState();
+		const undoDepth = this.markerUndoStack.length;
+
+		super.setText(text);
+
+		if (this.getText() === previousText) {
+			// The base editor clears paste metadata before checking whether the text
+			// changed. Preserve it when setText is effectively a no-op.
+			this.restorePasteState(previousPasteState);
+		} else if (this.markerUndoStack.length > undoDepth) {
+			// The base snapshot is pushed after it clears paste metadata. Pair that
+			// text snapshot with the metadata from the actual pre-setText state.
+			this.markerUndoStack[this.markerUndoStack.length - 1] = previousPasteState;
+		}
+	}
+
 	private decodeTmuxPasteControls(text: string): string {
 		return text.replace(/\x1b\[(\d+);5u/g, (match, code: string) => {
 			const codePoint = Number(code);
