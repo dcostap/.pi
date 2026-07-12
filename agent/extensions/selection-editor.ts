@@ -625,7 +625,7 @@ class SelectionEditor extends CustomEditor {
 		const rightPadding = leftPadding;
 		const horizontal = this.borderColor("─");
 		const selectionRange = this.getSelectionRange();
-		const emitCursorMarker = this.focused && !this.isShowingAutocomplete();
+		const emitCursorMarker = this.focused;
 
 		if (this.i.scrollOffset > 0) {
 			const indicator = `─── ↑ ${this.i.scrollOffset} more `;
