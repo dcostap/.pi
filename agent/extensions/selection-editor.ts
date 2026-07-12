@@ -59,6 +59,8 @@ type EditorInternals = {
 	undo(): void;
 	history: string[];
 	jumpMode: "forward" | "backward" | null;
+	pastes: Map<number, string>;
+	pasteCounter: number;
 };
 
 const RESET = "\x1b[0m";
@@ -70,6 +72,7 @@ const LARGE_PASTE_DIR = join(tmpdir(), "pi-paste-dumps");
 const KEY_DEBUG_LOG = join(tmpdir(), "pi-selection-editor-keys.log");
 const ENABLE_KEY_DEBUG_LOG = process.env.PI_SELECTION_EDITOR_KEY_DEBUG === "1";
 const KEY_DEBUG_PREVIEW_CHARS = 160;
+const PASTE_MARKER_REGEX = /\[paste #(\d+)( \+\d+ lines| \d+ chars)?\]/g;
 
 class SelectionEditor extends CustomEditor {
 	private selectionAnchor: Pos | null = null;
@@ -357,13 +360,38 @@ class SelectionEditor extends CustomEditor {
 		this.tui.requestRender();
 	}
 
+	private expandPasteMarkers(text: string): string {
+		return text.replace(PASTE_MARKER_REGEX, (marker, idText: string) => {
+			return this.i.pastes.get(Number(idText)) ?? marker;
+		});
+	}
+
+	private clonePasteMarkers(text: string, cursorCol: number): { text: string; cursorCol: number } {
+		let clonedCursorCol = cursorCol;
+		const clonedText = text.replace(
+			PASTE_MARKER_REGEX,
+			(marker, idText: string, suffix: string | undefined, offset: number) => {
+				const content = this.i.pastes.get(Number(idText));
+				if (content === undefined) return marker;
+
+				do this.i.pasteCounter++;
+				while (this.i.pastes.has(this.i.pasteCounter));
+				this.i.pastes.set(this.i.pasteCounter, content);
+				const clonedMarker = `[paste #${this.i.pasteCounter}${suffix ?? ""}]`;
+				if (offset + marker.length <= cursorCol) clonedCursorCol += clonedMarker.length - marker.length;
+				return clonedMarker;
+			},
+		);
+		return { text: clonedText, cursorCol: clonedCursorCol };
+	}
+
 	private getSelectedText(): string | null {
 		const range = this.getSelectionRange();
 		if (!range) return null;
 
 		const lines = this.state.lines;
 		if (range.start.line === range.end.line) {
-			return (lines[range.start.line] || "").slice(range.start.col, range.end.col);
+			return this.expandPasteMarkers((lines[range.start.line] || "").slice(range.start.col, range.end.col));
 		}
 
 		const parts: string[] = [];
@@ -372,7 +400,7 @@ class SelectionEditor extends CustomEditor {
 			parts.push(lines[line] || "");
 		}
 		parts.push((lines[range.end.line] || "").slice(0, range.end.col));
-		return parts.join("\n");
+		return this.expandPasteMarkers(parts.join("\n"));
 	}
 
 	private copyTextToClipboard(text: string): void {
@@ -501,7 +529,7 @@ class SelectionEditor extends CustomEditor {
 	private cutCurrentLine(): void {
 		const lineIndex = this.state.cursorLine;
 		const lines = this.state.lines;
-		const cutText = lines[lineIndex] ?? "";
+		const cutText = this.expandPasteMarkers(lines[lineIndex] ?? "");
 
 		this.i.cancelAutocomplete();
 		this.i.jumpMode = null;
@@ -532,9 +560,10 @@ class SelectionEditor extends CustomEditor {
 		this.i.cancelAutocomplete();
 		this.i.jumpMode = null;
 		this.i.pushUndoSnapshot();
-		this.state.lines.splice(lineIndex + 1, 0, line);
+		const duplicatedLine = this.clonePasteMarkers(line, targetCol);
+		this.state.lines.splice(lineIndex + 1, 0, duplicatedLine.text);
 		this.state.cursorLine = lineIndex + 1;
-		this.i.setCursorCol(Math.min(targetCol, line.length));
+		this.i.setCursorCol(Math.min(duplicatedLine.cursorCol, duplicatedLine.text.length));
 		this.clearSelection();
 		this.onChange?.(this.getText());
 		this.tui.requestRender();
