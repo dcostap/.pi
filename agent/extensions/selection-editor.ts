@@ -687,12 +687,13 @@ class SelectionEditor extends CustomEditor {
 		} else {
 			const historyIndicator = this.promptBufferIndex > -1 ? ` history[${this.promptBufferIndex}] ` : "";
 			if (historyIndicator) {
-				const indicatorWidth = visibleWidth(historyIndicator);
+				const visibleIndicator = truncateToWidth(historyIndicator, width, "");
+				const indicatorWidth = visibleWidth(visibleIndicator);
 				const leftWidth = Math.max(0, width - indicatorWidth - 2);
 				const rightWidth = Math.max(0, width - leftWidth - indicatorWidth);
 				result.push(
 					this.borderColor("─".repeat(leftWidth)) +
-					this.borderColor(historyIndicator) +
+					this.borderColor(visibleIndicator) +
 					this.borderColor("─".repeat(rightWidth)),
 				);
 			} else {
