@@ -306,9 +306,10 @@ class SelectionEditor extends CustomEditor {
 		return true;
 	}
 
-	resetPromptBufferBrowsing(): void {
+	resetAfterSubmit(): void {
 		this.promptBufferIndex = -1;
 		this.promptBufferTexts.clear();
+		this.redoStack.length = 0;
 	}
 
 	private normalizeRange(a: Pos, b: Pos): Range {
@@ -904,6 +905,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", () => {
-		activeEditor?.resetPromptBufferBrowsing();
+		activeEditor?.resetAfterSubmit();
 	});
 }
