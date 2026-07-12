@@ -1,0 +1,36 @@
+[workspace]
+members = [
+  "apply-patch",
+  "crates/codex-utils-absolute-path",
+  "crates/codex-exec-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+version = "0.0.0"
+
+[workspace.dependencies]
+anyhow = "1"
+assert_matches = "1"
+async-trait = "0.1"
+codex-utils-absolute-path = { path = "crates/codex-utils-absolute-path" }
+dirs = "6"
+dunce = "1"
+pretty_assertions = "1"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "rt", "rt-multi-thread", "sync"] }
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
+ts-rs = { version = "11", features = ["serde-json-impl", "no-serde-warnings"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
