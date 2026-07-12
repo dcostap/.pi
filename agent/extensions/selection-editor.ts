@@ -168,8 +168,6 @@ class SelectionEditor extends CustomEditor {
 		if (!this.customPasteInProgress) return false;
 
 		this.customPasteChunks.push(data);
-		if (!data.includes("\x1b[201~")) return true;
-
 		const buffered = this.customPasteChunks.join("");
 		const endIndex = buffered.indexOf("\x1b[201~");
 		if (endIndex === -1) return true;
