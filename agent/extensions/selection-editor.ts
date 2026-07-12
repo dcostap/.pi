@@ -79,7 +79,6 @@ class SelectionEditor extends CustomEditor {
 	private promptBufferTexts = new Map<number, string>();
 	private redoStack: EditorStateSnapshot[] = [];
 	private basePushUndoSnapshot: (() => void) | null = null;
-	private suppressRawEnyeUntil = 0;
 
 	constructor(...args: ConstructorParameters<typeof CustomEditor>) {
 		super(...args);
@@ -401,7 +400,6 @@ class SelectionEditor extends CustomEditor {
 				matchesEnd: matchesKey(data, "end"),
 				matchesCtrlShiftEnd: matchesKey(data, "ctrl+shift+end"),
 				matchesCtrlEnd: matchesKey(data, "ctrl+end"),
-				suppressRawEnyeUntil: this.suppressRawEnyeUntil,
 			};
 			appendFileSync(KEY_DEBUG_LOG, `${JSON.stringify(record)}\n`, "utf8");
 		} catch {
@@ -415,23 +413,6 @@ class SelectionEditor extends CustomEditor {
 		// is the legacy encoding for Alt+char. This is never useful text input
 		// for the prompt, and if it falls through it clears the selection.
 		return data === "\x1bñ" || data === "\x1bÑ";
-	}
-
-	private shouldDropSuppressedRawEnye(data: string): boolean {
-		if (Date.now() >= this.suppressRawEnyeUntil) return false;
-		const kittyPrintable = decodeKittyPrintable(data);
-		const text = kittyPrintable ?? data;
-		if (text !== "ñ" && text !== "Ñ") return false;
-
-		// If ñ auto-repeat leaks after the AHK Alt+ñ navigation hotkey, keep
-		// swallowing the run until it stops. This does not affect normal ñ typing
-		// unless it happens immediately after an Alt+ñ navigation command.
-		this.suppressRawEnyeUntil = Date.now() + 250;
-		return true;
-	}
-
-	private suppressRawEnyeBriefly(): void {
-		this.suppressRawEnyeUntil = Date.now() + 2000;
 	}
 
 	private collapseSelection(to: "start" | "end"): boolean {
@@ -706,7 +687,6 @@ class SelectionEditor extends CustomEditor {
 		if (isKeyRelease(data)) return;
 		if (this.handleCustomPasteInput(data)) return;
 		if (this.shouldDropAhkLeakedAltEnye(data)) return;
-		if (this.shouldDropSuppressedRawEnye(data)) return;
 
 		// 0) Undo/redo. Handle these before `super.handleInput()` so Ctrl+Z
 		// wins over pi's app.suspend binding on Unix-like terminals, and Ctrl+Y
@@ -769,10 +749,7 @@ class SelectionEditor extends CustomEditor {
 			if (matchesKey(data, "shift+up")) return this.moveWithSelection(() => this.i.moveCursor(-1, 0));
 			if (matchesKey(data, "shift+down")) return this.moveWithSelection(() => this.i.moveCursor(1, 0));
 			if (matchesKey(data, "shift+home")) return this.moveWithSelection(() => this.i.moveToLineStart());
-			if (matchesKey(data, "shift+end")) {
-				this.suppressRawEnyeBriefly();
-				return this.moveWithSelection(() => this.i.moveToLineEnd());
-			}
+			if (matchesKey(data, "shift+end")) return this.moveWithSelection(() => this.i.moveToLineEnd());
 			if (matchesKey(data, "shift+pageUp")) return this.moveWithSelection(() => this.i.pageScroll(-1));
 			if (matchesKey(data, "shift+pageDown")) return this.moveWithSelection(() => this.i.pageScroll(1));
 			if (matchesKey(data, "ctrl+shift+left") || matchesKey(data, "alt+shift+left")) {
@@ -782,10 +759,7 @@ class SelectionEditor extends CustomEditor {
 				return this.moveWithSelection(() => this.i.moveWordForwards());
 			}
 			if (matchesKey(data, "ctrl+shift+home")) return this.moveWithSelection(() => this.moveToDocumentStart());
-			if (matchesKey(data, "ctrl+shift+end")) {
-				this.suppressRawEnyeBriefly();
-				return this.moveWithSelection(() => this.moveToDocumentEnd());
-			}
+			if (matchesKey(data, "ctrl+shift+end")) return this.moveWithSelection(() => this.moveToDocumentEnd());
 
 			if (matchesKey(data, "left")) return this.moveWithoutSelection("backward", () => this.i.moveCursor(0, -1));
 			if (matchesKey(data, "right")) return this.moveWithoutSelection("forward", () => this.i.moveCursor(0, 1));
@@ -809,10 +783,7 @@ class SelectionEditor extends CustomEditor {
 				return this.moveWithoutSelection("forward", () => this.i.moveCursor(1, 0));
 			}
 			if (matchesKey(data, "home")) return this.moveWithoutSelection("backward", () => this.i.moveToLineStart());
-			if (matchesKey(data, "end")) {
-				this.suppressRawEnyeBriefly();
-				return this.moveWithoutSelection("forward", () => this.i.moveToLineEnd());
-			}
+			if (matchesKey(data, "end")) return this.moveWithoutSelection("forward", () => this.i.moveToLineEnd());
 			if (matchesKey(data, "pageUp")) return this.moveWithoutSelection("backward", () => this.i.pageScroll(-1));
 			if (matchesKey(data, "pageDown")) return this.moveWithoutSelection("forward", () => this.i.pageScroll(1));
 			if (matchesKey(data, "ctrl+left") || matchesKey(data, "alt+left")) {
@@ -822,10 +793,7 @@ class SelectionEditor extends CustomEditor {
 				return this.moveWithoutSelection("forward", () => this.i.moveWordForwards());
 			}
 			if (matchesKey(data, "ctrl+home")) return this.moveWithoutSelection("backward", () => this.moveToDocumentStart());
-			if (matchesKey(data, "ctrl+end")) {
-				this.suppressRawEnyeBriefly();
-				return this.moveWithoutSelection("forward", () => this.moveToDocumentEnd());
-			}
+			if (matchesKey(data, "ctrl+end")) return this.moveWithoutSelection("forward", () => this.moveToDocumentEnd());
 		}
 
 		// 4) Deletion becomes "delete selection" when a selection exists.
