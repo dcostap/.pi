@@ -143,6 +143,10 @@ function styledCounts(suffix: string, theme: RenderTheme): string {
 	return ` (${theme.fg("toolDiffAdded", `+${match[1]}`)} ${theme.fg("toolDiffRemoved", `-${match[2]}`)})`;
 }
 
+function actionLabel(action: { type: string }, theme: RenderTheme): string {
+	return action.type === "delete" ? `${theme.fg("toolDiffRemoved", "DELETED")} ` : "";
+}
+
 function styleHeaders(text: string, patchText: string, cwd: string, theme: RenderTheme, status: ApplyPatchRenderState["status"] | ApplyPatchSettledStatus): string {
 	let actions;
 	try {
@@ -159,7 +163,7 @@ function styleHeaders(text: string, patchText: string, cwd: string, theme: Rende
 		const suffix = lines[0]?.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
 		const linkTarget = action.movePath ?? action.path;
-		lines[0] = `${title} ${theme.fg("accent", clickablePath(target, linkTarget, cwd))}${styledCounts(suffix, theme)}`;
+		lines[0] = `${title} ${actionLabel(action, theme)}${theme.fg("accent", clickablePath(target, linkTarget, cwd))}${styledCounts(suffix, theme)}`;
 		return lines.join("\n");
 	}
 
@@ -173,7 +177,7 @@ function styleHeaders(text: string, patchText: string, cwd: string, theme: Rende
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
 		const linkTarget = action.movePath ?? action.path;
 		const linked = theme.fg("accent", clickablePath(target, linkTarget, cwd));
-		lines[index] = `  └ ${linked}${styledCounts(suffix, theme)}`;
+		lines[index] = `  └ ${actionLabel(action, theme)}${linked}${styledCounts(suffix, theme)}`;
 	}
 	return lines.join("\n");
 }
@@ -184,18 +188,65 @@ function tokenSuffix(tokens: number | undefined, theme: RenderTheme): string {
 	return ` ${theme.fg("dim", `↓${display}`)}`;
 }
 
-function pendingHeader(patchText: string, cwd: string, tokens: number | undefined, theme: RenderTheme): string {
-	let text = theme.fg("toolTitle", theme.bold("apply_patch"));
-	const target = patchText.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/m)?.[1]?.trim();
-	if (target) text += ` ${theme.fg("accent", clickablePath(target, target, cwd))}`;
-	return `${text}${tokenSuffix(tokens, theme)}`;
+interface PendingAction {
+	type: "add" | "update" | "delete";
+	path: string;
+	movePath?: string;
+}
+
+const MAX_PENDING_ACTIONS = 20;
+
+function pendingActions(patchText: string): PendingAction[] {
+	const lines = patchText.split("\n");
+	// The last streamed line may still be growing. Wait for its newline so the
+	// displayed path never flickers through partial values.
+	if (!patchText.endsWith("\n")) lines.pop();
+
+	const actions: PendingAction[] = [];
+	for (const rawLine of lines) {
+		const line = rawLine.replace(/\r$/, "");
+		const header = line.match(/^\*\*\* (Add|Update|Delete) File: (.+)$/);
+		if (header) {
+			const type = header[1]!.toLowerCase() as PendingAction["type"];
+			const path = header[2]!.trim();
+			if (path) actions.push({ type, path });
+			continue;
+		}
+
+		const move = line.match(/^\*\*\* Move to: (.+)$/);
+		const previous = actions.at(-1);
+		if (move && previous?.type === "update") {
+			const movePath = move[1]!.trim();
+			if (movePath) previous.movePath = movePath;
+		}
+	}
+	return actions;
+}
+
+function pendingActionLabel(action: PendingAction, theme: RenderTheme): string {
+	if (action.movePath) return theme.fg("accent", "MOVING");
+	if (action.type === "add") return theme.fg("toolDiffAdded", "ADDING");
+	if (action.type === "delete") return theme.fg("toolDiffRemoved", "DELETING");
+	return theme.fg("accent", "EDITING");
+}
+
+function pendingCall(patchText: string, cwd: string, tokens: number | undefined, theme: RenderTheme): string {
+	const lines = [`${theme.fg("toolTitle", theme.bold("apply_patch"))}${tokenSuffix(tokens, theme)}`];
+	const actions = pendingActions(patchText);
+	for (const action of actions.slice(0, MAX_PENDING_ACTIONS)) {
+		lines.push(`  └ ${pendingActionLabel(action, theme)} ${formatPatchTarget(action.path, action.movePath, cwd)}`);
+	}
+	if (actions.length > MAX_PENDING_ACTIONS) {
+		lines.push(`    ${theme.fg("dim", `… ${actions.length - MAX_PENDING_ACTIONS} more actions`)}`);
+	}
+	return lines.join("\n");
 }
 
 export function renderApplyPatchCallFromState(args: { input?: unknown | undefined }, theme: RenderTheme, context?: { toolCallId?: string | undefined; cwd?: string | undefined; expanded?: boolean | undefined; argsComplete?: boolean | undefined; showCollapsedDiff?: boolean | undefined; outputTokens?: number | undefined; settledStatus?: ApplyPatchSettledStatus | undefined }): string {
 	const patchText = typeof args.input === "string" ? args.input : "";
 	const cached = context?.toolCallId ? applyPatchRenderStates.get(context.toolCallId) : undefined;
 	const cwd = context?.cwd ?? cached?.cwd ?? process.cwd();
-	const pending = pendingHeader(patchText, cwd, context?.outputTokens, theme);
+	const pending = pendingCall(patchText, cwd, context?.outputTokens, theme);
 	// Native edit waits for complete arguments before constructing its preview.
 	// Rendering a growing diff on every streamed JSON delta leaves stale ANSI
 	// background cells behind in terminals when hunks wrap or change height.

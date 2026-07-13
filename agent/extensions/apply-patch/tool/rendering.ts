@@ -18,6 +18,7 @@ interface FilePreview {
 	added: number;
 	removed: number;
 	lines: PreviewLine[];
+	wholeFileDelete?: boolean;
 }
 
 export function formatApplyPatchSummary(patchText: string, cwd = process.cwd()): string {
@@ -72,17 +73,17 @@ export function formatApplyPatchCall(patchText: string, cwd = process.cwd()): st
 	if (files.length === 1) {
 		const file = files[0]!;
 		lines.push(`${bulletHeader(file.verb, formatPatchTarget(file.path, file.movePath, cwd))} ${renderCounts(file.added, file.removed)}`);
-		lines.push(...file.lines.map((line) => formatPreviewLine(line, file.lines)));
+		lines.push(...formatFilePreview(file));
 		return lines.join("\n");
 	}
 
 	lines.push(`${bulletHeader("Edited", `${files.length} files`)} ${renderCounts(totalAdded, totalRemoved)}`);
 	for (const [index, file] of files.entries()) {
-		if (index > 0) {
+		if (index > 0 && (hasFilePreview(files[index - 1]!) || hasFilePreview(file))) {
 			lines.push("");
 		}
 		lines.push(`  └ ${formatPatchTarget(file.path, file.movePath, cwd)} ${renderCounts(file.added, file.removed)}`);
-		lines.push(...file.lines.map((line) => formatPreviewLine(line, file.lines)));
+		lines.push(...formatFilePreview(file, "    "));
 	}
 
 	return lines.join("\n");
@@ -112,17 +113,17 @@ export function renderApplyPatchCall(patchText: string, cwd = process.cwd()): st
 	if (files.length === 1) {
 		const file = files[0]!;
 		lines.push(`${bulletHeader(file.verb, formatPatchTarget(file.path, file.movePath, cwd))} ${renderCounts(file.added, file.removed)}`);
-		lines.push(...renderPreviewLines(file.lines));
+		lines.push(...renderFilePreview(file));
 		return lines.join("\n");
 	}
 
 	lines.push(`${bulletHeader("Edited", `${files.length} files`)} ${renderCounts(totalAdded, totalRemoved)}`);
 	for (const [index, file] of files.entries()) {
-		if (index > 0) {
+		if (index > 0 && (hasFilePreview(files[index - 1]!) || hasFilePreview(file))) {
 			lines.push("");
 		}
 		lines.push(`  └ ${formatPatchTarget(file.path, file.movePath, cwd)} ${renderCounts(file.added, file.removed)}`);
-		lines.push(...renderPreviewLines(file.lines, "    "));
+		lines.push(...renderFilePreview(file, "    "));
 	}
 
 	return lines.join("\n");
@@ -141,13 +142,16 @@ function buildFilePreview(action: ParsedPatchAction, cwd: string): FilePreview {
 	}
 
 	if (action.type === "delete") {
-		const deletedLines = readFileLines(action.path, cwd);
+		const removed = readFileLines(action.path, cwd).length;
 		return {
 			verb: "Deleted",
 			path: action.path,
 			added: 0,
-			removed: deletedLines.length,
-			lines: deletedLines.map((text, index) => ({ lineNumber: index + 1, marker: "-", text })),
+			removed,
+			// A Delete File action contains only the path. Showing every old line
+			// makes it look as though the model emitted a giant deletion hunk.
+			lines: [],
+			wholeFileDelete: true,
 		};
 	}
 
@@ -278,6 +282,27 @@ function formatPreviewLine(line: PreviewLine, lines: PreviewLine[]): string {
 	if (line.separator) return "        ...";
 	const numberWidth = Math.max(1, ...lines.map((entry) => String(entry.lineNumber).length));
 	return `    ${String(line.lineNumber).padStart(numberWidth, " ")} ${line.marker}${line.text}`;
+}
+
+function hasFilePreview(file: FilePreview): boolean {
+	return !file.wholeFileDelete && file.lines.length > 0;
+}
+
+function formatFilePreview(file: FilePreview, indent = ""): string[] {
+	if (file.wholeFileDelete) {
+		return [];
+	}
+	return file.lines.map((line) => {
+		const formatted = formatPreviewLine(line, file.lines);
+		return indent ? `${indent}${formatted.trimStart()}` : formatted;
+	});
+}
+
+function renderFilePreview(file: FilePreview, indent = ""): string[] {
+	if (file.wholeFileDelete) {
+		return [];
+	}
+	return renderPreviewLines(file.lines, indent);
 }
 
 function renderPreviewLines(lines: PreviewLine[], indent = ""): string[] {
