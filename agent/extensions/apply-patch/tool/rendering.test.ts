@@ -36,12 +36,57 @@ function fixture(lineEnding = "\n") {
 	return { cwd, patchText };
 }
 
+function numberedFixture(firstChangedLine: number, secondChangedLine: number) {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-apply-patch-render-overlap-"));
+	temporaryDirectories.push(cwd);
+	writeFileSync(join(cwd, "lines.txt"), Array.from({ length: 24 }, (_, index) => `line ${index + 1}`).join("\n") + "\n");
+	const patchText = [
+		"*** Begin Patch",
+		"*** Update File: lines.txt",
+		"@@",
+		`-line ${firstChangedLine}`,
+		`+line ${firstChangedLine} changed`,
+		"@@",
+		`-line ${secondChangedLine}`,
+		`+line ${secondChangedLine} changed`,
+		"*** End Patch",
+	].join("\n");
+	return { cwd, patchText };
+}
+
 const taggedTheme = {
 	fg: (role: string, text: string) => `<${role}>${text}</${role}>`,
 	bold: (text: string) => `<bold>${text}</bold>`,
 };
 
 describe("apply_patch terminal rendering", () => {
+	test("merges hunks whose surrounding context overlaps", () => {
+		const { cwd, patchText } = numberedFixture(5, 10);
+		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
+
+		expect(preview).not.toContain("...");
+		expect(preview.split("\n").filter((line) => line.endsWith("line 7"))).toHaveLength(1);
+		expect(preview).toContain("- 5 line 5");
+		expect(preview).toContain("+ 5 line 5 changed");
+		expect(preview).toContain("-10 line 10");
+		expect(preview).toContain("+10 line 10 changed");
+	});
+
+	test("merges hunks whose surrounding context ranges touch", () => {
+		const { cwd, patchText } = numberedFixture(3, 10);
+		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
+
+		expect(preview).not.toContain("...");
+		expect(preview.split("\n").filter((line) => line.endsWith("line 7"))).toHaveLength(1);
+	});
+
+	test("keeps a separator between hunks with a real context gap", () => {
+		const { cwd, patchText } = numberedFixture(3, 14);
+		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
+
+		expect(preview).toContain("...");
+	});
+
 	test("keeps cached previews ANSI-free and styles with the callback theme", () => {
 		const { cwd, patchText } = fixture("\r\n");
 		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);

@@ -10,6 +10,24 @@ interface PreviewLine {
 	separator?: boolean;
 }
 
+interface ResolvedUpdateSection {
+	lines: PreviewLine[];
+	sourceStart: number;
+	sourceLength: number;
+	contextStart: number;
+	contextEnd: number;
+	readingPatchedFile: boolean;
+	deltaBefore: number;
+	delta: number;
+}
+
+interface UpdateSectionGroup {
+	sections: ResolvedUpdateSection[];
+	contextStart: number;
+	contextEnd: number;
+	readingPatchedFile: boolean;
+}
+
 interface FilePreview {
 	verb: "Added" | "Deleted" | "Edited";
 	path: string;
@@ -171,13 +189,12 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 	}
 
 	const originalLines = readFileLines(action.path, cwd);
-	const renderedLines: PreviewLine[] = [];
+	const sections: ResolvedUpdateSection[] = [];
 	let added = 0;
 	let removed = 0;
 	let searchStart = 0;
 	let delta = 0;
 	let index = 0;
-	let renderedSectionCount = 0;
 
 	while (index < action.lines.length) {
 		const line = action.lines[index]!;
@@ -199,17 +216,12 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 		if (sectionLines.length === 0) {
 			continue;
 		}
-		if (renderedSectionCount > 0) {
-			renderedLines.push({ lineNumber: 0, marker: " ", text: "...", separator: true });
-		}
-		renderedSectionCount += 1;
 
-		const oldSequence = sectionLines
-			.map(normalizePatchLine)
+		const normalizedLines = sectionLines.map(normalizePatchLine);
+		const oldSequence = normalizedLines
 			.filter((entry) => entry.marker === " " || entry.marker === "-")
 			.map((entry) => entry.text);
-		const newSequence = sectionLines
-			.map(normalizePatchLine)
+		const newSequence = normalizedLines
 			.filter((entry) => entry.marker === " " || entry.marker === "+")
 			.map((entry) => entry.text);
 		let sectionStart = findMatchingSequence(originalLines, oldSequence, searchStart);
@@ -219,31 +231,95 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 			readingPatchedFile = sectionStart !== -1;
 		}
 		if (sectionStart === -1) sectionStart = searchStart;
-		let oldLineNumber = readingPatchedFile ? sectionStart + 1 - delta : sectionStart + 1;
-		let newLineNumber = readingPatchedFile ? sectionStart + 1 : sectionStart + 1 + delta;
 		const contextStart = Math.max(0, sectionStart - 3);
+		for (const entry of normalizedLines) {
+			if (entry.marker === "+") added += 1;
+			if (entry.marker === "-") removed += 1;
+		}
+		const sourceLength = readingPatchedFile ? newSequence.length : oldSequence.length;
+		const sectionDelta = normalizedLines.reduce((sum, entry) => {
+			const marker = entry.marker;
+			if (marker === "+") return sum + 1;
+			if (marker === "-") return sum - 1;
+			return sum;
+		}, 0);
+		sections.push({
+			lines: normalizedLines,
+			sourceStart: sectionStart,
+			sourceLength,
+			contextStart,
+			contextEnd: Math.min(originalLines.length, sectionStart + sourceLength + 3),
+			readingPatchedFile,
+			deltaBefore: delta,
+			delta: sectionDelta,
+		});
 
-		// Patch input often contains only the minimum matching text. Add the same
-		// surrounding context users get from native edit's unified diff preview.
-		for (let originalIndex = contextStart; originalIndex < sectionStart; originalIndex += 1) {
+		searchStart = sectionStart + sourceLength;
+		delta += sectionDelta;
+	}
+
+	const groups: UpdateSectionGroup[] = [];
+	for (const section of sections) {
+		const previous = groups.at(-1);
+		// Context ranges are half-open. Equality means the rendered ranges touch
+		// with no hidden source line between them, so they should also be one hunk.
+		if (
+			previous &&
+			previous.readingPatchedFile === section.readingPatchedFile &&
+			section.contextStart <= previous.contextEnd
+		) {
+			previous.sections.push(section);
+			previous.contextEnd = Math.max(previous.contextEnd, section.contextEnd);
+			continue;
+		}
+		groups.push({
+			sections: [section],
+			contextStart: section.contextStart,
+			contextEnd: section.contextEnd,
+			readingPatchedFile: section.readingPatchedFile,
+		});
+	}
+
+	const renderedLines: PreviewLine[] = [];
+	for (const [groupIndex, group] of groups.entries()) {
+		if (groupIndex > 0) {
+			renderedLines.push({ lineNumber: 0, marker: " ", text: "...", separator: true });
+		}
+		renderedLines.push(...renderUpdateSectionGroup(originalLines, group));
+	}
+
+	return { added, removed, lines: renderedLines };
+}
+
+function renderUpdateSectionGroup(originalLines: string[], group: UpdateSectionGroup): PreviewLine[] {
+	const renderedLines: PreviewLine[] = [];
+	let sourceIndex = group.contextStart;
+
+	for (const section of group.sections) {
+		const contextDelta = section.readingPatchedFile ? 0 : section.deltaBefore;
+		while (sourceIndex < section.sourceStart) {
 			renderedLines.push({
-				lineNumber: readingPatchedFile ? originalIndex + 1 : originalIndex + 1 + delta,
+				lineNumber: sourceIndex + 1 + contextDelta,
 				marker: " ",
-				text: originalLines[originalIndex]!,
+				text: originalLines[sourceIndex]!,
 			});
+			sourceIndex += 1;
 		}
 
-		for (const rawLine of sectionLines) {
-			const entry = normalizePatchLine(rawLine);
+		let oldLineNumber = section.readingPatchedFile
+			? section.sourceStart + 1 - section.deltaBefore
+			: section.sourceStart + 1;
+		let newLineNumber = section.readingPatchedFile
+			? section.sourceStart + 1
+			: section.sourceStart + 1 + section.deltaBefore;
+		for (const entry of section.lines) {
 			if (entry.marker === "+") {
-				added += 1;
 				renderedLines.push({ lineNumber: newLineNumber, marker: "+", text: entry.text });
 				newLineNumber += 1;
 				continue;
 			}
 
 			if (entry.marker === "-") {
-				removed += 1;
 				renderedLines.push({ lineNumber: oldLineNumber, marker: "-", text: entry.text });
 				oldLineNumber += 1;
 				continue;
@@ -254,27 +330,21 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 			newLineNumber += 1;
 		}
 
-		const consumedSourceLines = readingPatchedFile ? newSequence.length : oldSequence.length;
-		const sectionDelta = sectionLines.reduce((sum, rawLine) => {
-			const marker = normalizePatchLine(rawLine).marker;
-			if (marker === "+") return sum + 1;
-			if (marker === "-") return sum - 1;
-			return sum;
-		}, 0);
-		const contextEnd = Math.min(originalLines.length, sectionStart + consumedSourceLines + 3);
-		for (let originalIndex = sectionStart + consumedSourceLines; originalIndex < contextEnd; originalIndex += 1) {
-			renderedLines.push({
-				lineNumber: readingPatchedFile ? originalIndex + 1 : originalIndex + 1 + delta + sectionDelta,
-				marker: " ",
-				text: originalLines[originalIndex]!,
-			});
-		}
-
-		searchStart = sectionStart + consumedSourceLines;
-		delta += sectionDelta;
+		sourceIndex = section.sourceStart + section.sourceLength;
 	}
 
-	return { added, removed, lines: renderedLines };
+	const finalSection = group.sections.at(-1)!;
+	const finalDelta = finalSection.readingPatchedFile ? 0 : finalSection.deltaBefore + finalSection.delta;
+	while (sourceIndex < group.contextEnd) {
+		renderedLines.push({
+			lineNumber: sourceIndex + 1 + finalDelta,
+			marker: " ",
+			text: originalLines[sourceIndex]!,
+		});
+		sourceIndex += 1;
+	}
+
+	return renderedLines;
 }
 
 function formatPreviewLine(line: PreviewLine, lines: PreviewLine[]): string {
