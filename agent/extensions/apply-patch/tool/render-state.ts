@@ -132,6 +132,18 @@ interface RenderTheme {
 	bold(text: string): string;
 }
 
+function stylePreviewLines(text: string, theme: RenderTheme): string {
+	return text.split("\n").map((line, index) => {
+		if (index === 0 || line.trim().length === 0 || /^\s*└ /.test(line)) return line;
+		if (/^\s*-\s*\d+\s/.test(line)) return theme.fg("toolDiffRemoved", line);
+		if (/^\s*\+\s*\d+\s/.test(line)) return theme.fg("toolDiffAdded", line);
+		// Remaining body rows are context lines or section separators. File
+		// headers were excluded above, so coloring the whole row cannot affect
+		// clickable paths or count parsing.
+		return theme.fg("toolDiffContext", line);
+	}).join("\n");
+}
+
 function clickablePath(display: string, path: string, cwd: string): string {
 	const absolutePath = isAbsolute(path) ? path : resolve(cwd, path);
 	return `\u001b]8;;${pathToFileURL(absolutePath).href}\u0007${display}\u001b]8;;\u0007`;
@@ -287,7 +299,7 @@ export function renderApplyPatchCallFromState(args: { input?: unknown | undefine
 		: status === "failed"
 			? renderFailedCall(baseText, { fg: (_role, text) => text }, cached?.failedTargets)
 			: baseText;
-	const styled = styleHeaders(statusText, effectivePatchText, cwd, theme, status, cached?.failedTargets);
+	const styled = styleHeaders(stylePreviewLines(statusText, theme), effectivePatchText, cwd, theme, status, cached?.failedTargets);
 	const lines = styled.split("\n");
 	lines[0] = `${lines[0]}${tokenSuffix(context?.outputTokens, theme)}`;
 	return lines.join("\n");

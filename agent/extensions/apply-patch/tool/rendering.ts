@@ -1,5 +1,4 @@
 import { isAbsolute, relative } from "node:path";
-import { renderDiff } from "@earendil-works/pi-coding-agent";
 import { openFileAtPath } from "../patch/paths.ts";
 import { parsePatchActions } from "../patch/parser.ts";
 import type { ParsedPatchAction } from "../patch/types.ts";
@@ -311,23 +310,15 @@ function renderPreviewLines(lines: PreviewLine[], indent = ""): string[] {
 	}
 
 	const numberWidth = Math.max(1, ...lines.map((entry) => String(entry.lineNumber).length));
-	const diffText = lines
-		.map((line) => line.separator ? "     ..." : `${line.marker}${String(line.lineNumber).padStart(numberWidth, " ")} ${line.text}`)
-		.join("\n");
-	try {
-		// renderDiff applies inverse-video word highlighting when it receives an
-		// adjacent removed/added pair. Inside the tool's success/error Box that
-		// inverts the row background into large black blocks, especially when a
-		// long line wraps. Render each row independently to retain line-level
-		// red/green coloring without enabling the incompatible intra-line mode.
-		return diffText.split("\n")
-			.map((line) => renderDiff(line))
-			.join("\n")
-			.split("\n")
-			.map((line) => `${indent}${line}`);
-	} catch {
-		return lines.map((line) => `${indent}${formatPreviewLine(line, lines).trimStart()}`);
-	}
+	// Keep cached previews semantic and ANSI-free. Styling them through
+	// renderDiff() is unsafe inside a background-filled Box: intra-line inverse
+	// spans can leave inverse active while Text pads a logical line, producing
+	// the large black rectangles seen in Windows Terminal. It also bakes the
+	// global theme into render-state caches. render-state.ts applies simple
+	// line-level colors with the renderer callback's current theme instead.
+	return lines.map((line) => line.separator
+		? `${indent}     ...`
+		: `${indent}${line.marker}${String(line.lineNumber).padStart(numberWidth, " ")} ${line.text}`);
 }
 
 function normalizePatchLine(rawLine: string): PreviewLine {
