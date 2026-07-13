@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parsePatchActions } from "./patch/parser.ts";
 import type { ExecutePatchResult } from "./patch/types.ts";
@@ -13,6 +13,7 @@ import {
   markApplyPatchPartialFailure,
   renderApplyPatchCallFromState,
   setApplyPatchRenderState,
+  type ApplyPatchSettledStatus,
 } from "./tool/render-state.ts";
 
 const TOOL_NAME = "apply_patch";
@@ -50,6 +51,11 @@ interface PatchDetails {
   status: "success" | "partial_failure";
   result: ExecutePatchResult;
   error?: string;
+}
+
+interface ApplyPatchRendererState {
+  callComponent?: Box;
+  settledStatus?: ApplyPatchSettledStatus;
 }
 
 function isCodexLike(ctx: ExtensionContext): boolean {
@@ -134,12 +140,47 @@ function textContent(result: { content?: Array<{ type: string; text?: string }> 
   return result.content?.find((item) => item.type === "text")?.text ?? "";
 }
 
+function settledStatus(details: PatchDetails | undefined, isError: boolean): ApplyPatchSettledStatus {
+  if (isError) return "failed";
+  return details?.status === "partial_failure" ? "partial_failure" : "success";
+}
+
+function renderCallComponent(
+  component: Box,
+  args: { input?: unknown },
+  theme: any,
+  context: any,
+  status?: ApplyPatchSettledStatus,
+): Box {
+  const rendered = renderApplyPatchCallFromState(args, theme, {
+    ...context,
+    showCollapsedDiff: true,
+    outputTokens: streamedTokenEstimate(context.toolCallId),
+    settledStatus: status,
+  });
+
+  component.setBgFn(status === "failed" || context.isError
+    ? (text: string) => theme.bg("toolErrorBg", text)
+    : status === "success" || status === "partial_failure" || context.argsComplete
+        ? (text: string) => theme.bg("toolSuccessBg", text)
+        : (text: string) => theme.bg("toolPendingBg", text));
+  component.clear();
+  const [header = "", ...diffLines] = rendered.split("\n");
+  component.addChild(new Text(header, 0, 0));
+  if (diffLines.length > 0) {
+    component.addChild(new Spacer(1));
+    component.addChild(new Text(diffLines.join("\n"), 0, 0));
+  }
+  return component;
+}
+
 export default function applyPatchExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
     label: "apply_patch",
     description: "Patch files.",
     parameters: PARAMETERS,
+    renderShell: "self",
     prepareArguments,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("apply_patch aborted");
@@ -175,14 +216,25 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
       }
     },
     renderCall(args, theme, context) {
-      return new Text(renderApplyPatchCallFromState(args, theme, {
-        ...context,
-        showCollapsedDiff: true,
-        outputTokens: streamedTokenEstimate(context.toolCallId),
-      }), 0, 0);
+      const state = context.state as ApplyPatchRendererState;
+      const component = context.lastComponent instanceof Box
+        ? context.lastComponent
+        : state.callComponent ?? new Box(1, 1, (text: string) => text);
+      state.callComponent = component;
+
+      // Match native edit's component structure: its header and diff are
+      // separate Text children inside a self-rendered Box. Keeping the OSC 8
+      // file link out of the diff Text also prevents ANSI state from leaking
+      // into wrapped diff lines and breaking the background fill.
+      return renderCallComponent(component, args, theme, context, state.settledStatus);
     },
     renderResult(result, _options, theme, context) {
       const details = result.details as PatchDetails | undefined;
+      const state = context.state as ApplyPatchRendererState;
+      state.settledStatus = settledStatus(details, context.isError);
+      if (state.callComponent) {
+        renderCallComponent(state.callComponent, context.args, theme, context, state.settledStatus);
+      }
       if (details?.status === "success") return new Container();
       const text = textContent(result);
       if (!text) return new Container();

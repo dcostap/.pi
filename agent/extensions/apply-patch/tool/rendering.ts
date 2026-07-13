@@ -1,5 +1,5 @@
 import { isAbsolute, relative } from "node:path";
-import { keyHint, renderDiff } from "@earendil-works/pi-coding-agent";
+import { renderDiff } from "@earendil-works/pi-coding-agent";
 import { openFileAtPath } from "../patch/paths.ts";
 import { parsePatchActions } from "../patch/parser.ts";
 import type { ParsedPatchAction } from "../patch/types.ts";
@@ -8,6 +8,7 @@ interface PreviewLine {
 	lineNumber: number;
 	marker: " " | "+" | "-";
 	text: string;
+	separator?: boolean;
 }
 
 interface FilePreview {
@@ -17,14 +18,6 @@ interface FilePreview {
 	added: number;
 	removed: number;
 	lines: PreviewLine[];
-}
-
-function expandHint(): string {
-	try {
-		return keyHint("app.tools.expand", "to expand");
-	} catch {
-		return "ctrl+o to expand";
-	}
 }
 
 export function formatApplyPatchSummary(patchText: string, cwd = process.cwd()): string {
@@ -95,19 +88,8 @@ export function formatApplyPatchCall(patchText: string, cwd = process.cwd()): st
 	return lines.join("\n");
 }
 
-// Keep enough of the patch visible to be useful without requiring an immediate expand.
-// Native edit renders a sizeable diff preview; apply_patch should behave similarly.
-export function formatApplyPatchCollapsedDiff(patchText: string, cwd = process.cwd(), maxPreviewLines = 30): string {
-	const full = renderApplyPatchCall(patchText, cwd);
-	if (!full) return formatApplyPatchSummary(patchText, cwd);
-	const fullLines = full.split("\n");
-	const visibleLines = fullLines.slice(0, maxPreviewLines + 1);
-	const remaining = fullLines.length - visibleLines.length;
-	const lines = [...visibleLines];
-	if (remaining > 0) {
-		lines.push(`    ... (${remaining} more lines, ${expandHint()})`);
-	}
-	return lines.join("\n");
+export function formatApplyPatchCollapsedDiff(patchText: string, cwd = process.cwd()): string {
+	return renderApplyPatchCall(patchText, cwd) || formatApplyPatchSummary(patchText, cwd);
 }
 
 export function renderApplyPatchCall(patchText: string, cwd = process.cwd()): string {
@@ -140,7 +122,7 @@ export function renderApplyPatchCall(patchText: string, cwd = process.cwd()): st
 			lines.push("");
 		}
 		lines.push(`  └ ${formatPatchTarget(file.path, file.movePath, cwd)} ${renderCounts(file.added, file.removed)}`);
-		lines.push(...renderPreviewLines(file.lines));
+		lines.push(...renderPreviewLines(file.lines, "    "));
 	}
 
 	return lines.join("\n");
@@ -192,6 +174,7 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 	let searchStart = 0;
 	let delta = 0;
 	let index = 0;
+	let renderedSectionCount = 0;
 
 	while (index < action.lines.length) {
 		const line = action.lines[index]!;
@@ -213,21 +196,35 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 		if (sectionLines.length === 0) {
 			continue;
 		}
+		if (renderedSectionCount > 0) {
+			renderedLines.push({ lineNumber: 0, marker: " ", text: "...", separator: true });
+		}
+		renderedSectionCount += 1;
 
 		const oldSequence = sectionLines
 			.map(normalizePatchLine)
 			.filter((entry) => entry.marker === " " || entry.marker === "-")
 			.map((entry) => entry.text);
-		const sectionStart = findMatchingSequence(originalLines, oldSequence, searchStart);
-		let oldLineNumber = sectionStart + 1;
-		let newLineNumber = sectionStart + 1 + delta;
+		const newSequence = sectionLines
+			.map(normalizePatchLine)
+			.filter((entry) => entry.marker === " " || entry.marker === "+")
+			.map((entry) => entry.text);
+		let sectionStart = findMatchingSequence(originalLines, oldSequence, searchStart);
+		let readingPatchedFile = false;
+		if (sectionStart === -1) {
+			sectionStart = findMatchingSequence(originalLines, newSequence, searchStart);
+			readingPatchedFile = sectionStart !== -1;
+		}
+		if (sectionStart === -1) sectionStart = searchStart;
+		let oldLineNumber = readingPatchedFile ? sectionStart + 1 - delta : sectionStart + 1;
+		let newLineNumber = readingPatchedFile ? sectionStart + 1 : sectionStart + 1 + delta;
 		const contextStart = Math.max(0, sectionStart - 3);
 
 		// Patch input often contains only the minimum matching text. Add the same
 		// surrounding context users get from native edit's unified diff preview.
 		for (let originalIndex = contextStart; originalIndex < sectionStart; originalIndex += 1) {
 			renderedLines.push({
-				lineNumber: originalIndex + 1 + delta,
+				lineNumber: readingPatchedFile ? originalIndex + 1 : originalIndex + 1 + delta,
 				marker: " ",
 				text: originalLines[originalIndex]!,
 			});
@@ -254,23 +251,23 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 			newLineNumber += 1;
 		}
 
-		const consumedOldLines = oldSequence.length;
+		const consumedSourceLines = readingPatchedFile ? newSequence.length : oldSequence.length;
 		const sectionDelta = sectionLines.reduce((sum, rawLine) => {
 			const marker = normalizePatchLine(rawLine).marker;
 			if (marker === "+") return sum + 1;
 			if (marker === "-") return sum - 1;
 			return sum;
 		}, 0);
-		const contextEnd = Math.min(originalLines.length, sectionStart + consumedOldLines + 3);
-		for (let originalIndex = sectionStart + consumedOldLines; originalIndex < contextEnd; originalIndex += 1) {
+		const contextEnd = Math.min(originalLines.length, sectionStart + consumedSourceLines + 3);
+		for (let originalIndex = sectionStart + consumedSourceLines; originalIndex < contextEnd; originalIndex += 1) {
 			renderedLines.push({
-				lineNumber: originalIndex + 1 + delta + sectionDelta,
+				lineNumber: readingPatchedFile ? originalIndex + 1 : originalIndex + 1 + delta + sectionDelta,
 				marker: " ",
 				text: originalLines[originalIndex]!,
 			});
 		}
 
-		searchStart = sectionStart + oldSequence.length;
+		searchStart = sectionStart + consumedSourceLines;
 		delta += sectionDelta;
 	}
 
@@ -278,25 +275,26 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 }
 
 function formatPreviewLine(line: PreviewLine, lines: PreviewLine[]): string {
+	if (line.separator) return "        ...";
 	const numberWidth = Math.max(1, ...lines.map((entry) => String(entry.lineNumber).length));
 	return `    ${String(line.lineNumber).padStart(numberWidth, " ")} ${line.marker}${line.text}`;
 }
 
-function renderPreviewLines(lines: PreviewLine[]): string[] {
+function renderPreviewLines(lines: PreviewLine[], indent = ""): string[] {
 	if (lines.length === 0) {
 		return [];
 	}
 
 	const numberWidth = Math.max(1, ...lines.map((entry) => String(entry.lineNumber).length));
 	const diffText = lines
-		.map((line) => `${line.marker}${String(line.lineNumber).padStart(numberWidth, " ")} ${line.text}`)
+		.map((line) => line.separator ? "     ..." : `${line.marker}${String(line.lineNumber).padStart(numberWidth, " ")} ${line.text}`)
 		.join("\n");
 	try {
 		return renderDiff(diffText)
 			.split("\n")
-			.map((line) => `    ${line}`);
+			.map((line) => `${indent}${line}`);
 	} catch {
-		return lines.map((line) => formatPreviewLine(line, lines));
+		return lines.map((line) => `${indent}${formatPreviewLine(line, lines).trimStart()}`);
 	}
 }
 
@@ -329,7 +327,7 @@ function findMatchingSequence(lines: string[], context: string[], start: number)
 		return trim;
 	}
 
-	return start;
+	return -1;
 }
 
 function findSequence(lines: string[], context: string[], start: number, normalize: (value: string) => string): number {

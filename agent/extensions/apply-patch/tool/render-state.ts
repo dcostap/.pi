@@ -125,6 +125,8 @@ function renderFailedCall(text: string, theme: { fg(role: string, text: string):
 	return lines.map((line, index) => failedLineIndexes.has(index) || index === 0 ? theme.fg("error", line) : line).join("\n");
 }
 
+export type ApplyPatchSettledStatus = "success" | "partial_failure" | "failed";
+
 interface RenderTheme {
 	fg(role: string, text: string): string;
 	bold(text: string): string;
@@ -141,7 +143,7 @@ function styledCounts(suffix: string, theme: RenderTheme): string {
 	return ` (${theme.fg("toolDiffAdded", `+${match[1]}`)} ${theme.fg("toolDiffRemoved", `-${match[2]}`)})`;
 }
 
-function styleHeaders(text: string, patchText: string, cwd: string, theme: RenderTheme, status: ApplyPatchRenderState["status"]): string {
+function styleHeaders(text: string, patchText: string, cwd: string, theme: RenderTheme, status: ApplyPatchRenderState["status"] | ApplyPatchSettledStatus): string {
 	let actions;
 	try {
 		actions = parsePatchActions({ text: patchText });
@@ -189,11 +191,18 @@ function pendingHeader(patchText: string, cwd: string, tokens: number | undefine
 	return `${text}${tokenSuffix(tokens, theme)}`;
 }
 
-export function renderApplyPatchCallFromState(args: { input?: unknown | undefined }, theme: RenderTheme, context?: { toolCallId?: string | undefined; cwd?: string | undefined; expanded?: boolean | undefined; argsComplete?: boolean | undefined; showCollapsedDiff?: boolean | undefined; outputTokens?: number | undefined }): string {
+export function renderApplyPatchCallFromState(args: { input?: unknown | undefined }, theme: RenderTheme, context?: { toolCallId?: string | undefined; cwd?: string | undefined; expanded?: boolean | undefined; argsComplete?: boolean | undefined; showCollapsedDiff?: boolean | undefined; outputTokens?: number | undefined; settledStatus?: ApplyPatchSettledStatus | undefined }): string {
 	const patchText = typeof args.input === "string" ? args.input : "";
 	const cached = context?.toolCallId ? applyPatchRenderStates.get(context.toolCallId) : undefined;
 	const cwd = context?.cwd ?? cached?.cwd ?? process.cwd();
 	const pending = pendingHeader(patchText, cwd, context?.outputTokens, theme);
+	// Native edit waits for complete arguments before constructing its preview.
+	// Rendering a growing diff on every streamed JSON delta leaves stale ANSI
+	// background cells behind in terminals when hunks wrap or change height.
+	// Historical tool rows are rebuilt from the stored call and result without
+	// replaying setArgsComplete(). A settled result is therefore also proof that
+	// the persisted arguments are complete.
+	if (context?.argsComplete === false && !context.settledStatus) return pending;
 	if (patchText.trim().length === 0) return pending;
 	const effectivePatchText = cached?.patchText ?? patchText;
 	const baseText = context?.expanded
@@ -205,7 +214,7 @@ export function renderApplyPatchCallFromState(args: { input?: unknown | undefine
 		if (cached?.status === "failed") return theme.fg("error", "• Edit failed");
 		return pending;
 	}
-	const status = cached?.status ?? "pending";
+	const status = context?.settledStatus ?? cached?.status ?? "pending";
 	const statusText = status === "partial_failure"
 		? renderPartialFailureCall(baseText, { fg: (_role, text) => text }, cached?.failedTargets)
 		: status === "failed"
