@@ -19,6 +19,7 @@ import {
 const TOOL_NAME = "apply_patch";
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const BINARY = join(ROOT, "bin", `${process.platform}-${process.arch}`, process.platform === "win32" ? "apply_patch.exe" : "apply_patch");
+const CODEX_APPLY_PATCH_GUIDANCE = "Use `apply_patch` for local file edits. Do not create or edit files with `cat` or other shell write tricks. Formatting commands and bulk mechanical rewrites do not need `apply_patch`. Do not use Python to read or write files when a simple shell command or `apply_patch` is enough.";
 
 const PARAMETERS = Type.Object({
   input: Type.String({
@@ -178,7 +179,8 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
     label: "apply_patch",
-    description: "Patch files.",
+    description: "Use the `apply_patch` tool to edit files.",
+    promptGuidelines: [CODEX_APPLY_PATCH_GUIDANCE],
     parameters: PARAMETERS,
     renderShell: "self",
     prepareArguments,
