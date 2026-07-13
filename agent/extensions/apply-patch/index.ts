@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parsePatchActions } from "./patch/parser.ts";
-import type { ExecutePatchResult } from "./patch/types.ts";
+import type { ExecutePatchResult, ParsedPatchAction } from "./patch/types.ts";
 import {
   clearApplyPatchRenderState,
   markApplyPatchFailure,
@@ -15,6 +15,7 @@ import {
   setApplyPatchRenderState,
   type ApplyPatchSettledStatus,
 } from "./tool/render-state.ts";
+import { formatPatchTarget } from "./tool/rendering.ts";
 
 const TOOL_NAME = "apply_patch";
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -52,6 +53,9 @@ interface PatchDetails {
   status: "success" | "partial_failure";
   result: ExecutePatchResult;
   error?: string;
+  attemptedFiles?: string[];
+  appliedFiles?: string[];
+  failedFiles?: string[];
 }
 
 interface ApplyPatchRendererState {
@@ -137,6 +141,68 @@ function changed(result: ExecutePatchResult): boolean {
   return result.changedFiles.length > 0 || result.createdFiles.length > 0 || result.deletedFiles.length > 0 || result.movedFiles.length > 0;
 }
 
+function pathKey(cwd: string, path: string): string {
+  const absolute = isAbsolute(path) ? path : resolve(cwd, path);
+  const normalized = absolute.replace(/\\/g, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function classifyActions(
+  actions: ParsedPatchAction[],
+  result: ExecutePatchResult,
+  cwd: string,
+): { attemptedFiles: string[]; appliedFiles: string[]; failedFiles: string[] } {
+  const changedPaths = new Set(result.changedFiles.map((path) => pathKey(cwd, path)));
+  const attemptedFiles: string[] = [];
+  const appliedFiles: string[] = [];
+  const failedFiles: string[] = [];
+
+  for (const action of actions) {
+    const target = formatPatchTarget(action.path, action.movePath, cwd);
+    const mutationPaths = action.movePath ? [action.path, action.movePath] : [action.path];
+    const applied = mutationPaths.every((path) => changedPaths.has(pathKey(cwd, path)));
+    attemptedFiles.push(target);
+    (applied ? appliedFiles : failedFiles).push(target);
+  }
+
+  return { attemptedFiles, appliedFiles, failedFiles };
+}
+
+function dedupeRepeatedError(message: string): string {
+  // Some lower-level errors arrive as "message: message" after being wrapped.
+  // Keep one copy for both the model result and the expanded UI details.
+  let separator = message.indexOf(": ");
+  while (separator !== -1) {
+    const first = message.slice(0, separator);
+    const second = message.slice(separator + 2);
+    if (first === second) return first;
+    separator = message.indexOf(": ", separator + 2);
+  }
+  return message;
+}
+
+function partialFailureText(details: PatchDetails, rawText: string, expanded: boolean, theme: any): string {
+  const attempted = details.attemptedFiles?.length ?? 0;
+  const applied = details.appliedFiles?.length ?? details.result.changedFiles.length;
+  const countText = attempted > 0
+    ? `${applied} of ${attempted} ${attempted === 1 ? "file" : "files"} changed`
+    : `${details.result.changedFiles.length} ${details.result.changedFiles.length === 1 ? "file was" : "files were"} changed`;
+  const failedFile = details.failedFiles?.[0];
+  const error = dedupeRepeatedError(details.error?.trim() || rawText.replace(/^Patch partially applied:\s*/, "").trim());
+  const expectedLinesMissing = /Failed to find (?:expected lines|context)\b/i.test(error);
+  const reason = expectedLinesMissing
+    ? `Expected lines no longer matched${failedFile ? ` in ${failedFile}` : " the file"}.`
+    : error.split(/\r?\n/, 1)[0] || "One or more edits could not be applied.";
+  const lines = [
+    `${theme.fg("warning", "⚠ Partially applied")}${theme.fg("muted", ` — ${countText}`)}`,
+    theme.fg("dim", `  ${reason}`),
+  ];
+  if (expanded && error) {
+    lines.push("", ...error.split(/\r?\n/).map((line) => theme.fg("dim", line)));
+  }
+  return lines.join("\n");
+}
+
 function textContent(result: { content?: Array<{ type: string; text?: string }> }): string {
   return result.content?.find((item) => item.type === "text")?.text ?? "";
 }
@@ -162,7 +228,9 @@ function renderCallComponent(
 
   component.setBgFn(status === "failed" || context.isError
     ? (text: string) => theme.bg("toolErrorBg", text)
-    : status === "success" || status === "partial_failure" || context.argsComplete
+    : status === "partial_failure"
+      ? (text: string) => theme.bg("toolPendingBg", text)
+      : status === "success" || context.argsComplete
         ? (text: string) => theme.bg("toolSuccessBg", text)
         : (text: string) => theme.bg("toolPendingBg", text));
   component.clear();
@@ -190,7 +258,7 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
       if (typeof input !== "string") throw new Error("apply_patch requires a string input");
 
       // Parse before spawning so malformed patches fail without touching disk and can still render cleanly.
-      parsePatchActions({ text: input });
+      const actions = parsePatchActions({ text: input });
       setApplyPatchRenderState(toolCallId, input, ctx.cwd);
 
       try {
@@ -202,12 +270,18 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
           };
         }
 
-        const message = response.error?.trim() || "apply_patch failed";
+        const message = dedupeRepeatedError(response.error?.trim() || "apply_patch failed");
         if (changed(response.result)) {
-          markApplyPatchPartialFailure(toolCallId);
+          const actionStatus = classifyActions(actions, response.result, ctx.cwd);
+          markApplyPatchPartialFailure(toolCallId, actionStatus.failedFiles);
           return {
             content: [{ type: "text" as const, text: `Patch partially applied: ${message}` }],
-            details: { status: "partial_failure", result: response.result, error: message } satisfies PatchDetails,
+            details: {
+              status: "partial_failure",
+              result: response.result,
+              error: message,
+              ...actionStatus,
+            } satisfies PatchDetails,
           };
         }
         markApplyPatchFailure(toolCallId, "failed");
@@ -230,16 +304,42 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
       // into wrapped diff lines and breaking the background fill.
       return renderCallComponent(component, args, theme, context, state.settledStatus);
     },
-    renderResult(result, _options, theme, context) {
-      const details = result.details as PatchDetails | undefined;
+    renderResult(result, options, theme, context) {
+      let details = result.details as PatchDetails | undefined;
       const state = context.state as ApplyPatchRendererState;
+      if (
+        details?.status === "partial_failure" &&
+        !details.attemptedFiles &&
+        typeof context.args.input === "string"
+      ) {
+        try {
+          details = {
+            ...details,
+            ...classifyActions(parsePatchActions({ text: context.args.input }), details.result, context.cwd),
+          };
+        } catch {
+          // Older session entries may not contain enough detail to classify each file.
+        }
+      }
       state.settledStatus = settledStatus(details, context.isError);
+      if (details?.status === "partial_failure" && typeof context.args.input === "string") {
+        setApplyPatchRenderState(
+          context.toolCallId,
+          context.args.input,
+          context.cwd,
+          "partial_failure",
+          details.failedFiles,
+        );
+      }
       if (state.callComponent) {
         renderCallComponent(state.callComponent, context.args, theme, context, state.settledStatus);
       }
       if (details?.status === "success") return new Container();
       const text = textContent(result);
       if (!text) return new Container();
+      if (details?.status === "partial_failure") {
+        return new Text(partialFailureText(details, text, options.expanded, theme), 0, 0);
+      }
       return new Text(theme.fg(context.isError ? "error" : "warning", text), 0, 0);
     },
   });

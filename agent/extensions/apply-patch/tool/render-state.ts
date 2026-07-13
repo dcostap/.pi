@@ -147,7 +147,14 @@ function actionLabel(action: { type: string }, theme: RenderTheme): string {
 	return action.type === "delete" ? `${theme.fg("toolDiffRemoved", "DELETED")} ` : "";
 }
 
-function styleHeaders(text: string, patchText: string, cwd: string, theme: RenderTheme, status: ApplyPatchRenderState["status"] | ApplyPatchSettledStatus): string {
+function styleHeaders(
+	text: string,
+	patchText: string,
+	cwd: string,
+	theme: RenderTheme,
+	status: ApplyPatchRenderState["status"] | ApplyPatchSettledStatus,
+	failedTargets?: string[],
+): string {
 	let actions;
 	try {
 		actions = parsePatchActions({ text: patchText });
@@ -155,15 +162,24 @@ function styleHeaders(text: string, patchText: string, cwd: string, theme: Rende
 		return text;
 	}
 	const lines = text.split("\n");
-	const titleRole = status === "failed" ? "error" : status === "partial_failure" ? "warning" : "toolTitle";
+	const titleRole = status === "failed" ? "error" : "toolTitle";
 	const title = theme.fg(titleRole, theme.bold("apply_patch"));
+	const outcomeLabel = (target: string): string => {
+		if (status !== "partial_failure") return "";
+		return failedTargets?.includes(target)
+			? theme.fg("error", "! ")
+			: theme.fg("success", "✓ ");
+	};
+	const failureSuffix = (target: string): string => status === "partial_failure" && failedTargets?.includes(target)
+		? theme.fg("muted", " — not applied")
+		: "";
 
 	if (actions.length === 1) {
 		const action = actions[0]!;
 		const suffix = lines[0]?.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
 		const linkTarget = action.movePath ?? action.path;
-		lines[0] = `${title} ${actionLabel(action, theme)}${theme.fg("accent", clickablePath(target, linkTarget, cwd))}${styledCounts(suffix, theme)}`;
+		lines[0] = `${title} ${outcomeLabel(target)}${actionLabel(action, theme)}${theme.fg("accent", clickablePath(target, linkTarget, cwd))}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
 		return lines.join("\n");
 	}
 
@@ -177,7 +193,7 @@ function styleHeaders(text: string, patchText: string, cwd: string, theme: Rende
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
 		const linkTarget = action.movePath ?? action.path;
 		const linked = theme.fg("accent", clickablePath(target, linkTarget, cwd));
-		lines[index] = `  └ ${actionLabel(action, theme)}${linked}${styledCounts(suffix, theme)}`;
+		lines[index] = `  └ ${outcomeLabel(target)}${actionLabel(action, theme)}${linked}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
 	}
 	return lines.join("\n");
 }
@@ -271,7 +287,7 @@ export function renderApplyPatchCallFromState(args: { input?: unknown | undefine
 		: status === "failed"
 			? renderFailedCall(baseText, { fg: (_role, text) => text }, cached?.failedTargets)
 			: baseText;
-	const styled = styleHeaders(statusText, effectivePatchText, cwd, theme, status);
+	const styled = styleHeaders(statusText, effectivePatchText, cwd, theme, status, cached?.failedTargets);
 	const lines = styled.split("\n");
 	lines[0] = `${lines[0]}${tokenSuffix(context?.outputTokens, theme)}`;
 	return lines.join("\n");
