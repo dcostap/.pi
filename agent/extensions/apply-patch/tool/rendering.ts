@@ -315,7 +315,14 @@ function renderPreviewLines(lines: PreviewLine[], indent = ""): string[] {
 		.map((line) => line.separator ? "     ..." : `${line.marker}${String(line.lineNumber).padStart(numberWidth, " ")} ${line.text}`)
 		.join("\n");
 	try {
-		return renderDiff(diffText)
+		// renderDiff applies inverse-video word highlighting when it receives an
+		// adjacent removed/added pair. Inside the tool's success/error Box that
+		// inverts the row background into large black blocks, especially when a
+		// long line wraps. Render each row independently to retain line-level
+		// red/green coloring without enabling the incompatible intra-line mode.
+		return diffText.split("\n")
+			.map((line) => renderDiff(line))
+			.join("\n")
 			.split("\n")
 			.map((line) => `${indent}${line}`);
 	} catch {
