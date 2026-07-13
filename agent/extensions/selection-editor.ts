@@ -130,6 +130,49 @@ class SelectionEditor extends CustomEditor {
 		}
 	}
 
+	/**
+	 * Pi transfers only getText() when installing a custom editor. If input was
+	 * pasted into the default editor during startup, that text can therefore
+	 * arrive here as a marker while ctx.ui.getEditorText() still has the expanded
+	 * value. Reattach the hidden content without changing the visible prompt.
+	 */
+	restoreTransferredText(expandedText: string): void {
+		const rawText = this.getText();
+		if (rawText === expandedText) return;
+
+		const markers = [...rawText.matchAll(/\[paste #(\d+)(?: \+\d+ lines| \d+ chars)?\]/g)];
+		if (markers.length === 1) {
+			const marker = markers[0]!;
+			const markerOffset = marker.index ?? 0;
+			const prefix = rawText.slice(0, markerOffset);
+			const suffix = rawText.slice(markerOffset + marker[0].length);
+			const contentEnd = expandedText.length - suffix.length;
+
+			if (
+				expandedText.startsWith(prefix) &&
+				expandedText.endsWith(suffix) &&
+				contentEnd >= prefix.length
+			) {
+				const pasteId = Number(marker[1]);
+				const pasteContent = expandedText.slice(prefix.length, contentEnd);
+				this.i.pastes.set(pasteId, pasteContent);
+				this.i.pasteCounter = Math.max(this.i.pasteCounter, pasteId);
+				this.tui.requestRender();
+				return;
+			}
+		}
+
+		// Multiple markers cannot be separated unambiguously from expanded text.
+		// Preserve the exact content as one paste instead of risking silent loss.
+		super.setText("");
+		const undoStack = (this as unknown as { undoStack?: { clear(): void } }).undoStack;
+		undoStack?.clear();
+		this.markerUndoStack.length = 0;
+		this.redoStack.length = 0;
+		this.i.handlePaste(expandedText);
+		this.tui.requestRender();
+	}
+
 	private decodeTmuxPasteControls(text: string): string {
 		return text.replace(/\x1b\[(\d+);5u/g, (match, code: string) => {
 			const codePoint = Number(code);
@@ -965,10 +1008,14 @@ export default function (pi: ExtensionAPI) {
 	let activeEditor: SelectionEditor | null = null;
 
 	pi.on("session_start", (_event, ctx) => {
+		// The TUI accepts input before extension session_start handlers finish. Capture
+		// the expanded value before Pi copies only the collapsed text into our editor.
+		const expandedTextBeforeSwap = ctx.ui.getEditorText();
 		ctx.ui.setEditorComponent((tui, theme, kb) => {
 			activeEditor = new SelectionEditor(tui, theme, kb);
 			return activeEditor;
 		});
+		activeEditor?.restoreTransferredText(expandedTextBeforeSwap);
 		ctx.ui.notify("Selection editor loaded", "info");
 	});
 

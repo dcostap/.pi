@@ -1,6 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 
+const TUI_CAPTURE_WIDGET_ID = "pi-chat-history-viewport:tui-capture";
+
 type RenderFn = (width: number) => string[];
 
 interface PatchState {
@@ -65,10 +67,7 @@ export default function chatHistoryViewport(pi: ExtensionAPI) {
   let enabled = false;
   let currentCtx: any = null;
   let currentTui: any = null;
-  let currentEditorFactory: any = null;
-  let installedEditorFactory: any = null;
   let patch: PatchState | null = null;
-  let installGeneration = 0;
   let scrollOffset = 0;
   let lastLineCount = 0;
   let renderingPatchedHistory = false;
@@ -184,39 +183,39 @@ export default function chatHistoryViewport(pi: ExtensionAPI) {
     setTimeout(() => tui.requestRender?.(true), 10);
   }
 
-  function applyEnabledUi(ctx: any): void {
-    const currentFactory = ctx.ui.getEditorComponent?.();
-    if (currentFactory && currentFactory !== installedEditorFactory) {
-      currentEditorFactory = currentFactory;
-    }
+  function captureTui(ctx: any): any | null {
+    if (ctx.mode !== "tui") return null;
 
-    const generation = ++installGeneration;
-    installedEditorFactory = (tui: any, theme: any, keybindings: any) => {
-      const editor = currentEditorFactory
-        ? currentEditorFactory(tui, theme, keybindings)
-        : undefined;
-      queueMicrotask(() => {
-        if (!enabled || generation !== installGeneration) return;
-        installPatch(tui);
-      });
-      return editor;
-    };
-
-    if (installedEditorFactory) {
-      ctx.ui.setEditorComponent(installedEditorFactory);
-    }
-  }
-
-  function applyDisabledUi(ctx: any): void {
-    teardownPatch();
-    ctx.ui.setEditorComponent(currentEditorFactory ?? undefined);
-    installedEditorFactory = null;
+    let captured: any = null;
+    ctx.ui.setWidget(TUI_CAPTURE_WIDGET_ID, (tui: any) => {
+      captured = tui;
+      return { render: () => [], invalidate: () => {} };
+    });
+    ctx.ui.setWidget(TUI_CAPTURE_WIDGET_ID, undefined);
+    return captured;
   }
 
   function syncUi(ctx: any): void {
-    if (!ctx.hasUI) return;
-    if (enabled) applyEnabledUi(ctx);
-    else applyDisabledUi(ctx);
+    if (ctx.mode !== "tui") return;
+
+    if (!enabled) {
+      teardownPatch();
+      return;
+    }
+
+    currentTui ??= captureTui(ctx);
+    const tui = currentTui;
+    if (!tui) {
+      notify("chat-history-viewport: could not access TUI", "warning");
+      return;
+    }
+
+    // Avoid changing input listeners while a shortcut's input event is being
+    // dispatched. Unlike the old implementation, this never rebuilds the editor.
+    queueMicrotask(() => {
+      if (!enabled || currentTui !== tui) return;
+      installPatch(tui);
+    });
   }
 
   function setEnabled(next: boolean): void {
@@ -233,8 +232,7 @@ export default function chatHistoryViewport(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
-    currentEditorFactory = ctx.ui.getEditorComponent?.() ?? null;
-    installedEditorFactory = null;
+    currentTui = captureTui(ctx);
     syncUi(ctx);
   });
 
@@ -242,7 +240,6 @@ export default function chatHistoryViewport(pi: ExtensionAPI) {
     teardownPatch();
     currentCtx = null;
     currentTui = null;
-    installedEditorFactory = null;
   });
 
   pi.registerCommand("chat-viewport", {
