@@ -402,7 +402,11 @@ function splitFileLines(text: string): string[] {
 	if (text.length === 0) {
 		return [];
 	}
-	const lines = text.split("\n");
+	// File reads preserve CRLF. A stray carriage return inside a rendered TUI
+	// row sends the terminal cursor back to column zero before Box writes its
+	// padding, leaving the right side of the row unpainted. Normalize line
+	// endings at the semantic preview boundary so no component ever sees CR.
+	const lines = text.split(/\r?\n/);
 	if (lines.at(-1) === "") {
 		lines.pop();
 	}

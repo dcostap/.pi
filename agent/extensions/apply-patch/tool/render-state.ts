@@ -1,5 +1,3 @@
-import { isAbsolute, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import type { ExecutePatchResult } from "../patch/types.ts";
 import { parsePatchActions } from "../patch/parser.ts";
 import { formatApplyPatchCollapsedDiff, formatApplyPatchSummary, formatPatchTarget, renderApplyPatchCall } from "./rendering.ts";
@@ -144,11 +142,6 @@ function stylePreviewLines(text: string, theme: RenderTheme): string {
 	}).join("\n");
 }
 
-function clickablePath(display: string, path: string, cwd: string): string {
-	const absolutePath = isAbsolute(path) ? path : resolve(cwd, path);
-	return `\u001b]8;;${pathToFileURL(absolutePath).href}\u0007${display}\u001b]8;;\u0007`;
-}
-
 function styledCounts(suffix: string, theme: RenderTheme): string {
 	const match = suffix.match(/^ \(\+(\d+) -(\d+)\)$/);
 	if (!match) return suffix;
@@ -190,8 +183,7 @@ function styleHeaders(
 		const action = actions[0]!;
 		const suffix = lines[0]?.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
-		const linkTarget = action.movePath ?? action.path;
-		lines[0] = `${title} ${outcomeLabel(target)}${actionLabel(action, theme)}${theme.fg("accent", clickablePath(target, linkTarget, cwd))}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
+		lines[0] = `${title} ${outcomeLabel(target)}${actionLabel(action, theme)}${theme.fg("accent", target)}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
 		return lines.join("\n");
 	}
 
@@ -203,9 +195,8 @@ function styleHeaders(
 		const action = actions[actionIndex++]!;
 		const suffix = lines[index]!.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
-		const linkTarget = action.movePath ?? action.path;
-		const linked = theme.fg("accent", clickablePath(target, linkTarget, cwd));
-		lines[index] = `  └ ${outcomeLabel(target)}${actionLabel(action, theme)}${linked}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
+		const styledTarget = theme.fg("accent", target);
+		lines[index] = `  └ ${outcomeLabel(target)}${actionLabel(action, theme)}${styledTarget}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
 	}
 	return lines.join("\n");
 }

@@ -14,7 +14,7 @@ afterEach(() => {
 	}
 });
 
-function fixture() {
+function fixture(lineEnding = "\n") {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-apply-patch-render-"));
 	temporaryDirectories.push(cwd);
 	writeFileSync(join(cwd, "index.ts"), [
@@ -23,7 +23,7 @@ function fixture() {
 		'export const LABEL = "Codex Sub";',
 		'export const LEGACY_IDS = ["corp"] as const;',
 		"",
-	].join("\n"));
+	].join(lineEnding));
 
 	const patchText = [
 		"*** Begin Patch",
@@ -43,9 +43,10 @@ const taggedTheme = {
 
 describe("apply_patch terminal rendering", () => {
 	test("keeps cached previews ANSI-free and styles with the callback theme", () => {
-		const { cwd, patchText } = fixture();
+		const { cwd, patchText } = fixture("\r\n");
 		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
-		expect(preview).not.toContain("\u001b[");
+		expect(preview).not.toContain("\r");
+		expect(preview).not.toContain("\u001b");
 
 		setApplyPatchRenderState("call-1", patchText, cwd);
 		const rendered = renderApplyPatchCallFromState({ input: patchText }, taggedTheme, {
@@ -59,8 +60,8 @@ describe("apply_patch terminal rendering", () => {
 		expect(rendered).toContain("<toolDiffRemoved>");
 		expect(rendered).toContain("<toolDiffAdded>");
 		expect(rendered).toContain("<toolDiffContext>");
-		// OSC 8 file links are intentional; cached/global SGR sequences are not.
-		expect(rendered).not.toMatch(/\u001b\[/);
+		expect(rendered).not.toContain("\r");
+		expect(rendered).not.toContain("\u001b");
 	});
 
 	test("does not emit inverse video that can corrupt background padding", () => {
