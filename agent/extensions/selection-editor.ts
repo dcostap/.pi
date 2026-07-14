@@ -170,6 +170,27 @@ class SelectionEditor extends CustomEditor {
 			) {
 				const pasteId = Number(marker[1]);
 				const pasteContent = expandedText.slice(prefix.length, contentEnd);
+
+				// Input is accepted while session_start handlers are still running. A
+				// very large paste can therefore be collapsed by Pi's default editor
+				// before this custom editor (and its file-dump policy) is installed.
+				// Apply that policy now instead of reattaching a huge hidden marker.
+				if (this.shouldDumpPasteToFile(pasteContent)) {
+					try {
+						const filePath = this.writeLargePasteFile(pasteContent);
+						const fileReference = this.formatFileReference(filePath, prefix[prefix.length - 1] ?? "");
+						super.setText(prefix + fileReference + suffix);
+						const undoStack = (this as unknown as { undoStack?: { clear(): void } }).undoStack;
+						undoStack?.clear();
+						this.markerUndoStack.length = 0;
+						this.redoStack.length = 0;
+						this.tui.requestRender();
+						return;
+					} catch {
+						// Fall back to preserving the paste marker and its hidden content.
+					}
+				}
+
 				this.i.pastes.set(pasteId, pasteContent);
 				this.i.pasteCounter = Math.max(this.i.pasteCounter, pasteId);
 				this.tui.requestRender();
@@ -214,12 +235,23 @@ class SelectionEditor extends CustomEditor {
 		return join(LARGE_PASTE_DIR, `paste-${timestamp}-${randomUUID().slice(0, 8)}.txt`);
 	}
 
-	private insertFilePathAtCursor(filePath: string, pushUndo: boolean): void {
+	private writeLargePasteFile(pastedText: string): string {
+		const fileContent = this.normalizePastedFileContent(pastedText);
+		const filePath = this.makeLargePasteFilePath();
+		writeFileSync(filePath, fileContent, "utf8");
+		return filePath;
+	}
+
+	private formatFileReference(filePath: string, charBefore: string): string {
 		const normalizedPath = filePath.replace(/\\/g, "/");
 		const fileReference = `@${normalizedPath}`;
+		return charBefore && !/\s/.test(charBefore) ? ` ${fileReference}` : fileReference;
+	}
+
+	private insertFilePathAtCursor(filePath: string, pushUndo: boolean): void {
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const charBeforeCursor = this.state.cursorCol > 0 ? currentLine[this.state.cursorCol - 1] : "";
-		const textToInsert = charBeforeCursor && !/\s/.test(charBeforeCursor) ? ` ${fileReference}` : fileReference;
+		const textToInsert = this.formatFileReference(filePath, charBeforeCursor);
 
 		this.i.cancelAutocomplete();
 		if (pushUndo) this.i.pushUndoSnapshot();
@@ -230,9 +262,7 @@ class SelectionEditor extends CustomEditor {
 	private handleBracketedPaste(pastedText: string): boolean {
 		if (!this.shouldDumpPasteToFile(pastedText)) return false;
 
-		const fileContent = this.normalizePastedFileContent(pastedText);
-		const filePath = this.makeLargePasteFilePath();
-		writeFileSync(filePath, fileContent, "utf8");
+		const filePath = this.writeLargePasteFile(pastedText);
 
 		const hadSelection = this.hasSelection();
 		if (hadSelection) this.deleteSelection(true);
