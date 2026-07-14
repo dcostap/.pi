@@ -9,6 +9,7 @@
  * - Ctrl+Shift+Home / Ctrl+Shift+End
  * - Shift+PageUp / Shift+PageDown
  * - Ctrl+Z undo and Ctrl+Y redo
+ * - Paste the same collapsed paste twice within two seconds to force it inline
  * - Typing replaces selection
  * - Backspace/Delete/word-delete remove selection
  * - Escape clears selection first
@@ -36,6 +37,16 @@ type VisualLine = { logicalLine: number; startCol: number; length: number };
 type PasteStateSnapshot = { pastes: Map<number, string>; pasteCounter: number };
 type EditorStateSnapshot = { lines: string[]; cursorLine: number; cursorCol: number } & PasteStateSnapshot;
 type PromptBufferState = { text: string } & PasteStateSnapshot;
+type PendingInlinePaste = {
+	sourceText: string;
+	content: string;
+	createdAt: number;
+	markerId: number;
+	markerText: string;
+	markerRange: Range;
+	cursorAfter: Pos;
+	rawTextAfter: string;
+};
 
 type EditorInternals = {
 	state: { lines: string[]; cursorLine: number; cursorCol: number };
@@ -70,6 +81,7 @@ const REVERSE = "\x1b[7m";
 const LARGE_PASTE_FILE_THRESHOLD = 5_000;
 const PASTE_MARKER_LINE_THRESHOLD = 10;
 const PASTE_MARKER_CHAR_THRESHOLD = 1_000;
+const DOUBLE_PASTE_INLINE_WINDOW_MS = 2_000;
 const LARGE_PASTE_DIR = join(tmpdir(), "pi-paste-dumps");
 const KEY_DEBUG_LOG = join(tmpdir(), "pi-selection-editor-keys.log");
 const ENABLE_KEY_DEBUG_LOG = process.env.PI_SELECTION_EDITOR_KEY_DEBUG === "1";
@@ -80,6 +92,7 @@ class SelectionEditor extends CustomEditor {
 	private selectionAnchor: Pos | null = null;
 	private customPasteChunks: string[] = [];
 	private customPasteInProgress = false;
+	private pendingInlinePaste: PendingInlinePaste | null = null;
 	private promptBufferIndex = -1;
 	private promptBufferStates = new Map<number, PromptBufferState>();
 	private markerUndoStack: PasteStateSnapshot[] = [];
@@ -113,6 +126,7 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	setText(text: string): void {
+		this.pendingInlinePaste = null;
 		const previousText = this.getText();
 		const previousPasteState = this.snapshotPasteState();
 		const undoDepth = this.markerUndoStack.length;
@@ -137,6 +151,7 @@ class SelectionEditor extends CustomEditor {
 	 * value. Reattach the hidden content without changing the visible prompt.
 	 */
 	restoreTransferredText(expandedText: string): void {
+		this.pendingInlinePaste = null;
 		const rawText = this.getText();
 		if (rawText === expandedText) return;
 
@@ -246,6 +261,65 @@ class SelectionEditor extends CustomEditor {
 		return `---\n${normalizedText}\n---`;
 	}
 
+	private rememberCollapsedPaste(sourceText: string, start: Pos, previousPasteCounter: number): void {
+		this.pendingInlinePaste = null;
+
+		const markerId = this.i.pasteCounter;
+		if (markerId <= previousPasteCounter) return;
+		const content = this.i.pastes.get(markerId);
+		if (content === undefined) return;
+
+		const cursorAfter = this.currentPos();
+		if (cursorAfter.line !== start.line || cursorAfter.col <= start.col) return;
+
+		const markerText = (this.state.lines[start.line] ?? "").slice(start.col, cursorAfter.col);
+		const markerMatch = markerText.match(/^\[paste #(\d+)(?: \+\d+ lines| \d+ chars)?\]$/);
+		if (!markerMatch || Number(markerMatch[1]) !== markerId) return;
+
+		this.pendingInlinePaste = {
+			sourceText,
+			content,
+			createdAt: Date.now(),
+			markerId,
+			markerText,
+			markerRange: { start: this.clonePos(start), end: this.clonePos(cursorAfter) },
+			cursorAfter: this.clonePos(cursorAfter),
+			rawTextAfter: this.getCurrentRawText(),
+		};
+	}
+
+	private tryInlineRepeatedPaste(sourceText: string): boolean {
+		const pending = this.pendingInlinePaste;
+		this.pendingInlinePaste = null;
+		if (!pending) return false;
+
+		const cursor = this.currentPos();
+		const markerLine = this.state.lines[pending.markerRange.start.line] ?? "";
+		const markerStillPresent =
+			pending.markerRange.start.line === pending.markerRange.end.line &&
+			markerLine.slice(pending.markerRange.start.col, pending.markerRange.end.col) === pending.markerText;
+		const storedContent = this.i.pastes.get(pending.markerId);
+
+		if (
+			Date.now() - pending.createdAt > DOUBLE_PASTE_INLINE_WINDOW_MS ||
+			sourceText !== pending.sourceText ||
+			this.hasSelection() ||
+			this.comparePos(cursor, pending.cursorAfter) !== 0 ||
+			this.getCurrentRawText() !== pending.rawTextAfter ||
+			!markerStillPresent ||
+			storedContent !== pending.content
+		) {
+			return false;
+		}
+
+		// Do not push another undo snapshot: the snapshot created by the first
+		// paste should undo the entire double-paste action, not reveal the marker.
+		this.deleteRange(pending.markerRange, false);
+		this.i.insertTextAtCursorInternal(pending.content);
+		this.tui.requestRender();
+		return true;
+	}
+
 	private handleCustomPasteInput(data: string): boolean {
 		if (data.includes("\x1b[200~")) {
 			this.customPasteInProgress = true;
@@ -265,6 +339,11 @@ class SelectionEditor extends CustomEditor {
 		this.customPasteChunks = [];
 		this.customPasteInProgress = false;
 
+		if (this.tryInlineRepeatedPaste(pastedText)) {
+			if (remaining.length > 0) this.handleInput(remaining);
+			return true;
+		}
+
 		let handled = false;
 		if (pastedText.length > 0) {
 			try {
@@ -279,7 +358,10 @@ class SelectionEditor extends CustomEditor {
 					: pastedText;
 				if (this.hasSelection()) this.deleteSelection(false);
 				this.clearSelection();
+				const pasteStart = this.currentPos();
+				const previousPasteCounter = this.i.pasteCounter;
 				this.i.handlePaste(textToPaste);
+				this.rememberCollapsedPaste(pastedText, pasteStart, previousPasteCounter);
 				this.tui.requestRender();
 			}
 		}
@@ -404,6 +486,7 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	resetAfterSubmit(): void {
+		this.pendingInlinePaste = null;
 		this.promptBufferIndex = -1;
 		this.promptBufferStates.clear();
 		this.markerUndoStack.length = 0;
@@ -827,6 +910,9 @@ class SelectionEditor extends CustomEditor {
 		this.debugKeyInput(data);
 		if (isKeyRelease(data)) return;
 		if (this.handleCustomPasteInput(data)) return;
+		// Any non-paste input (movement, editing, commands, etc.) cancels the
+		// double-paste gesture, even if it later leaves the cursor where it was.
+		this.pendingInlinePaste = null;
 		if (this.shouldDropAhkLeakedAltEnye(data)) return;
 
 		// 0) Undo/redo. Handle these before `super.handleInput()` so Ctrl+Z
