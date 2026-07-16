@@ -80,8 +80,18 @@ describe("apply_patch terminal rendering", () => {
 		expect(preview.split("\n").filter((line) => line.endsWith("line 7"))).toHaveLength(1);
 	});
 
-	test("keeps a separator between hunks with a real context gap", () => {
+	test("merges hunks separated by a small visual context gap", () => {
 		const { cwd, patchText } = numberedFixture(3, 14);
+		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
+
+		expect(preview).not.toContain("...");
+		expect(preview.split("\n").filter((line) => line.endsWith("line 8"))).toHaveLength(1);
+		// The wider range is only for grouping; outer context remains three lines.
+		expect(preview.split("\n").some((line) => line.endsWith("line 18"))).toBe(false);
+	});
+
+	test("keeps a separator between hunks beyond the wider overlap check", () => {
+		const { cwd, patchText } = numberedFixture(3, 15);
 		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
 
 		expect(preview).toContain("...");

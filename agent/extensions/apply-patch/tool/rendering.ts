@@ -3,6 +3,9 @@ import { openFileAtPath } from "../patch/paths.ts";
 import { parsePatchActions } from "../patch/parser.ts";
 import type { ParsedPatchAction } from "../patch/types.ts";
 
+const VISUAL_CONTEXT_LINES = 3;
+const OVERLAP_CONTEXT_LINES = 5;
+
 interface PreviewLine {
 	lineNumber: number;
 	marker: " " | "+" | "-";
@@ -16,6 +19,8 @@ interface ResolvedUpdateSection {
 	sourceLength: number;
 	contextStart: number;
 	contextEnd: number;
+	overlapStart: number;
+	overlapEnd: number;
 	readingPatchedFile: boolean;
 	deltaBefore: number;
 	delta: number;
@@ -25,6 +30,7 @@ interface UpdateSectionGroup {
 	sections: ResolvedUpdateSection[];
 	contextStart: number;
 	contextEnd: number;
+	overlapEnd: number;
 	readingPatchedFile: boolean;
 }
 
@@ -231,7 +237,7 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 			readingPatchedFile = sectionStart !== -1;
 		}
 		if (sectionStart === -1) sectionStart = searchStart;
-		const contextStart = Math.max(0, sectionStart - 3);
+		const contextStart = Math.max(0, sectionStart - VISUAL_CONTEXT_LINES);
 		for (const entry of normalizedLines) {
 			if (entry.marker === "+") added += 1;
 			if (entry.marker === "-") removed += 1;
@@ -248,7 +254,9 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 			sourceStart: sectionStart,
 			sourceLength,
 			contextStart,
-			contextEnd: Math.min(originalLines.length, sectionStart + sourceLength + 3),
+			contextEnd: Math.min(originalLines.length, sectionStart + sourceLength + VISUAL_CONTEXT_LINES),
+			overlapStart: Math.max(0, sectionStart - OVERLAP_CONTEXT_LINES),
+			overlapEnd: Math.min(originalLines.length, sectionStart + sourceLength + OVERLAP_CONTEXT_LINES),
 			readingPatchedFile,
 			deltaBefore: delta,
 			delta: sectionDelta,
@@ -261,21 +269,25 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 	const groups: UpdateSectionGroup[] = [];
 	for (const section of sections) {
 		const previous = groups.at(-1);
-		// Context ranges are half-open. Equality means the rendered ranges touch
-		// with no hidden source line between them, so they should also be one hunk.
+		// Use a wider range for deciding whether hunks belong together than for
+		// their outer visual context. This avoids an ellipsis for only a few lines
+		// between edits without making every standalone hunk show extra context.
+		// Ranges are half-open, so equality means the check ranges touch.
 		if (
 			previous &&
 			previous.readingPatchedFile === section.readingPatchedFile &&
-			section.contextStart <= previous.contextEnd
+			section.overlapStart <= previous.overlapEnd
 		) {
 			previous.sections.push(section);
 			previous.contextEnd = Math.max(previous.contextEnd, section.contextEnd);
+			previous.overlapEnd = Math.max(previous.overlapEnd, section.overlapEnd);
 			continue;
 		}
 		groups.push({
 			sections: [section],
 			contextStart: section.contextStart,
 			contextEnd: section.contextEnd,
+			overlapEnd: section.overlapEnd,
 			readingPatchedFile: section.readingPatchedFile,
 		});
 	}
