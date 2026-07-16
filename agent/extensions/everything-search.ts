@@ -619,6 +619,7 @@ export default async function (pi: ExtensionAPI) {
 		promptSnippet: "Search local files and folders with Everything",
 		promptGuidelines: [
 			"Use `everything_search` as the preferred option for very fast file and folder discovery, anywhere on the local PC, or scoped to a folder.",
+			"Prefer `rg` over Everything's `content:` filter for searching file contents.",
 			"`everything_search` query syntax: `space`=AND, `|`=OR, `<...>`=grouping, and `\"...\"`=exact phrase. If mixing `|` with spaces, use `<...>`.",
 			"Use `scope_path` to limit results to a folder tree, `children_only` for direct children only, and `search_full_path` to match against full path+filename text.",
 			"Use `ext:` to filter by extension; for example `ext:py`, `ext:ts;tsx`, or `ext:jpg;png`.",
