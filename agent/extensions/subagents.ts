@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getMarkdownTheme, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -17,6 +17,10 @@ const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' co
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const MAX_SUBAGENT_ATTEMPTS = 2;
 const SUBAGENT_RETRY_DELAY_MS = 1_000;
+const LIVE_STATUS_WIDTH = "◐ preparing".length;
+const LIVE_CACHE_WIDTH = "CH100.0%".length;
+const LIVE_COST_WIDTH = "$99.999".length;
+const LIVE_CONTEXT_WIDTH = "100.0%/1000k".length;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type SubagentKind = "review" | "generic";
@@ -105,6 +109,9 @@ type ChildResult = {
 	exitCode: number | null;
 };
 
+type ThemeColor = Parameters<Theme["fg"]>[0];
+type LiveStatPart = { kind: "cache" | "cost" | "context"; text: string; known: boolean };
+
 function cleanText(value: string): string {
 	return value.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
 }
@@ -159,23 +166,30 @@ function countLabel(count: number, singular: string): string {
 	return `${count} ${singular}${count === 1 ? "" : "s"}`;
 }
 
-function formatUsage(usage: UsageStats): string {
-	// Match Pi's footer token convention: show cache read/write only when present,
-	// and show CH as the latest response's prompt cache hit rate.
-	const parts: string[] = [];
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if ((usage.cacheRead > 0 || usage.cacheWrite > 0) && usage.latestCacheHitRate !== undefined) {
-		parts.push(`CH${usage.latestCacheHitRate.toFixed(1)}%`);
-	}
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(3)}`);
-	return parts.join(" ");
+function liveStatParts(state: RuntimeState): LiveStatPart[] {
+	const usage = state.usage;
+	const cacheKnown = usage.latestCacheHitRate !== undefined;
+	const costKnown = usage.turns > 0;
+	const contextKnown = state.contextPercent !== undefined;
+	const contextWindow = (state.contextWindow ?? 0) > 0 ? formatTokens(state.contextWindow!) : "---k";
+	return [
+		{ kind: "cache", text: cacheKnown ? `CH${usage.latestCacheHitRate!.toFixed(1)}%` : "CH??.?%", known: cacheKnown },
+		{ kind: "cost", text: costKnown ? `$${usage.cost.toFixed(3)}` : "$?.???", known: costKnown },
+		{ kind: "context", text: `${contextKnown ? `${state.contextPercent!.toFixed(1)}%` : "??.?%"}/${contextWindow}`, known: contextKnown },
+	];
 }
 
-function fixedUsage(usage: UsageStats): string {
-	return fitColumn(formatUsage(usage), 36);
+function liveStatWidth(kind: LiveStatPart["kind"]): number {
+	if (kind === "cache") return LIVE_CACHE_WIDTH;
+	if (kind === "cost") return LIVE_COST_WIDTH;
+	return LIVE_CONTEXT_WIDTH;
+}
+
+function formatLiveStats(state: RuntimeState): string {
+	// Detailed token counts remain in the final stats; the live row only keeps
+	// compact, independently separated at-a-glance values. Unknown values keep
+	// their slots so later usage updates do not shift the following columns.
+	return liveStatParts(state).map((part) => part.text.padEnd(liveStatWidth(part.kind))).join(" · ");
 }
 
 function formatContextUsage(state: RuntimeState): string {
@@ -598,13 +612,14 @@ function statusIcon(status: SubagentStatus): string {
 	}
 }
 
-function buildSubagentPromptHeader(states: RuntimeState[]): string {
+function buildSubagentPromptHeader(states: RuntimeState[], includePerSubagentDetails = true): string {
 	const first = states[0];
 	const mainTask = states.find((state) => state.mainTask)?.mainTask;
 	const lines: string[] = [];
 	if (mainTask) {
 		lines.push(first?.kind === "generic" ? "Generic task prompt sent to subagents:" : "Code review target prompt sent to subagents:", "<<<", mainTask, ">>>");
 	}
+	if (!includePerSubagentDetails) return lines.join("\n");
 	const detailLines = states
 		.map((state) => {
 			if (state.kind === "generic" && state.assignment) return `- ${state.sessionName}: ${state.assignment}`;
@@ -616,17 +631,55 @@ function buildSubagentPromptHeader(states: RuntimeState[]): string {
 	return lines.join("\n");
 }
 
+function statusColor(status: SubagentStatus): ThemeColor {
+	if (status === "done") return "success";
+	if (status === "error") return "error";
+	if (status === "aborted") return "warning";
+	if (status === "running" || status === "thinking" || status === "tool") return "accent";
+	return "dim";
+}
+
+function thinkingColor(thinking: ThinkingLevel | undefined): ThemeColor {
+	if (!thinking) return "dim";
+	return `thinking${thinking === "xhigh" ? "Xhigh" : thinking[0]!.toUpperCase() + thinking.slice(1)}` as ThemeColor;
+}
+
+function renderLiveStats(state: RuntimeState, theme: Theme): string {
+	const parts = liveStatParts(state);
+	return parts.map((part) => {
+		const color = !part.known ? "dim" : part.kind === "cache" ? "success" : part.kind === "cost" ? "warning" : "accent";
+		return theme.fg(color, part.text) + " ".repeat(Math.max(0, liveStatWidth(part.kind) - part.text.length));
+	}).join(theme.fg("dim", " · "));
+}
+
+function formatStatusRow(state: RuntimeState, includeActivity: boolean): string {
+	const status = fitColumn(`${statusIcon(state.status)} ${state.status}`, LIVE_STATUS_WIDTH);
+	const stats = formatLiveStats(state);
+	const attempt = state.maxAttempts > 1 && state.attempt > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
+	const model = `model=${state.modelRef ?? "(unknown)"} [${state.thinking ?? "(unknown)"}]${attempt}`;
+	const columns = [status, stats, model, state.sessionName];
+	if (includeActivity) columns.push(state.error ?? state.lastActivity);
+	return columns.filter(Boolean).join(" · ");
+}
+
+function renderStatusRow(state: RuntimeState, theme: Theme, includeActivity: boolean): string {
+	const status = theme.fg(statusColor(state.status), fitColumn(`${statusIcon(state.status)} ${state.status}`, LIVE_STATUS_WIDTH));
+	const stats = renderLiveStats(state, theme);
+	const attempt = state.maxAttempts > 1 && state.attempt > 1 ? theme.fg("warning", ` attempt=${state.attempt}/${state.maxAttempts}`) : "";
+	const model = `${theme.fg("dim", "model=")}${theme.fg("muted", state.modelRef ?? "(unknown)")} ${theme.fg(thinkingColor(state.thinking), `[${state.thinking ?? "(unknown)"}]`)}${attempt}`;
+	const columns = [status, stats, model, theme.fg("toolTitle", state.sessionName)];
+	if (includeActivity) columns.push(theme.fg(state.error ? "error" : "dim", state.error ?? state.lastActivity));
+	return columns.filter(Boolean).join(theme.fg("dim", " · "));
+}
+
+function renderToolPartial(states: RuntimeState[], prefix: string, theme: Theme): Text {
+	const lines = states.map((state) => renderStatusRow(state, theme, true));
+	const header = buildSubagentPromptHeader(states);
+	return new Text([prefix, header, lines.join("\n")].filter(Boolean).join("\n\n"), 0, 0);
+}
+
 function buildToolPartial(states: RuntimeState[]) {
-	const lines = states.map((state) => {
-		const status = fitColumn(`${statusIcon(state.status)} ${state.status}`, 12);
-		const usage = fixedUsage(state.usage);
-		const name = fitColumn(state.sessionName, 56);
-		const context = fitColumn(formatContextUsage(state), 14);
-		const attempt = state.maxAttempts > 1 && state.attempt > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
-		const model = `model=${state.modelRef ?? "(unknown)"} [${state.thinking ?? "(unknown)"}]${attempt}`;
-		const activity = state.error ?? state.lastActivity;
-		return `${status} ${usage} ${context} ${model} ${name} ${activity}`;
-	});
+	const lines = states.map((state) => formatStatusRow(state, true));
 	const header = buildSubagentPromptHeader(states);
 	const text = [header, lines.join("\n")].filter(Boolean).join("\n\n") || "subagents preparing...";
 	return {
@@ -1128,30 +1181,10 @@ function buildFinalStats(states: RuntimeState[]): { text: string; summary: Recor
 		`- **Time:** ${formatDuration(wallDurationMs)} wall · ${formatDuration(combinedAgentDurationMs)} combined agent time`,
 		`- **Tokens:** ${formatExactTokens(totalTokens(usage))} total (input ${formatExactTokens(usage.input)} · output ${formatExactTokens(usage.output)} · cache read ${formatExactTokens(usage.cacheRead)} · cache write ${formatExactTokens(usage.cacheWrite)})`,
 		`- **Total cost:** ${formatCost(usage.cost)}`,
-		"",
-		"## Per Subagent",
 	];
 
-	const perSubagent = states.flatMap((state, index) => {
-		const context = formatContextUsage(state) || "unknown";
-		const cacheHit = state.usage.latestCacheHitRate === undefined ? "unknown" : `${state.usage.latestCacheHitRate.toFixed(1)}%`;
-		const lines = [
-			`### ${index + 1}. ${state.sessionName}`,
-			`- **Status:** ${state.status}${state.error ? ` — ${oneLine(state.error, 180)}` : ""}`,
-			`- **Model:** ${state.modelRef ?? "unknown"} · thinking ${state.thinking ?? "unknown"}`,
-			`- **Attempts / model turns:** ${countLabel(state.attempt, "attempt")} · ${countLabel(state.usage.turns, "turn")} · **duration:** ${formatDuration(state.updatedAt - state.startedAt)}`,
-			`- **Tokens:** ${formatExactTokens(totalTokens(state.usage))} total (input ${formatExactTokens(state.usage.input)} · output ${formatExactTokens(state.usage.output)} · cache read ${formatExactTokens(state.usage.cacheRead)} · cache write ${formatExactTokens(state.usage.cacheWrite)})`,
-			`- **Cost:** ${formatCost(state.usage.cost)} · **latest cache hit:** ${cacheHit} · **final context:** ${context}`,
-			`- **Session:** ${state.sessionFile ?? "unavailable"}`,
-		];
-		if (state.previousErrors.length > 0) {
-			lines.push("- **Retry history:**", ...state.previousErrors.map((error) => `  - ${oneLine(error, 180)}`));
-		}
-		return [...lines, ""];
-	});
-
 	return {
-		text: [...overall, ...perSubagent].join("\n").trim(),
+		text: overall.join("\n").trim(),
 		summary: {
 			count: states.length,
 			statusCounts,
@@ -1167,13 +1200,22 @@ function buildFinalToolResult(results: ChildResult[]) {
 	const states = results.map((result) => result.state);
 	const stats = buildFinalStats(states);
 	const answers = results.map(({ state }, index) => {
-		const title = `## Answer ${index + 1} — ${state.sessionName}`;
-		const metadata = `> **${state.status}** · ${state.modelRef ?? "unknown"} · thinking ${state.thinking ?? "unknown"}`;
+		const title = `## Subagent ${index + 1} — ${state.sessionName}`;
+		const metadata = `> ${formatStatusRow(state, false)}`;
+		const specificAssignment = state.kind === "review" ? state.focus : state.assignment;
+		const details = [
+			specificAssignment ? `- **${state.kind === "review" ? "Focus" : "Assignment"}:** ${specificAssignment}` : "",
+			`- **Attempts / model turns / duration:** ${countLabel(state.attempt, "attempt")} · ${countLabel(state.usage.turns, "turn")} · ${formatDuration(state.updatedAt - state.startedAt)}`,
+			`- **Tokens:** ${formatExactTokens(totalTokens(state.usage))} total (input ${formatExactTokens(state.usage.input)} · output ${formatExactTokens(state.usage.output)} · cache read ${formatExactTokens(state.usage.cacheRead)} · cache write ${formatExactTokens(state.usage.cacheWrite)})`,
+			`- **Exact cost:** ${formatCost(state.usage.cost)}`,
+			`- **Session:** ${state.sessionFile ?? "unavailable"}`,
+		].filter(Boolean);
+		if (state.previousErrors.length > 0) details.push("- **Retry history:**", ...state.previousErrors.map((error) => `  - ${oneLine(error, 180)}`));
 		const body = state.finalAnswer || state.error || (state.status === "done" ? "(Subagent finished without a final answer.)" : "Subagent failed without a final answer.");
-		return `---\n\n${title}\n\n${metadata}\n\n${body}`;
+		return `---\n\n${title}\n\n${metadata}\n\n${details.join("\n")}\n\n### Answer\n\n${body}`;
 	});
 	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
-	const header = buildSubagentPromptHeader(states);
+	const header = buildSubagentPromptHeader(states, false);
 	const assignmentContext = header ? `# Assignment Context\n\n${header}` : "";
 	const priorityLegend = results[0]?.state.kind === "review"
 		? "Priority legend: [P0] critical/blocking, [P1] high/should fix before merge/use, [P2] medium/actionable, [P3] low/minor or test gap."
@@ -1184,6 +1226,9 @@ function buildFinalToolResult(results: ChildResult[]) {
 		details: {
 			failures,
 			summary: stats.summary,
+			overallText: stats.text,
+			assignmentContext,
+			priorityLegend,
 			results: results.map((result) => ({
 				kind: result.state.kind,
 				description: result.state.description,
@@ -1198,17 +1243,61 @@ function buildFinalToolResult(results: ChildResult[]) {
 				modelRef: result.state.modelRef,
 				thinking: result.state.thinking,
 				error: result.state.error,
+				finalAnswer: result.state.finalAnswer,
+				lastActivity: result.state.lastActivity,
 				usage: { ...result.state.usage, totalTokens: totalTokens(result.state.usage) },
 				durationMs: Math.max(0, result.state.updatedAt - result.state.startedAt),
 				contextWindow: result.state.contextWindow,
 				contextTokens: result.state.contextTokens,
 				contextPercent: result.state.contextPercent,
+				attempt: result.state.attempt,
 				attempts: result.state.attempt,
+				maxAttempts: result.state.maxAttempts,
 				previousErrors: result.state.previousErrors,
 			})),
 		},
 		isError: failures === results.length,
 	};
+}
+
+function renderFinalSubagentResult(result: any, prefix: string, theme: Theme): Container | undefined {
+	const details = result?.details;
+	if (!Array.isArray(details?.results)) return undefined;
+
+	const container = new Container();
+	container.addChild(new Text(prefix, 0, 0));
+	if (details.overallText) container.addChild(new Markdown(details.overallText, 0, 0, getMarkdownTheme()));
+	if (details.assignmentContext) container.addChild(new Markdown(details.assignmentContext, 0, 0, getMarkdownTheme()));
+	container.addChild(new Text(theme.fg("toolTitle", theme.bold("Subagent Answers")), 0, 0));
+	if (details.priorityLegend) container.addChild(new Text(theme.fg("dim", details.priorityLegend), 0, 0));
+
+	details.results.forEach((item: any, index: number) => {
+		container.addChild(new DynamicBorder((text: string) => theme.fg("borderMuted", text)));
+		container.addChild(new Text(theme.fg("toolTitle", theme.bold(`Subagent ${index + 1}`)), 0, 0));
+		container.addChild(new Text(renderStatusRow(item as RuntimeState, theme, false), 0, 0));
+
+		const specificAssignment = item.kind === "review" ? item.focus : item.assignment;
+		const usage = item.usage as UsageStats;
+		const info = [
+			specificAssignment ? `${item.kind === "review" ? "focus" : "assignment"}: ${specificAssignment}` : "",
+			`${countLabel(item.attempts ?? item.attempt ?? 1, "attempt")} · ${countLabel(usage?.turns ?? 0, "turn")} · ${formatDuration(item.durationMs ?? 0)}`,
+			`tokens: ${formatExactTokens(totalTokens(usage))} total (input ${formatExactTokens(usage.input)} · output ${formatExactTokens(usage.output)} · cache read ${formatExactTokens(usage.cacheRead)} · cache write ${formatExactTokens(usage.cacheWrite)})`,
+			`exact cost: ${formatCost(usage.cost)}`,
+			`session: ${item.sessionFile ?? "unavailable"}`,
+		].filter(Boolean);
+		if (Array.isArray(item.previousErrors) && item.previousErrors.length > 0) {
+			info.push("retry history:", ...item.previousErrors.map((error: string) => `  ${oneLine(error, 180)}`));
+		}
+		container.addChild(new Text(theme.fg("muted", info.join("\n")), 0, 0));
+
+		const body = item.finalAnswer || item.error || (item.status === "done" ? "(Subagent finished without a final answer.)" : "Subagent failed without a final answer.");
+		container.addChild(new Text(theme.fg("accent", theme.bold("Answer")), 0, 0));
+		container.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
+	});
+
+	container.addChild(new DynamicBorder((text: string) => theme.fg("borderMuted", text)));
+	container.addChild(new Text(theme.fg("dim", FINAL_RESULT_DISCLAIMER), 0, 0));
+	return container;
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -1292,7 +1381,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		renderResult(result, { isPartial }, theme) {
 			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
 			const prefix = result?.isError ? theme.fg("error", "code review subagents") : theme.fg("success", "code review subagents");
+			if (isPartial && Array.isArray(result?.details?.states)) return renderToolPartial(result.details.states as RuntimeState[], prefix, theme);
 			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
+			const finalResult = renderFinalSubagentResult(result, prefix, theme);
+			if (finalResult) return finalResult;
 
 			const container = new Container();
 			container.addChild(new Text(prefix, 0, 0));
@@ -1377,7 +1469,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		renderResult(result, { isPartial }, theme) {
 			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
 			const prefix = result?.isError ? theme.fg("error", "generic subagents") : theme.fg("success", "generic subagents");
+			if (isPartial && Array.isArray(result?.details?.states)) return renderToolPartial(result.details.states as RuntimeState[], prefix, theme);
 			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
+			const finalResult = renderFinalSubagentResult(result, prefix, theme);
+			if (finalResult) return finalResult;
 
 			const container = new Container();
 			container.addChild(new Text(prefix, 0, 0));
