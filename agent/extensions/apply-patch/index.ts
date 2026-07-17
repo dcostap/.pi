@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parsePatchActions } from "./patch/parser.ts";
-import type { ExecutePatchResult, ParsedPatchAction } from "./patch/types.ts";
+import type { ExecutePatchResult } from "./patch/types.ts";
+import { classifyActions, type AppliedPatchChange } from "./tool/classification.ts";
 import {
   clearApplyPatchRenderState,
   markApplyPatchFailure,
@@ -15,7 +16,6 @@ import {
   setApplyPatchRenderState,
   type ApplyPatchSettledStatus,
 } from "./tool/render-state.ts";
-import { formatPatchTarget } from "./tool/rendering.ts";
 
 const TOOL_NAME = "apply_patch";
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +47,7 @@ interface BinaryResponse {
   status: "success" | "failure";
   error?: string | null;
   result: ExecutePatchResult;
+  changes?: AppliedPatchChange[];
 }
 
 interface PatchDetails {
@@ -56,6 +57,7 @@ interface PatchDetails {
   attemptedFiles?: string[];
   appliedFiles?: string[];
   failedFiles?: string[];
+  failedActionIndexes?: number[];
 }
 
 interface ApplyPatchRendererState {
@@ -139,33 +141,6 @@ function runPatch(cwd: string, input: string, signal?: AbortSignal): Promise<Bin
 
 function changed(result: ExecutePatchResult): boolean {
   return result.changedFiles.length > 0 || result.createdFiles.length > 0 || result.deletedFiles.length > 0 || result.movedFiles.length > 0;
-}
-
-function pathKey(cwd: string, path: string): string {
-  const absolute = isAbsolute(path) ? path : resolve(cwd, path);
-  const normalized = absolute.replace(/\\/g, "/");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function classifyActions(
-  actions: ParsedPatchAction[],
-  result: ExecutePatchResult,
-  cwd: string,
-): { attemptedFiles: string[]; appliedFiles: string[]; failedFiles: string[] } {
-  const changedPaths = new Set(result.changedFiles.map((path) => pathKey(cwd, path)));
-  const attemptedFiles: string[] = [];
-  const appliedFiles: string[] = [];
-  const failedFiles: string[] = [];
-
-  for (const action of actions) {
-    const target = formatPatchTarget(action.path, action.movePath, cwd);
-    const mutationPaths = action.movePath ? [action.path, action.movePath] : [action.path];
-    const applied = mutationPaths.every((path) => changedPaths.has(pathKey(cwd, path)));
-    attemptedFiles.push(target);
-    (applied ? appliedFiles : failedFiles).push(target);
-  }
-
-  return { attemptedFiles, appliedFiles, failedFiles };
 }
 
 function dedupeRepeatedError(message: string): string {
@@ -272,8 +247,8 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
 
         const message = dedupeRepeatedError(response.error?.trim() || "apply_patch failed");
         if (changed(response.result)) {
-          const actionStatus = classifyActions(actions, response.result, ctx.cwd);
-          markApplyPatchPartialFailure(toolCallId, actionStatus.failedFiles);
+          const actionStatus = classifyActions(actions, response.result, ctx.cwd, response.changes);
+          markApplyPatchPartialFailure(toolCallId, actionStatus.failedFiles, actionStatus.failedActionIndexes);
           return {
             content: [{ type: "text" as const, text: `Patch partially applied: ${message}` }],
             details: {
@@ -329,6 +304,7 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
           context.cwd,
           "partial_failure",
           details.failedFiles,
+          details.failedActionIndexes,
         );
       }
       if (state.callComponent) {

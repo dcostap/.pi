@@ -3,9 +3,11 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { DiffError } from "./types.ts";
 
 export function normalizePatchPath({ path }: { path: string }): string {
-	const trimmed = path.trim();
-	const withoutAt = trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
-	return withoutAt.replace(/^['"]|['"]$/g, "");
+	// Codex treats the text after a hunk marker as the literal path. In
+	// particular, quotes and a leading `@` are filename characters rather than
+	// shell syntax. Hunk-line whitespace is handled by the patch parser before
+	// it extracts this value.
+	return path;
 }
 
 // Match Codex apply_patch path handling: absolute patch paths are accepted

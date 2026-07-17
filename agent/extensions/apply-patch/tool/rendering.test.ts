@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearApplyPatchRenderState, renderApplyPatchCallFromState, setApplyPatchRenderState } from "./render-state.ts";
-import { formatApplyPatchCollapsedDiff } from "./rendering.ts";
+import { formatApplyPatchCollapsedDiff, formatApplyPatchSummary } from "./rendering.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -60,6 +60,57 @@ const taggedTheme = {
 };
 
 describe("apply_patch terminal rendering", () => {
+	test("renders Codex's headerless first update chunk", () => {
+		const { cwd } = fixture();
+		const patchText = [
+			"*** Begin Patch",
+			"*** Update File: index.ts",
+			'-export const APP_NAME = "CastrosuaIa";',
+			'+export const APP_NAME = "Castrosua IA";',
+			"*** End Patch",
+		].join("\n");
+
+		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);
+		expect(preview).toContain('-1 export const APP_NAME = "CastrosuaIa";');
+		expect(preview).toContain('+1 export const APP_NAME = "Castrosua IA";');
+	});
+
+	test("labels repeated-path operations as changes rather than files", () => {
+		const { cwd } = fixture();
+		const patchText = [
+			"*** Begin Patch",
+			"*** Delete File: index.ts",
+			"*** Add File: index.ts",
+			"+replacement",
+			"*** End Patch",
+		].join("\n");
+
+		expect(formatApplyPatchSummary(patchText, cwd)).toStartWith("• Edited 2 changes ");
+	});
+
+	test("marks only the failed repeated-path action", () => {
+		const { cwd } = fixture();
+		const patchText = [
+			"*** Begin Patch",
+			"*** Delete File: index.ts",
+			"*** Add File: index.ts",
+			"+replacement",
+			"*** End Patch",
+		].join("\n");
+		setApplyPatchRenderState("repeated-partial", patchText, cwd, "partial_failure", ["index.ts"], [1]);
+
+		const rendered = renderApplyPatchCallFromState({ input: patchText }, taggedTheme, {
+			toolCallId: "repeated-partial",
+			cwd,
+			argsComplete: true,
+			showCollapsedDiff: true,
+			settledStatus: "partial_failure",
+		});
+
+		expect(rendered).toContain("<success>✓ </success><toolDiffRemoved>DELETED</toolDiffRemoved> <accent>index.ts</accent>");
+		expect(rendered).toContain("<error>! </error><accent>index.ts</accent><muted> — not applied</muted>");
+	});
+
 	test("merges hunks whose surrounding context overlaps", () => {
 		const { cwd, patchText } = numberedFixture(5, 10);
 		const preview = formatApplyPatchCollapsedDiff(patchText, cwd);

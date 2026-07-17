@@ -67,7 +67,7 @@ export function formatApplyPatchSummary(patchText: string, cwd = process.cwd()):
 		return lines.join("\n");
 	}
 
-	lines.push(`${bulletHeader("Edited", `${files.length} files`)} ${renderCounts(totalAdded, totalRemoved)}`);
+	lines.push(`${bulletHeader("Edited", collectionLabel(actions, cwd))} ${renderCounts(totalAdded, totalRemoved)}`);
 	for (const [index, file] of files.entries()) {
 		const prefix = index === 0 ? "  └ " : "    ";
 		lines.push(`${prefix}${formatPatchTarget(file.path, file.movePath, cwd)} ${renderCounts(file.added, file.removed)}`);
@@ -100,7 +100,7 @@ export function formatApplyPatchCall(patchText: string, cwd = process.cwd()): st
 		return lines.join("\n");
 	}
 
-	lines.push(`${bulletHeader("Edited", `${files.length} files`)} ${renderCounts(totalAdded, totalRemoved)}`);
+	lines.push(`${bulletHeader("Edited", collectionLabel(actions, cwd))} ${renderCounts(totalAdded, totalRemoved)}`);
 	for (const [index, file] of files.entries()) {
 		if (index > 0 && (hasFilePreview(files[index - 1]!) || hasFilePreview(file))) {
 			lines.push("");
@@ -140,7 +140,7 @@ export function renderApplyPatchCall(patchText: string, cwd = process.cwd()): st
 		return lines.join("\n");
 	}
 
-	lines.push(`${bulletHeader("Edited", `${files.length} files`)} ${renderCounts(totalAdded, totalRemoved)}`);
+	lines.push(`${bulletHeader("Edited", collectionLabel(actions, cwd))} ${renderCounts(totalAdded, totalRemoved)}`);
 	for (const [index, file] of files.entries()) {
 		if (index > 0 && (hasFilePreview(files[index - 1]!) || hasFilePreview(file))) {
 			lines.push("");
@@ -201,23 +201,30 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 	let searchStart = 0;
 	let delta = 0;
 	let index = 0;
+	let firstSection = true;
 
 	while (index < action.lines.length) {
 		const line = action.lines[index]!;
 		if (line === "*** End of File") {
 			break;
 		}
-		if (!line.startsWith("@@")) {
+		const hasContextMarker = line.startsWith("@@");
+		if (!hasContextMarker && (!firstSection || line.trim().length === 0)) {
 			index += 1;
 			continue;
 		}
 
-		index += 1;
+		let contextAnchor: string | undefined;
+		if (hasContextMarker) {
+			contextAnchor = line.startsWith("@@ ") ? line.slice(3) : undefined;
+			index += 1;
+		}
 		const sectionLines: string[] = [];
 		while (index < action.lines.length && !action.lines[index]!.startsWith("@@") && action.lines[index] !== "*** End of File") {
 			sectionLines.push(action.lines[index]!);
 			index += 1;
 		}
+		firstSection = false;
 
 		if (sectionLines.length === 0) {
 			continue;
@@ -230,10 +237,19 @@ function buildUpdatePreview(action: ParsedPatchAction, cwd: string): { added: nu
 		const newSequence = normalizedLines
 			.filter((entry) => entry.marker === " " || entry.marker === "+")
 			.map((entry) => entry.text);
-		let sectionStart = findMatchingSequence(originalLines, oldSequence, searchStart);
+		let sectionSearchStart = searchStart;
+		if (contextAnchor) {
+			const anchorIndex = findMatchingSequence(originalLines, [contextAnchor], searchStart);
+			if (anchorIndex !== -1) sectionSearchStart = anchorIndex + 1;
+		}
+		// Codex applies a pure-addition update chunk at EOF. An empty sequence
+		// otherwise matches every position, which used to render it at line one.
+		let sectionStart = oldSequence.length === 0
+			? originalLines.length
+			: findMatchingSequence(originalLines, oldSequence, sectionSearchStart);
 		let readingPatchedFile = false;
 		if (sectionStart === -1) {
-			sectionStart = findMatchingSequence(originalLines, newSequence, searchStart);
+			sectionStart = findMatchingSequence(originalLines, newSequence, sectionSearchStart);
 			readingPatchedFile = sectionStart !== -1;
 		}
 		if (sectionStart === -1) sectionStart = searchStart;
@@ -457,6 +473,11 @@ export function formatPatchTarget(path: string, movePath: string | undefined, cw
 		return from;
 	}
 	return `${from} → ${displayPath(movePath, cwd)}`;
+}
+
+export function collectionLabel(actions: ParsedPatchAction[], cwd: string): string {
+	const targets = actions.map((action) => formatPatchTarget(action.path, action.movePath, cwd));
+	return new Set(targets).size === targets.length ? `${targets.length} files` : `${targets.length} changes`;
 }
 
 function displayPath(path: string, cwd: string): string {

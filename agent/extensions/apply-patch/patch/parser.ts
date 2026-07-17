@@ -207,16 +207,10 @@ function peekNextSection({ lines, index }: { lines: string[]; index: number }): 
 
 function parseAddFile({ state }: { state: ParserState }): PatchAction {
 	const lines: string[] = [];
-	while (
-		!parserIsDone({
-			state,
-			prefixes: ["*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:"],
-		})
-	) {
-		const value = parserReadStr({ state, prefix: "" });
-		if (!value.startsWith("+")) {
-			throw new DiffError(`Invalid Add File Line: ${value}`);
-		}
+	while (!parserIsDone({ state })) {
+		const value = state.lines[state.index]!;
+		if (!value.startsWith("+")) break;
+		state.index += 1;
 		lines.push(value.slice(1));
 	}
 
@@ -297,39 +291,79 @@ const VALID_HUNK_HEADERS = [
 	"'*** Update File: {path}'",
 ].join(", ");
 
-export function parsePatchActions({ text }: { text: string }): ParsedPatchAction[] {
-	const lines = text.trim().split("\n");
-	if (lines.length < 2 || !lines[0]!.startsWith("*** Begin Patch") || lines[lines.length - 1] !== "*** End Patch") {
-		throw new DiffError("Invalid patch text");
+const BEGIN_PATCH_MARKER = "*** Begin Patch";
+const END_PATCH_MARKER = "*** End Patch";
+const ENVIRONMENT_ID_MARKER = "*** Environment ID: ";
+const ADD_FILE_MARKER = "*** Add File: ";
+const DELETE_FILE_MARKER = "*** Delete File: ";
+const UPDATE_FILE_MARKER = "*** Update File: ";
+const MOVE_TO_MARKER = "*** Move to: ";
+
+function hasPatchBoundaries(lines: string[]): boolean {
+	return lines.length >= 2 && lines[0]!.trim() === BEGIN_PATCH_MARKER && lines.at(-1)!.trim() === END_PATCH_MARKER;
+}
+
+function patchLines(text: string): string[] {
+	// Rust's str::lines removes the carriage return in CRLF input. split("\n")
+	// does not, so normalize only that line terminator and preserve all other
+	// path/content characters.
+	const originalLines = text.trim().split("\n").map((line) => line.endsWith("\r") ? line.slice(0, -1) : line);
+	if (hasPatchBoundaries(originalLines)) return originalLines;
+
+	// Match Codex's lenient direct-argument handling for the heredoc-shaped
+	// payloads some models emit.
+	const first = originalLines[0];
+	const last = originalLines.at(-1);
+	if (
+		originalLines.length >= 4 &&
+		(first === "<<EOF" || first === "<<'EOF'" || first === '<<"EOF"') &&
+		last?.endsWith("EOF")
+	) {
+		const innerLines = originalLines.slice(1, -1);
+		if (hasPatchBoundaries(innerLines)) return innerLines;
 	}
 
+	throw new DiffError("Invalid patch text");
+}
+
+function hunkHeader(line: string): string {
+	// Codex trims a line before parsing a top-level hunk header.
+	return line.trim();
+}
+
+function startsNextUpdateHunk(line: string): boolean {
+	// Inside an update hunk, a leading space is a diff context marker. Do not
+	// trim it and accidentally interpret its contents as another file header.
+	return line.startsWith(UPDATE_FILE_MARKER) || line.startsWith(DELETE_FILE_MARKER) || line.startsWith(ADD_FILE_MARKER);
+}
+
+export function parsePatchActions({ text }: { text: string }): ParsedPatchAction[] {
+	const lines = patchLines(text);
+
 	const actions: ParsedPatchAction[] = [];
-	const seenPaths = new Set<string>();
 	let index = 1;
+	const environmentLine = lines[index]?.trimStart();
+	if (environmentLine?.startsWith(ENVIRONMENT_ID_MARKER)) {
+		if (environmentLine.slice(ENVIRONMENT_ID_MARKER.length).trim().length === 0) {
+			throw new DiffError("apply_patch environment_id cannot be empty");
+		}
+		index += 1;
+	}
 
 	while (index < lines.length - 1) {
-		const line = lines[index]!;
+		const line = hunkHeader(lines[index]!);
 		const lineNumber = index + 1;
 
-		if (line.startsWith("*** Update File: ")) {
-			const updatePath = normalizePatchPath({ path: line.slice("*** Update File: ".length) });
-			if (seenPaths.has(updatePath)) {
-				throw new DiffError(`Update File Error: Duplicate Path: ${updatePath}`);
-			}
-			seenPaths.add(updatePath);
+		if (line.startsWith(UPDATE_FILE_MARKER)) {
+			const updatePath = normalizePatchPath({ path: line.slice(UPDATE_FILE_MARKER.length) });
 			index += 1;
 			let movePath: string | undefined;
-			if (index < lines.length - 1 && lines[index]!.startsWith("*** Move to: ")) {
-				movePath = normalizePatchPath({ path: lines[index]!.slice("*** Move to: ".length) });
+			if (index < lines.length - 1 && lines[index]!.startsWith(MOVE_TO_MARKER)) {
+				movePath = normalizePatchPath({ path: lines[index]!.slice(MOVE_TO_MARKER.length) });
 				index += 1;
 			}
 			const bodyStart = index;
-			while (
-				index < lines.length - 1 &&
-				!lines[index]!.startsWith("*** Update File: ") &&
-				!lines[index]!.startsWith("*** Delete File: ") &&
-				!lines[index]!.startsWith("*** Add File: ")
-			) {
+			while (index < lines.length - 1 && !startsNextUpdateHunk(lines[index]!)) {
 				index += 1;
 			}
 			const bodyLines = lines.slice(bodyStart, index);
@@ -345,12 +379,8 @@ export function parsePatchActions({ text }: { text: string }): ParsedPatchAction
 			continue;
 		}
 
-		if (line.startsWith("*** Delete File: ")) {
-			const deletePath = normalizePatchPath({ path: line.slice("*** Delete File: ".length) });
-			if (seenPaths.has(deletePath)) {
-				throw new DiffError(`Delete File Error: Duplicate Path: ${deletePath}`);
-			}
-			seenPaths.add(deletePath);
+		if (line.startsWith(DELETE_FILE_MARKER)) {
+			const deletePath = normalizePatchPath({ path: line.slice(DELETE_FILE_MARKER.length) });
 			actions.push({
 				type: "delete",
 				path: deletePath,
@@ -359,12 +389,8 @@ export function parsePatchActions({ text }: { text: string }): ParsedPatchAction
 			continue;
 		}
 
-		if (line.startsWith("*** Add File: ")) {
-			const addPath = normalizePatchPath({ path: line.slice("*** Add File: ".length) });
-			if (seenPaths.has(addPath)) {
-				throw new DiffError(`Add File Error: Duplicate Path: ${addPath}`);
-			}
-			seenPaths.add(addPath);
+		if (line.startsWith(ADD_FILE_MARKER)) {
+			const addPath = normalizePatchPath({ path: line.slice(ADD_FILE_MARKER.length) });
 			const state: ParserState = {
 				lines,
 				index: index + 1,

@@ -1,6 +1,6 @@
 import type { ExecutePatchResult } from "../patch/types.ts";
 import { parsePatchActions } from "../patch/parser.ts";
-import { formatApplyPatchCollapsedDiff, formatApplyPatchSummary, formatPatchTarget, renderApplyPatchCall } from "./rendering.ts";
+import { collectionLabel, formatApplyPatchCollapsedDiff, formatApplyPatchSummary, formatPatchTarget, renderApplyPatchCall } from "./rendering.ts";
 
 interface ApplyPatchRenderState {
 	cwd: string;
@@ -10,6 +10,7 @@ interface ApplyPatchRenderState {
 	expanded: string;
 	status: "pending" | "partial_failure" | "failed";
 	failedTargets?: string[] | undefined;
+	failedActionIndexes?: number[] | undefined;
 }
 
 export interface ApplyPatchSuccessDetails {
@@ -22,6 +23,7 @@ export interface ApplyPatchPartialFailureDetails {
 	result: ExecutePatchResult;
 	error: string;
 	failedTargets?: string[] | undefined;
+	failedActionIndexes?: number[] | undefined;
 	appliedFiles: string[];
 	failedFiles: string[];
 	recoveryInstructions: {
@@ -48,21 +50,27 @@ export function setApplyPatchRenderState(
 	cwd: string,
 	status: "pending" | "partial_failure" | "failed" = "pending",
 	failedTargets?: string[],
+	failedActionIndexes?: number[],
 ): void {
 	const collapsed = formatApplyPatchSummary(patchText, cwd);
 	const collapsedDiff = formatApplyPatchCollapsedDiff(patchText, cwd);
 	const expanded = renderApplyPatchCall(patchText, cwd);
-	applyPatchRenderStates.set(toolCallId, { cwd, patchText, collapsed, collapsedDiff, expanded, status, failedTargets });
+	applyPatchRenderStates.set(toolCallId, { cwd, patchText, collapsed, collapsedDiff, expanded, status, failedTargets, failedActionIndexes });
 }
 
-export function markApplyPatchPartialFailure(toolCallId: string, failedTargets?: string[]): void {
-	markApplyPatchFailure(toolCallId, "partial_failure", failedTargets);
+export function markApplyPatchPartialFailure(toolCallId: string, failedTargets?: string[], failedActionIndexes?: number[]): void {
+	markApplyPatchFailure(toolCallId, "partial_failure", failedTargets, failedActionIndexes);
 }
 
-export function markApplyPatchFailure(toolCallId: string, status: "partial_failure" | "failed", failedTargets?: string[]): void {
+export function markApplyPatchFailure(
+	toolCallId: string,
+	status: "partial_failure" | "failed",
+	failedTargets?: string[],
+	failedActionIndexes?: number[],
+): void {
 	const existing = applyPatchRenderStates.get(toolCallId);
 	if (!existing) return;
-	applyPatchRenderStates.set(toolCallId, { ...existing, status, failedTargets });
+	applyPatchRenderStates.set(toolCallId, { ...existing, status, failedTargets, failedActionIndexes });
 }
 
 function markFailedTargetLine(line: string, failedTarget: string): string | undefined {
@@ -159,6 +167,7 @@ function styleHeaders(
 	theme: RenderTheme,
 	status: ApplyPatchRenderState["status"] | ApplyPatchSettledStatus,
 	failedTargets?: string[],
+	failedActionIndexes?: number[],
 ): string {
 	let actions;
 	try {
@@ -169,13 +178,16 @@ function styleHeaders(
 	const lines = text.split("\n");
 	const titleRole = status === "failed" ? "error" : "toolTitle";
 	const title = theme.fg(titleRole, theme.bold("apply_patch"));
-	const outcomeLabel = (target: string): string => {
+	const actionFailed = (target: string, actionIndex: number): boolean => failedActionIndexes
+		? failedActionIndexes.includes(actionIndex)
+		: failedTargets?.includes(target) ?? false;
+	const outcomeLabel = (target: string, actionIndex: number): string => {
 		if (status !== "partial_failure") return "";
-		return failedTargets?.includes(target)
+		return actionFailed(target, actionIndex)
 			? theme.fg("error", "! ")
 			: theme.fg("success", "✓ ");
 	};
-	const failureSuffix = (target: string): string => status === "partial_failure" && failedTargets?.includes(target)
+	const failureSuffix = (target: string, actionIndex: number): string => status === "partial_failure" && actionFailed(target, actionIndex)
 		? theme.fg("muted", " — not applied")
 		: "";
 
@@ -183,20 +195,21 @@ function styleHeaders(
 		const action = actions[0]!;
 		const suffix = lines[0]?.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
-		lines[0] = `${title} ${outcomeLabel(target)}${actionLabel(action, theme)}${theme.fg("accent", target)}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
+		lines[0] = `${title} ${outcomeLabel(target, 0)}${actionLabel(action, theme)}${theme.fg("accent", target)}${failureSuffix(target, 0)}${styledCounts(suffix, theme)}`;
 		return lines.join("\n");
 	}
 
 	const totalSuffix = lines[0]?.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
-	lines[0] = `${title} ${theme.fg("muted", `${actions.length} files`)}${styledCounts(totalSuffix, theme)}`;
+	lines[0] = `${title} ${theme.fg("muted", collectionLabel(actions, cwd))}${styledCounts(totalSuffix, theme)}`;
 	let actionIndex = 0;
 	for (let index = 1; index < lines.length && actionIndex < actions.length; index += 1) {
 		if (!/^  └ /.test(lines[index]!)) continue;
+		const currentActionIndex = actionIndex;
 		const action = actions[actionIndex++]!;
 		const suffix = lines[index]!.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
 		const styledTarget = theme.fg("accent", target);
-		lines[index] = `  └ ${outcomeLabel(target)}${actionLabel(action, theme)}${styledTarget}${failureSuffix(target)}${styledCounts(suffix, theme)}`;
+		lines[index] = `  └ ${outcomeLabel(target, currentActionIndex)}${actionLabel(action, theme)}${styledTarget}${failureSuffix(target, currentActionIndex)}${styledCounts(suffix, theme)}`;
 	}
 	return lines.join("\n");
 }
@@ -286,11 +299,23 @@ export function renderApplyPatchCallFromState(args: { input?: unknown | undefine
 	}
 	const status = context?.settledStatus ?? cached?.status ?? "pending";
 	const statusText = status === "partial_failure"
-		? renderPartialFailureCall(baseText, { fg: (_role, text) => text }, cached?.failedTargets)
+		? renderPartialFailureCall(
+			baseText,
+			{ fg: (_role, text) => text },
+			cached?.failedActionIndexes ? undefined : cached?.failedTargets,
+		)
 		: status === "failed"
 			? renderFailedCall(baseText, { fg: (_role, text) => text }, cached?.failedTargets)
 			: baseText;
-	const styled = styleHeaders(stylePreviewLines(statusText, theme), effectivePatchText, cwd, theme, status, cached?.failedTargets);
+	const styled = styleHeaders(
+		stylePreviewLines(statusText, theme),
+		effectivePatchText,
+		cwd,
+		theme,
+		status,
+		cached?.failedTargets,
+		cached?.failedActionIndexes,
+	);
 	const lines = styled.split("\n");
 	lines[0] = `${lines[0]}${tokenSuffix(context?.outputTokens, theme)}`;
 	return lines.join("\n");
