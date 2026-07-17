@@ -15,6 +15,14 @@ export interface ActionClassification {
 	failedActionIndexes: number[];
 }
 
+export function formatPartialProgress(attemptedFiles: string[], applied: number): string {
+	const attempted = attemptedFiles.length;
+	if (new Set(attemptedFiles).size < attempted) {
+		return `${applied} of ${attempted} changes applied`;
+	}
+	return `${applied} of ${attempted} ${attempted === 1 ? "file" : "files"} changed`;
+}
+
 function pathKey(cwd: string, path: string): string {
 	const absolute = isAbsolute(path) ? path : resolve(cwd, path);
 	const normalized = absolute.replace(/\\/g, "/");

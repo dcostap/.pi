@@ -7,7 +7,7 @@ import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parsePatchActions } from "./patch/parser.ts";
 import type { ExecutePatchResult } from "./patch/types.ts";
-import { classifyActions, type AppliedPatchChange } from "./tool/classification.ts";
+import { classifyActions, formatPartialProgress, type AppliedPatchChange } from "./tool/classification.ts";
 import {
   clearApplyPatchRenderState,
   markApplyPatchFailure,
@@ -160,7 +160,7 @@ function partialFailureText(details: PatchDetails, rawText: string, expanded: bo
   const attempted = details.attemptedFiles?.length ?? 0;
   const applied = details.appliedFiles?.length ?? details.result.changedFiles.length;
   const countText = attempted > 0
-    ? `${applied} of ${attempted} ${attempted === 1 ? "file" : "files"} changed`
+    ? formatPartialProgress(details.attemptedFiles ?? [], applied)
     : `${details.result.changedFiles.length} ${details.result.changedFiles.length === 1 ? "file was" : "files were"} changed`;
   const failedFile = details.failedFiles?.[0];
   const error = dedupeRepeatedError(details.error?.trim() || rawText.replace(/^Patch partially applied:\s*/, "").trim());
