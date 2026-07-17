@@ -16,21 +16,21 @@ import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
 
 const StartParameters = Type.Object({
-	command: Type.String({ minLength: 1, description: "Non-interactive command to run using Pi's local bash backend" }),
+	command: Type.String({ minLength: 1, description: "Non-interactive bash command to run using the same local backend as Pi's built-in bash tool" }),
 	title: Type.String({ minLength: 1, description: "Short human-readable title (maximum 80 characters)" }),
 	working_dir: Type.Optional(Type.String({ description: "Working directory, relative to the session directory by default" })),
 });
 
 const IdParameters = Type.Object({
-	id: Type.String({ minLength: 1, description: "Background process ID returned by bg_start" }),
+	id: Type.String({ minLength: 1, description: "Background bash process ID returned by bash_bg_start" }),
 });
 
 const IdsParameters = Type.Object({
-	ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Background process IDs" }),
+	ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Background bash process IDs" }),
 });
 
 const WaitParameters = Type.Object({
-	ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Background process IDs" }),
+	ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Background bash process IDs" }),
 	timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400, description: "Maximum wait in seconds" })),
 });
 
@@ -80,10 +80,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	};
 
 	pi.registerTool({
-		name: "bg_start",
-		label: "background start",
-		description: `Start a long-running non-interactive command through Pi's local bash backend and return immediately. Recent merged output is retained in bounded memory.\n\n${BACKGROUND_PROCESS_PROMPT}`,
-		promptSnippet: "Start a long non-interactive command in the background; completion is delivered automatically",
+		name: "bash_bg_start",
+		label: "bash background start",
+		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool and return immediately. Recent merged output is retained in bounded memory.\n\n${BACKGROUND_PROCESS_PROMPT}`,
+		promptSnippet: "Start a long non-interactive bash command in the background; completion is delivered automatically",
 		parameters: StartParameters,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
@@ -104,16 +104,16 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 
 			const started = ensureManager(ctx).start(command, title, cwd);
 			return {
-				content: [{ type: "text", text: `Started ${started.id}: ${title}\nWorking directory: ${cwd}\nUse bg_wait only when further work depends on completion; otherwise continue useful work.` }],
+				content: [{ type: "text", text: `Started ${started.id}: ${title}\nWorking directory: ${cwd}\nUse bash_bg_wait only when further work depends on completion; otherwise continue useful work.` }],
 				details: { id: started.id, title, cwd, status: started.status },
 			};
 		},
 	});
 
 	pi.registerTool({
-		name: "bg_status",
-		label: "background status",
-		description: "Return a nonblocking status and bounded recent-output snapshot for one background process.",
+		name: "bash_bg_status",
+		label: "bash background status",
+		description: "Return a nonblocking status and bounded recent-output snapshot for one background bash process.",
 		parameters: IdParameters,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const snapshot = requireManager(ctx).get(params.id, true);
@@ -125,9 +125,9 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "bg_list",
-		label: "background list",
-		description: "List tracked background processes without waiting or including command output.",
+		name: "bash_bg_list",
+		label: "bash background list",
+		description: "List tracked background bash processes without waiting or including bash command output.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			latestContext = ctx;
@@ -140,9 +140,9 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "bg_wait",
-		label: "background wait",
-		description: "Wait for selected background processes to settle. Timeout or cancellation leaves them running.",
+		name: "bash_bg_wait",
+		label: "bash background wait",
+		description: "Wait for selected background bash processes to settle. Timeout or cancellation leaves them running.",
 		parameters: WaitParameters,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const activeManager = requireManager(ctx);
@@ -175,9 +175,9 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "bg_kill",
-		label: "background stop",
-		description: "Request termination of selected background processes through Pi's bash backend.",
+		name: "bash_bg_kill",
+		label: "bash background stop",
+		description: "Request termination of selected background bash processes through the same local backend as Pi's built-in bash tool.",
 		parameters: IdsParameters,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background stop aborted before termination began");

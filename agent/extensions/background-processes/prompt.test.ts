@@ -3,6 +3,8 @@ import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
 
 describe("background process prompt", () => {
 	test("warns against interaction, polling, and nested backgrounding", () => {
+		expect(BACKGROUND_PROCESS_PROMPT).toContain("bash_bg_start");
+		expect(BACKGROUND_PROCESS_PROMPT).toContain("bash_bg_wait");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("instead of polling");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("receive no stdin");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("Do not append &");

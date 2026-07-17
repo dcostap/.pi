@@ -1,19 +1,19 @@
-# Pi Background Processes
+# Pi Background Bash Processes
 
-A session-scoped Pi extension for long-running, non-interactive commands.
+A session-scoped Pi extension for long-running, non-interactive bash commands.
 
-It reuses Pi's public `createLocalBashOperations()` backend. The extension contains no direct process spawning, `taskkill`, shell quoting, native helper, runtime dependency, or skill.
+It reuses Pi's public `createLocalBashOperations()` backend—the same local backend used by Pi's built-in `bash` tool. The extension contains no direct process spawning, `taskkill`, shell quoting, native helper, runtime dependency, or skill.
 
 ## Tools
 
-- `bg_start` — start and return immediately
-- `bg_status` — inspect one process without waiting
-- `bg_list` — list tracked processes
-- `bg_wait` — wait without polling; timeout/cancellation leaves processes alive
-- `bg_kill` — stop through Pi's bash abort behavior
+- `bash_bg_start` — start a bash command and return immediately
+- `bash_bg_status` — inspect one background bash process without waiting
+- `bash_bg_list` — list tracked background bash processes
+- `bash_bg_wait` — wait without polling; timeout/cancellation leaves bash processes alive
+- `bash_bg_kill` — stop through Pi's bash abort behavior
 - `/ps` — TUI dashboard or RPC textual inventory
 
-Commands receive no stdin. Do not add `&`, `start`, `Start-Process`, `nohup`, or daemonization flags: `bg_start` already owns the background lifetime.
+Bash commands receive no stdin. Do not add `&`, `start`, `Start-Process`, `nohup`, or daemonization flags: `bash_bg_start` already owns the background lifetime.
 
 Output is a merged stdout/stderr stream. Each process retains only its newest 1 MiB in memory. Older bytes are discarded; version 1 intentionally has no persistent full-log spill.
 
