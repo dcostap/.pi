@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AUTO_BUDGET, formatAutomaticResults, formatProcess, formatWaitResult, WAIT_TOTAL_BYTES } from "./formatting.ts";
+import { AUTO_BUDGET, formatAutomaticResults, formatProcess, formatStartResult, formatWaitResult, WAIT_TOTAL_BYTES } from "./formatting.ts";
 import type { BackgroundProcessSnapshot } from "./manager.ts";
 
 function snapshot(id: string, output: string): BackgroundProcessSnapshot {
@@ -20,6 +20,12 @@ function snapshot(id: string, output: string): BackgroundProcessSnapshot {
 }
 
 describe("bounded formatting", () => {
+	test("start results include the command", () => {
+		const text = formatStartResult(snapshot("bg-1", ""));
+		expect(text).toContain("Started bg-1: Job bg-1");
+		expect(text).toContain("Command: node test.js");
+	});
+
 	test("process output is terminal-sanitized", () => {
 		const text = formatProcess(snapshot("bg-1", "safe\x1b]0;secret\x07end"));
 		expect(text).toContain("safeend");

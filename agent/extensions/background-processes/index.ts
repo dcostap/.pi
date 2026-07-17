@@ -8,12 +8,14 @@ import {
 	formatKillResults,
 	formatList,
 	formatProcess,
+	formatStartResult,
 	formatWaitResult,
 } from "./formatting.ts";
 import { BackgroundProcessManager, WaitAbortedError } from "./manager.ts";
 import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
 import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
+import { renderBackgroundStartCall } from "./ui/tool-call.ts";
 
 const StartParameters = Type.Object({
 	command: Type.String({ minLength: 1, description: "Non-interactive bash command to run using the same local backend as Pi's built-in bash tool" }),
@@ -85,6 +87,9 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool and return immediately. Recent merged output is retained in bounded memory.\n\n${BACKGROUND_PROCESS_PROMPT}`,
 		promptSnippet: "Start a long non-interactive bash command in the background; completion is delivered automatically",
 		parameters: StartParameters,
+		renderCall(args, theme, context) {
+			return renderBackgroundStartCall(args, theme, context.lastComponent as Text | undefined);
+		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
 			const command = params.command.trim();
@@ -104,7 +109,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 
 			const started = ensureManager(ctx).start(command, title, cwd);
 			return {
-				content: [{ type: "text", text: `Started ${started.id}: ${title}\nWorking directory: ${cwd}\nUse bash_bg_wait only when further work depends on completion; otherwise continue useful work.` }],
+				content: [{ type: "text", text: formatStartResult(started) }],
 				details: { id: started.id, title, cwd, status: started.status },
 			};
 		},

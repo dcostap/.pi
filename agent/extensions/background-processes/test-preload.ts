@@ -36,6 +36,23 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+	Text: class Text {
+		constructor(
+			private text: string,
+			private readonly paddingX = 0,
+			private readonly paddingY = 0,
+		) {}
+		setText(text: string) { this.text = text; }
+		render() {
+			const padding = " ".repeat(this.paddingX);
+			return [
+				...Array.from({ length: this.paddingY }, () => ""),
+				...this.text.split("\n").map((line) => `${padding}${line}${padding}`),
+				...Array.from({ length: this.paddingY }, () => ""),
+			];
+		}
+		invalidate() {}
+	},
 	matchesKey(data: string, key: string) {
 		if (key === "return") return data === "\r" || data === "\n";
 		if (key === "escape") return data === "\x1b";

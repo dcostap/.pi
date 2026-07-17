@@ -21,6 +21,15 @@ export function formatDuration(milliseconds: number): string {
 	return `${hours}h ${minutes % 60}m`;
 }
 
+export function formatStartResult(snapshot: BackgroundProcessSnapshot): string {
+	return [
+		`Started ${snapshot.id}: ${cleanInline(snapshot.title)}`,
+		`Working directory: ${cleanInline(snapshot.cwd)}`,
+		`Command: ${sanitizeTerminalText(snapshot.command)}`,
+		"Use bash_bg_wait only when further work depends on completion; otherwise continue useful work.",
+	].join("\n");
+}
+
 export function formatProcess(
 	snapshot: BackgroundProcessSnapshot,
 	budget: OutputBudget = STATUS_BUDGET,
