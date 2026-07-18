@@ -8,7 +8,12 @@
       "./index.ts"
     ]
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/content-policy.test.ts src/quality-signals.test.ts src/response-body.test.ts src/concurrency-limiter.test.ts src/url-routing.test.ts src/jina-response.test.ts"
+  },
   "dependencies": {
+    "defuddle": "^0.19.1",
+    "linkedom": "^0.18.13",
     "pdf-parse": "^1.1.1",
     "turndown": "^7.2.0"
   },

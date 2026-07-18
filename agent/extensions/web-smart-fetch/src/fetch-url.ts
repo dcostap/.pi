@@ -1,13 +1,18 @@
 import pdf from "pdf-parse";
 import TurndownService from "turndown";
 import { execFile } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionConfig } from "./config.ts";
+import { classifyContentQuality, selectContentOutput, type ContentOutput } from "./content-policy.ts";
 import { getFirecrawlClient, scrapeWithFirecrawl } from "./firecrawl.ts";
 import { handleGitHubUrl, parseGitHubUrl } from "./github.ts";
+import { parseJinaTargetMetadata } from "./jina-response.ts";
+import { assessWeakness, resolveBodyContentType } from "./quality-signals.ts";
+import { readResponseBuffer, readResponseText, ResponseSizeLimitError } from "./response-body.ts";
 import { processExtractedContentWithSpark } from "./summarize.ts";
+import { resolveUrl, type UrlResolution } from "./url-routing.ts";
 import { makeArtifactDir, saveBuffer, saveText, safeName, stripMarkdown } from "./utils.ts";
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
@@ -23,7 +28,18 @@ function decodeHtmlEntities(text: string): string {
 	});
 }
 
-function extractHtmlContent(html: string): { title?: string; content: string; usedReadability: false } {
+type HtmlExtraction = {
+	title?: string;
+	author?: string;
+	published?: string;
+	description?: string;
+	wordCount?: number;
+	content: string;
+	extractor: "defuddle" | "turndown" | "plain-text";
+	extractorError?: string;
+};
+
+function extractHtmlContentFallback(html: string, extractorError?: string): HtmlExtraction {
 	const titleHtml = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
 	const title = decodeHtmlEntities(titleHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()) || undefined;
 	const cleaned = html
@@ -44,7 +60,55 @@ function extractHtmlContent(html: string): { title?: string; content: string; us
 			.replace(/\n\s*\n+/g, "\n")
 			.trim(),
 	);
-	return { title, content: markdown || plainText, usedReadability: false };
+	return {
+		title,
+		content: markdown || plainText,
+		extractor: markdown ? "turndown" : "plain-text",
+		extractorError,
+	};
+}
+
+async function extractHtmlContent(html: string, url: string, signal?: AbortSignal): Promise<HtmlExtraction> {
+	try {
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("HTML extraction aborted");
+		// Keep the heavier article extractor off Pi's extension startup path.
+		const [{ Defuddle }, { parseHTML }] = await Promise.all([import("defuddle/node"), import("linkedom")]);
+		const { document } = parseHTML(html);
+		const windowLike = (document.defaultView || document) as any;
+		if (typeof windowLike.getComputedStyle !== "function") {
+			windowLike.getComputedStyle = () => new Proxy({}, { get: () => "" });
+		}
+
+		const extracted = await Defuddle(document as any, url, {
+			markdown: true,
+			// Keep the local extractor deterministic and private. Defuddle's async
+			// fallback can otherwise contact third-party site-specific APIs.
+			useAsync: false,
+		});
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("HTML extraction aborted");
+		const content = String(extracted.content || extracted.contentMarkdown || "").trim();
+		if (!content) {
+			return extractHtmlContentFallback(html, "Defuddle returned no content");
+		}
+
+		const optionalText = (value: unknown): string | undefined => {
+			const text = String(value || "").trim();
+			return text || undefined;
+		};
+
+		return {
+			title: optionalText(extracted.title),
+			author: optionalText(extracted.author),
+			published: optionalText(extracted.published),
+			description: optionalText(extracted.description),
+			wordCount: Number.isFinite(extracted.wordCount) ? extracted.wordCount : undefined,
+			content,
+			extractor: "defuddle",
+		};
+	} catch (error) {
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : error;
+		return extractHtmlContentFallback(html, error instanceof Error ? error.message : String(error));
+	}
 }
 
 type FetchResult = {
@@ -59,9 +123,9 @@ type FetchResult = {
 	qualityReason?: string;
 	answer?: string;
 	meta?: Record<string, unknown>;
+	output?: ContentOutput;
 };
 
-const MIN_CHARS_FOR_TLDR = 5000;
 const NETWORK_STEP_TIMEOUT_MS = 60_000;
 
 function timeoutSignal(parent: AbortSignal | undefined, ms: number, label: string): { signal: AbortSignal; cancel: () => void } {
@@ -107,6 +171,24 @@ function isTextLike(contentType: string): boolean {
 	);
 }
 
+function isMarkdownLike(contentType: string): boolean {
+	return contentType.includes("markdown") || contentType.includes("text/plain; profile=markdown");
+}
+
+function buildAcceptHeader(expectedContentType?: string): string {
+	if (expectedContentType && isMarkdownLike(expectedContentType)) {
+		return "text/markdown,text/plain;q=0.9,text/html;q=0.8,application/xhtml+xml;q=0.7,*/*;q=0.5";
+	}
+	return "text/html,application/xhtml+xml,application/xml,text/plain,application/json,*/*";
+}
+
+function extractMarkdownTitle(text: string): string | undefined {
+	const frontmatter = text.match(/^---\s*\n([\s\S]*?)\n---/i)?.[1] || "";
+	const frontmatterTitle = frontmatter.match(/^title:\s*["']?(.+?)["']?\s*$/im)?.[1]?.trim();
+	if (frontmatterTitle) return frontmatterTitle;
+	return text.match(/^#\s+(.+)$/m)?.[1]?.trim() || undefined;
+}
+
 function extractNextData(html: string): string | undefined {
 	const nextData = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i)?.[1];
 	if (!nextData) return undefined;
@@ -115,15 +197,6 @@ function extractNextData(html: string): string | undefined {
 		return JSON.stringify(parsed?.props ?? parsed, null, 2);
 	} catch {
 		return nextData;
-	}
-}
-
-function isYouTubeUrl(url: string): boolean {
-	try {
-		const host = new URL(url).hostname.replace(/^www\./, "").toLowerCase();
-		return host === "youtube.com" || host === "m.youtube.com" || host === "youtu.be";
-	} catch {
-		return false;
 	}
 }
 
@@ -142,7 +215,33 @@ function stripVtt(vtt: string): string {
 	return deduped.join(" ").replace(/\s+/g, " ").trim();
 }
 
-async function tryFetchYouTubeTranscript(url: string, artifactDir: string, signal?: AbortSignal): Promise<{ text: string; file?: string; error?: string }> {
+async function tryFetchYouTubeTranscript(
+	url: string,
+	artifactDir: string,
+	maxBytes: number,
+	signal?: AbortSignal,
+): Promise<{ text: string; file?: string; error?: string }> {
+	const controller = new AbortController();
+	let oversized: { file: string; size: number } | undefined;
+	const onParentAbort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) onParentAbort();
+	else signal?.addEventListener("abort", onParentAbort, { once: true });
+	const sizeMonitor = setInterval(() => {
+		for (const name of readdirSync(artifactDir).filter((entry) => /^youtube-transcript\..*\.vtt$/i.test(entry))) {
+			const file = join(artifactDir, name);
+			try {
+				const size = statSync(file).size;
+				if (size > maxBytes) {
+					oversized = { file, size };
+					controller.abort(new ResponseSizeLimitError("YouTube transcript", maxBytes, size));
+					return;
+				}
+			} catch {
+				// File may be renamed while yt-dlp finalizes it.
+			}
+		}
+	}, 100);
+
 	try {
 		await execFileAsync("yt-dlp", [
 			"--skip-download",
@@ -152,16 +251,32 @@ async function tryFetchYouTubeTranscript(url: string, artifactDir: string, signa
 			"--sub-format", "vtt",
 			"--output", join(artifactDir, "youtube-transcript.%(ext)s"),
 			url,
-		], { timeout: 45_000, signal });
+		], { timeout: 45_000, signal: controller.signal });
 
 		const vttFile = readdirSync(artifactDir).find((name) => /^youtube-transcript\..*\.vtt$/i.test(name) || name === "youtube-transcript.vtt");
 		if (!vttFile) return { text: "", error: "yt-dlp produced no VTT subtitle file" };
 
 		const file = join(artifactDir, vttFile);
+		const size = statSync(file).size;
+		if (size > maxBytes) {
+			rmSync(file, { force: true });
+			return { text: "", error: `YouTube transcript exceeds the ${maxBytes}-byte limit (${size} bytes)` };
+		}
 		const text = stripVtt(readFileSync(file, "utf8"));
 		return text ? { text, file } : { text: "", file, error: "subtitle file was empty after cleanup" };
 	} catch (error) {
+		if (oversized) {
+			rmSync(oversized.file, { force: true });
+			return {
+				text: "",
+				error: `YouTube transcript exceeds the ${maxBytes}-byte limit (${oversized.size} bytes)`,
+			};
+		}
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : error;
 		return { text: "", error: error instanceof Error ? error.message : String(error) };
+	} finally {
+		clearInterval(sizeMonitor);
+		signal?.removeEventListener("abort", onParentAbort);
 	}
 }
 
@@ -189,52 +304,74 @@ function isLikelyTlsError(error: unknown): boolean {
 	].some((marker) => text.includes(marker));
 }
 
-function assessWeakness(text: string, html?: string, options?: { apiLike?: boolean }): string[] {
-	const reasons: string[] = [];
-	const lower = text.toLowerCase();
-	if (!options?.apiLike && text.trim().length < 1200) reasons.push("too-short");
-	for (const marker of [
-		"verify you are human",
-		"access denied",
-		"enable javascript",
-		"sign in to continue",
-		"log in to continue",
-		"subscribe to continue",
-		"checking your browser",
-		"captcha",
-	]) {
-		if (lower.includes(marker)) reasons.push(marker);
-	}
-	const boilerplateHits = ["cookie", "privacy policy", "terms of service", "all rights reserved"].filter((s) => lower.includes(s)).length;
-	if (boilerplateHits >= 3 && text.length < 4000) reasons.push("boilerplate-heavy");
-	if (html && /<script[^>]*>self\.__next_f\.push/i.test(html) && text.trim().length < 2000) reasons.push("next-rsc-shell");
-	return [...new Set(reasons)];
-}
-
-async function fetchWithJina(url: string, signal?: AbortSignal): Promise<string> {
-	const stripped = url.replace(/^https?:\/\//i, "");
-	const res = await fetch(`https://r.jina.ai/http://${stripped}`, {
+async function fetchWithJina(
+	url: string,
+	maxBytes: number,
+	signal?: AbortSignal,
+): Promise<{ text: string; status: number; proxyStatus: number; finalUrl: string; serviceUrl: string }> {
+	const targetUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+	const res = await fetch(`https://r.jina.ai/${targetUrl}`, {
 		headers: { Accept: "text/plain" },
 		signal,
 	});
-	if (!res.ok) throw new Error(`Jina Reader failed: ${res.status}`);
-	return (await res.text()).trim();
+	if (!res.ok) {
+		await res.body?.cancel().catch(() => undefined);
+		throw new Error(`Jina Reader failed: ${res.status}`);
+	}
+	const text = (await readResponseText(res, maxBytes, "Jina Reader response", signal)).trim();
+	const target = parseJinaTargetMetadata(text, targetUrl, res.status);
+	return {
+		text,
+		status: target.status,
+		proxyStatus: res.status,
+		finalUrl: target.finalUrl,
+		serviceUrl: res.url || `https://r.jina.ai/${targetUrl}`,
+	};
 }
 
-async function fetchWithCurl(url: string, artifactDir: string, signal?: AbortSignal) {
+async function fetchWithCurl(
+	url: string,
+	artifactDir: string,
+	maxTextBytes: number,
+	maxPdfBytes: number,
+	expectedContentType: string | undefined,
+	signal?: AbortSignal,
+) {
+	const startedAt = Date.now();
 	const headerPath = join(artifactDir, "curl-headers.txt");
 	const bodyPath = join(artifactDir, "curl-body.bin");
-	const { stdout } = await execFileAsync(
-		"curl.exe",
-		[
+	const transferLimit = isProbablyPdf(expectedContentType || "", url) ? maxPdfBytes : maxTextBytes;
+	const controller = new AbortController();
+	let observedOversize: number | undefined;
+	const onParentAbort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) onParentAbort();
+	else signal?.addEventListener("abort", onParentAbort, { once: true });
+	const sizeMonitor = setInterval(() => {
+		try {
+			const size = statSync(bodyPath).size;
+			if (size > transferLimit) {
+				observedOversize = size;
+				controller.abort(new ResponseSizeLimitError("curl response", transferLimit, size));
+			}
+		} catch {
+			// The output file may not exist yet.
+		}
+	}, 50);
+	let stdout = "";
+	try {
+		({ stdout } = await execFileAsync(
+			"curl.exe",
+			[
 			"-L",
 			"-sS",
 			"--max-time",
 			"30",
+			"--max-filesize",
+			String(transferLimit),
 			"-H",
 			"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Pi-Firecrawl-Smart-Fetch/0.1",
 			"-H",
-			"Accept: text/html,application/xhtml+xml,application/xml,text/plain,application/json,*/*",
+			`Accept: ${buildAcceptHeader(expectedContentType)}`,
 			"-D",
 			headerPath,
 			"-o",
@@ -242,9 +379,23 @@ async function fetchWithCurl(url: string, artifactDir: string, signal?: AbortSig
 			"-w",
 			"__PI_META__%{url_effective}\n%{http_code}",
 			url,
-		],
-		{ signal },
-	);
+			],
+			{ signal: controller.signal },
+		));
+	} catch (error) {
+		rmSync(bodyPath, { force: true });
+		if (observedOversize !== undefined) {
+			throw new ResponseSizeLimitError("curl response", transferLimit, observedOversize);
+		}
+		if (Number((error as { code?: unknown })?.code) === 63) {
+			throw new ResponseSizeLimitError("curl response", transferLimit);
+		}
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : error;
+		throw error;
+	} finally {
+		clearInterval(sizeMonitor);
+		signal?.removeEventListener("abort", onParentAbort);
+	}
 
 	const meta = stdout.match(/__PI_META__(.*)\r?\n(\d{3})/s);
 	const finalUrl = meta?.[1]?.trim() || url;
@@ -263,55 +414,120 @@ async function fetchWithCurl(url: string, artifactDir: string, signal?: AbortSig
 			.filter((entry): entry is [string, string] => Boolean(entry))
 			.filter(([key]) => ["content-type", "content-length", "cache-control", "etag", "last-modified"].includes(key)),
 	);
-	const contentType = (responseHeaders["content-type"] || "").toLowerCase();
+	const actualContentType = (responseHeaders["content-type"] || "").toLowerCase();
 	const body = readFileSync(bodyPath);
-	return { finalUrl, status, contentType, responseHeaders, body, bodyPath, headerPath };
+	const decoded = body.toString("utf8");
+	const contentType = resolveBodyContentType(actualContentType, decoded, expectedContentType);
+	const limit = isProbablyPdf(contentType, finalUrl) ? maxPdfBytes : maxTextBytes;
+	if (body.byteLength > limit) {
+		rmSync(bodyPath, { force: true });
+		throw new ResponseSizeLimitError("curl response", limit, body.byteLength);
+	}
+	rmSync(bodyPath, { force: true });
+	return { finalUrl, status, contentType, responseHeaders, body, headerPath, fetchMs: Date.now() - startedAt };
 }
 
-async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSignal) {
+async function localFetch(
+	url: string,
+	config: ExtensionConfig,
+	signal?: AbortSignal,
+	expectedContentType?: string,
+) {
+	const startedAt = Date.now();
 	const artifactDir = makeArtifactDir(config.fetchesDir, "fetch", url);
 	let res: Response;
 	try {
 		res = await fetch(url, {
 			headers: {
 				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Pi-Firecrawl-Smart-Fetch/0.1",
-				Accept: "text/html,application/xhtml+xml,application/xml,text/plain,application/json,*/*",
+				Accept: buildAcceptHeader(expectedContentType),
 			},
 			redirect: "follow",
 			signal,
 		});
 	} catch (error) {
 		if (!isLikelyTlsError(error)) throw error;
-		const curl = await fetchWithCurl(url, artifactDir, signal);
+		const curl = await fetchWithCurl(
+			url,
+			artifactDir,
+			config.maxTextResponseBytes,
+			config.maxPdfResponseBytes,
+			expectedContentType,
+			signal,
+		);
 		const files: Record<string, string> = { curlHeaders: curl.headerPath };
 		if (isProbablyPdf(curl.contentType, curl.finalUrl)) {
+			const extractStartedAt = Date.now();
 			const parsed = await pdf(curl.body);
+			const content = parsed.text || "";
 			files.pdf = saveBuffer(join(artifactDir, safeName(basename(curl.finalUrl) || "document.pdf")), curl.body);
-			files.markdown = saveText(join(artifactDir, "content.md"), parsed.text || "");
+			files.markdown = saveText(join(artifactDir, "content.md"), content);
 			return {
 				method: "direct" as const,
 				url: curl.finalUrl,
-				content: parsed.text || "",
+				content,
 				artifactDir,
 				files,
-				meta: { contentType: curl.contentType, status: curl.status, headers: curl.responseHeaders, contentKind: "pdf", transport: "curl", weakReasons: assessWeakness(parsed.text || "") },
+				meta: {
+					contentType: curl.contentType,
+					status: curl.status,
+					headers: curl.responseHeaders,
+					contentKind: "pdf",
+					transport: "curl",
+					weakReasons: assessWeakness(content, undefined, { status: curl.status }),
+					diagnostics: {
+						strategy: "curl-tls-fallback",
+						cache: "none",
+						status: curl.status,
+						finalUrl: curl.finalUrl,
+						fetchMs: curl.fetchMs,
+						extractMs: Date.now() - extractStartedAt,
+						originalBytes: curl.body.byteLength,
+						extractedChars: content.length,
+						truncated: false,
+					},
+				},
 			};
 		}
 		if (isTextLike(curl.contentType) && !curl.contentType.includes("html")) {
 			const text = curl.body.toString("utf8");
+			const markdownLike = isMarkdownLike(curl.contentType);
 			files.raw = saveText(join(artifactDir, "raw.txt"), text);
 			return {
 				method: "direct" as const,
 				url: curl.finalUrl,
+				title: markdownLike ? extractMarkdownTitle(text) : undefined,
 				content: text,
 				artifactDir,
 				files,
-				meta: { contentType: curl.contentType, status: curl.status, headers: curl.responseHeaders, contentKind: "api", isApiLike: true, transport: "curl", weakReasons: assessWeakness(text, undefined, { apiLike: true }) },
+				meta: {
+					contentType: curl.contentType,
+					status: curl.status,
+					headers: curl.responseHeaders,
+					contentKind: markdownLike ? "text" : "api",
+					isApiLike: true,
+					transport: "curl",
+					weakReasons: assessWeakness(text, undefined, { apiLike: true, status: curl.status }),
+					diagnostics: {
+						strategy: "curl-tls-fallback",
+						cache: "none",
+						status: curl.status,
+						finalUrl: curl.finalUrl,
+						fetchMs: curl.fetchMs,
+						extractMs: 0,
+						originalBytes: curl.body.byteLength,
+						originalChars: text.length,
+						extractedChars: text.length,
+						truncated: false,
+					},
+				},
 			};
 		}
 		const html = curl.body.toString("utf8");
 		files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
-		const extracted = extractHtmlContent(html);
+		const extractStartedAt = Date.now();
+		const extracted = await extractHtmlContent(html, curl.finalUrl, signal);
+		const extractMs = Date.now() - extractStartedAt;
 		const title = extracted.title;
 		const nextData = extractNextData(html);
 		const content = extracted.content || nextData || "";
@@ -330,50 +546,114 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 				headers: curl.responseHeaders,
 				contentKind: "html",
 				transport: "curl",
-				weakReasons: assessWeakness(content, html),
-				usedReadability: extracted.usedReadability,
+				weakReasons: assessWeakness(content, html, { status: curl.status }),
+				extractor: extracted.extractor,
+				extractorError: extracted.extractorError,
+				author: extracted.author,
+				published: extracted.published,
+				description: extracted.description,
+				wordCount: extracted.wordCount,
+				diagnostics: {
+					strategy: "curl-tls-fallback",
+					cache: "none",
+					status: curl.status,
+					finalUrl: curl.finalUrl,
+					fetchMs: curl.fetchMs,
+					extractMs,
+					originalBytes: curl.body.byteLength,
+					originalChars: html.length,
+					extractedChars: content.length,
+					truncated: false,
+				},
 			},
 		};
 	}
 
 	const finalUrl = res.url || url;
-	const contentType = (res.headers.get("content-type") || "").toLowerCase();
+	const actualContentType = (res.headers.get("content-type") || "").toLowerCase();
 	const responseHeaders = Object.fromEntries(
 		Array.from(res.headers.entries()).filter(([key]) => ["content-type", "content-length", "cache-control", "etag", "last-modified"].includes(key.toLowerCase())),
 	);
 	const files: Record<string, string> = {};
 
-	if (isProbablyPdf(contentType, finalUrl)) {
-		const buffer = Buffer.from(await res.arrayBuffer());
+	if (isProbablyPdf(actualContentType, finalUrl)) {
+		const buffer = await readResponseBuffer(res, config.maxPdfResponseBytes, "PDF response", signal);
+		const fetchMs = Date.now() - startedAt;
+		const extractStartedAt = Date.now();
 		const parsed = await pdf(buffer);
+		const content = parsed.text || "";
 		files.pdf = saveBuffer(join(artifactDir, safeName(basename(finalUrl) || "document.pdf")), buffer);
-		files.markdown = saveText(join(artifactDir, "content.md"), parsed.text || "");
+		files.markdown = saveText(join(artifactDir, "content.md"), content);
 		return {
 			method: "direct" as const,
 			url: finalUrl,
-			content: parsed.text || "",
+			content,
 			artifactDir,
 			files,
-			meta: { contentType, status: res.status, headers: responseHeaders, contentKind: "pdf", weakReasons: assessWeakness(parsed.text || "") },
+			meta: {
+				contentType: actualContentType || "application/pdf",
+				status: res.status,
+				headers: responseHeaders,
+				contentKind: "pdf",
+				weakReasons: assessWeakness(content, undefined, { status: res.status }),
+				diagnostics: {
+					strategy: "http",
+					cache: "none",
+					status: res.status,
+					finalUrl,
+					fetchMs,
+					extractMs: Date.now() - extractStartedAt,
+					originalBytes: buffer.byteLength,
+					extractedChars: content.length,
+					truncated: false,
+				},
+			},
 		};
 	}
 
+	const responseText = await readResponseText(res, config.maxTextResponseBytes, "Web response", signal);
+	const contentType = resolveBodyContentType(actualContentType, responseText, expectedContentType);
+
 	if (isTextLike(contentType) && !contentType.includes("html")) {
-		const text = await res.text();
+		const text = responseText;
+		const markdownLike = isMarkdownLike(contentType);
+		const fetchMs = Date.now() - startedAt;
 		files.raw = saveText(join(artifactDir, "raw.txt"), text);
 		return {
 			method: "direct" as const,
 			url: finalUrl,
+			title: markdownLike ? extractMarkdownTitle(text) : undefined,
 			content: text,
 			artifactDir,
 			files,
-			meta: { contentType, status: res.status, headers: responseHeaders, contentKind: "api", isApiLike: true, weakReasons: assessWeakness(text, undefined, { apiLike: true }) },
+			meta: {
+				contentType,
+				status: res.status,
+				headers: responseHeaders,
+				contentKind: markdownLike ? "text" : "api",
+				isApiLike: true,
+				weakReasons: assessWeakness(text, undefined, { apiLike: true, status: res.status }),
+				diagnostics: {
+					strategy: "http",
+					cache: "none",
+					status: res.status,
+					finalUrl,
+					fetchMs,
+					extractMs: 0,
+					originalChars: text.length,
+					extractedChars: text.length,
+					truncated: false,
+				},
+			},
 		};
 	}
 
-	const html = await res.text();
+	const html = responseText;
+	const fetchMs = Date.now() - startedAt;
 	files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
-	const extracted = extractHtmlContent(html);
+	const extractStartedAt = Date.now();
+	const extracted = await extractHtmlContent(html, finalUrl, signal);
+	const extractMs = Date.now() - extractStartedAt;
 	const title = extracted.title;
 	const nextData = extractNextData(html);
 	const content = extracted.content || nextData || "";
@@ -392,28 +672,121 @@ async function localFetch(url: string, config: ExtensionConfig, signal?: AbortSi
 			status: res.status,
 			headers: responseHeaders,
 			contentKind: "html",
-			weakReasons: assessWeakness(content, html),
-			usedReadability: extracted.usedReadability,
+			weakReasons: assessWeakness(content, html, { status: res.status }),
+			extractor: extracted.extractor,
+			extractorError: extracted.extractorError,
+			author: extracted.author,
+			published: extracted.published,
+			description: extracted.description,
+			wordCount: extracted.wordCount,
+			diagnostics: {
+				strategy: "http",
+				cache: "none",
+				status: res.status,
+				finalUrl,
+				fetchMs,
+				extractMs,
+				originalChars: html.length,
+				extractedChars: content.length,
+				truncated: false,
+			},
 		},
 	};
 }
 
 function formatFetchOutput(result: FetchResult): string {
-	const contentChars = result.content.length;
-	const suppressTldr = result.quality === "OK" && contentChars < MIN_CHARS_FOR_TLDR;
+	const diagnostics = result.meta?.diagnostics as AttemptDiagnostic | undefined;
+	const outputLabel = {
+		answer: "Answer",
+		content: "Extracted content",
+		summary: "TL;DR",
+		preview: "Extracted content preview",
+	}[result.output?.kind || "content"];
 	const sections = [
 		`Method: ${result.method}`,
 		`URL: ${result.url}`,
+		result.meta?.adapterId && result.meta.adapterId !== "default" ? `Adapter: ${result.meta.adapterId}` : undefined,
+		result.meta?.rewritten ? `Fetch target: ${result.meta.fetchUrl}` : undefined,
+		diagnostics?.strategy
+			? `Strategy: ${diagnostics.strategy}${typeof diagnostics.status === "number" ? ` (HTTP ${diagnostics.status})` : ""}`
+			: undefined,
 		result.title ? `Title: ${result.title}` : undefined,
+		result.method === "direct" && result.meta?.extractor ? `Extractor: ${result.meta.extractor}` : undefined,
+		result.meta?.author ? `Author: ${result.meta.author}` : undefined,
+		result.meta?.published ? `Published: ${result.meta.published}` : undefined,
+		typeof result.meta?.wordCount === "number" ? `Word count: ${result.meta.wordCount}` : undefined,
 		result.quality ? `Quality: ${result.quality}${result.qualityReason ? ` — ${result.qualityReason}` : ""}` : undefined,
-		result.answer ? `\nAnswer:\n\n${result.answer}` : undefined,
-		result.tldr && !suppressTldr ? `\nTL;DR:\n\n${result.tldr}` : undefined,
-		suppressTldr ? `\nNote:\n\nPayload is short (${contentChars} chars), so TL;DR was omitted. Inspect the saved artifact directly.` : undefined,
+		result.output?.note ? `\nNote:\n\n${result.output.note}` : undefined,
+		result.output?.text ? `\n${outputLabel}:\n\n${result.output.text}` : undefined,
 		`\nArtifacts:`,
 		...Object.entries(result.files).filter(([, v]) => Boolean(v)).map(([k, v]) => `- ${k}: ${v}`),
 		`- artifactDir: ${result.artifactDir}`,
 	].filter(Boolean);
 	return sections.join("\n");
+}
+
+type CandidateAssessment = {
+	quality: "OK" | "WEAK";
+	reason: string;
+	promptAnswer?: string;
+	tldr?: string;
+};
+
+type AttemptDiagnostic = {
+	strategy: string;
+	cache?: "none" | "hit" | "miss";
+	status?: number;
+	proxyStatus?: number;
+	finalUrl?: string;
+	serviceUrl?: string;
+	fetchMs?: number;
+	extractMs?: number;
+	originalBytes?: number;
+	originalChars?: number;
+	extractedChars?: number;
+	truncated?: boolean;
+	quality?: "OK" | "WEAK";
+	qualityReason?: string;
+	error?: string;
+};
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function attemptFromResult(result: FetchResult, assessment: CandidateAssessment): AttemptDiagnostic {
+	const diagnostics = (result.meta?.diagnostics as AttemptDiagnostic | undefined) || { strategy: result.method };
+	return {
+		...diagnostics,
+		quality: assessment.quality,
+		qualityReason: assessment.reason,
+	};
+}
+
+async function assessCandidate(
+	content: string,
+	weakReasons: string[],
+	ctx: any,
+	signal: AbortSignal | undefined,
+	prompt: string | undefined,
+	sparkContext: {
+		url?: string;
+		finalUrl?: string;
+		contentType?: string;
+		status?: number;
+		contentKind?: "api" | "html" | "pdf" | "text" | "unknown";
+		method?: string;
+		headers?: Record<string, string>;
+	},
+	onUpdate?: (update: any) => void,
+): Promise<CandidateAssessment> {
+	const deterministic = classifyContentQuality(content, weakReasons);
+	if (deterministic.quality !== "AMBIGUOUS") {
+		return { quality: deterministic.quality, reason: deterministic.reason };
+	}
+
+	onUpdate?.({ content: [{ type: "text", text: `${deterministic.reason} Asking the fast model to judge quality...` }] });
+	return await processExtractedContentWithSpark(content, ctx, weakReasons, signal, prompt, sparkContext);
 }
 
 export async function fetchUrl(
@@ -424,18 +797,28 @@ export async function fetchUrl(
 	onUpdate?: (update: any) => void,
 	signal?: AbortSignal,
 ): Promise<{ text: string; details: Record<string, unknown> }> {
-	const github = parseGitHubUrl(url);
+	const route: UrlResolution = resolveUrl(url);
+	const github = route.handler === "github" ? parseGitHubUrl(route.canonicalUrl) : undefined;
 	if (github) {
+		const githubStartedAt = Date.now();
 		onUpdate?.({ content: [{ type: "text", text: "Handling GitHub URL..." }] });
 		const gh = await handleGitHubUrl(
 			config,
-			url,
+			route.canonicalUrl,
 			(message: string) => onUpdate?.({ content: [{ type: "text", text: message }] }),
 			signal,
 		);
 		const details = {
 			method: gh.kind,
-			url,
+			url: route.canonicalUrl,
+			requestedUrl: route.requestedUrl,
+			canonicalUrl: route.canonicalUrl,
+			fetchUrl: route.fetchUrl,
+			dedupeKey: route.dedupeKey,
+			adapterId: route.adapterId,
+			strategy: "github-checkout",
+			cache: "managed",
+			fetchMs: Date.now() - githubStartedAt,
 			owner: gh.owner,
 			repo: gh.repo,
 			repoDir: gh.repoDir,
@@ -452,29 +835,64 @@ export async function fetchUrl(
 	const client = config.firecrawlApiKey ? await getFirecrawlClient(config) : undefined;
 
 	let result: FetchResult;
+	const attempts: AttemptDiagnostic[] = [];
+	const localStartedAt = Date.now();
 	try {
 		onUpdate?.({ content: [{ type: "text", text: `Fetching URL locally... (timeout ${NETWORK_STEP_TIMEOUT_MS / 1000}s)` }] });
 		const localTimeout = timeoutSignal(signal, NETWORK_STEP_TIMEOUT_MS, "Local URL fetch");
 		try {
-			result = (await localFetch(url, config, localTimeout.signal)) as FetchResult;
+			result = (await localFetch(
+				route.fetchUrl,
+				config,
+				localTimeout.signal,
+				route.expectedContentType,
+			)) as FetchResult;
 		} finally {
 			localTimeout.cancel();
 		}
 		onUpdate?.({ content: [{ type: "text", text: "Extracted local content. Assessing quality..." }] });
 	} catch (error) {
-		const artifactDir = makeArtifactDir(config.fetchesDir, "fetch", url);
+		const artifactDir = makeArtifactDir(config.fetchesDir, "fetch", route.canonicalUrl);
 		result = {
 			method: "direct",
-			url,
+			url: route.canonicalUrl,
 			content: "",
 			artifactDir,
 			files: {},
-			meta: { localFetchError: error instanceof Error ? error.message : String(error) },
+			meta: {
+				localFetchError: errorMessage(error),
+				diagnostics: {
+					strategy: "http",
+					cache: "none",
+					finalUrl: route.fetchUrl,
+					fetchMs: Date.now() - localStartedAt,
+					extractedChars: 0,
+					truncated: false,
+					error: errorMessage(error),
+				},
+			},
 		};
 	}
-	if (isYouTubeUrl(result.url)) {
+	result.url = route.canonicalUrl;
+	result.meta = {
+		...(result.meta || {}),
+		requestedUrl: route.requestedUrl,
+		canonicalUrl: route.canonicalUrl,
+		fetchUrl: route.fetchUrl,
+		dedupeKey: route.dedupeKey,
+		adapterId: route.adapterId,
+		rewritten: route.rewritten,
+		expectedContentType: route.expectedContentType,
+	};
+
+	if (route.handler === "youtube") {
 		onUpdate?.({ content: [{ type: "text", text: "YouTube URL detected. Trying yt-dlp captions if available..." }] });
-		const transcript = await tryFetchYouTubeTranscript(result.url, result.artifactDir, signal);
+		const transcript = await tryFetchYouTubeTranscript(
+			result.url,
+			result.artifactDir,
+			config.maxTextResponseBytes,
+			signal,
+		);
 		if (transcript.text) {
 			result.files.youtubeTranscript = saveText(join(result.artifactDir, "youtube-transcript.md"), transcript.text);
 			result.content = [
@@ -483,18 +901,27 @@ export async function fetchUrl(
 				result.content.trim() ? "\n# YouTube page extraction / description" : "",
 				result.content,
 			].filter(Boolean).join("\n\n");
-			result.meta = { ...(result.meta || {}), youtubeTranscriptStatus: "used", youtubeTranscript: transcript.file || result.files.youtubeTranscript };
+			result.meta = {
+				...(result.meta || {}),
+				weakReasons: assessWeakness(result.content),
+				diagnostics: {
+					...((result.meta?.diagnostics as Record<string, unknown> | undefined) || {}),
+					extractedChars: result.content.length,
+				},
+				youtubeTranscriptStatus: "used",
+				youtubeTranscript: transcript.file || result.files.youtubeTranscript,
+			};
 		} else {
 			result.meta = { ...(result.meta || {}), youtubeTranscriptStatus: "unavailable", youtubeTranscriptError: transcript.error || "No captions found" };
 		}
 	}
 
-	let manualReasons = ((result.meta?.weakReasons as string[]) || []).slice();
-	if (!result.content.trim()) manualReasons.push("local-fetch-failed");
+	let weakReasons = ((result.meta?.weakReasons as string[]) || []).slice();
+	if (!result.content.trim()) weakReasons.push("local-fetch-failed");
 
 	const sparkContext = {
-		url,
-		finalUrl: result.url,
+		url: route.canonicalUrl,
+		finalUrl: (result.meta?.diagnostics as AttemptDiagnostic | undefined)?.finalUrl || route.fetchUrl,
 		contentType: result.meta?.contentType as string | undefined,
 		status: result.meta?.status as number | undefined,
 		contentKind: (result.meta?.contentKind as "api" | "html" | "pdf" | "text" | "unknown" | undefined) || "unknown",
@@ -502,112 +929,302 @@ export async function fetchUrl(
 		headers: (result.meta?.headers as Record<string, string> | undefined) || undefined,
 	};
 
-	onUpdate?.({ content: [{ type: "text", text: prompt ? "Answering focused question from extracted content..." : "Summarizing extracted content..." }] });
-	let processed = await processExtractedContentWithSpark(result.content, ctx, manualReasons, signal, prompt, sparkContext);
-	result.quality = processed.quality;
-	result.qualityReason = processed.reason;
+	let assessment = await assessCandidate(result.content, weakReasons, ctx, signal, prompt, sparkContext, onUpdate);
+	result.quality = assessment.quality;
+	result.qualityReason = assessment.reason;
+	result.answer = assessment.promptAnswer;
+	result.tldr = assessment.tldr;
+	attempts.push(attemptFromResult(result, assessment));
 
-	if (processed.quality === "WEAK") {
-		onUpdate?.({ content: [{ type: "text", text: `Extraction looked weak (${processed.reason}). Trying Jina Reader...` }] });
+	if (assessment.quality === "WEAK") {
+		onUpdate?.({ content: [{ type: "text", text: `Extraction looked weak (${assessment.reason}). Trying Jina Reader...` }] });
+		const jinaStartedAt = Date.now();
 		try {
 			const jinaTimeout = timeoutSignal(signal, NETWORK_STEP_TIMEOUT_MS, "Jina Reader fetch");
-			let jinaText = "";
+			let jinaResult: {
+				text: string;
+				status: number;
+				proxyStatus: number;
+				finalUrl: string;
+				serviceUrl: string;
+			};
 			try {
-				jinaText = await fetchWithJina(result.url, jinaTimeout.signal);
+				jinaResult = await fetchWithJina(route.fetchUrl, config.maxTextResponseBytes, jinaTimeout.signal);
 			} finally {
 				jinaTimeout.cancel();
 			}
-			const jinaReasons = assessWeakness(jinaText, undefined, { apiLike: sparkContext.contentKind === "api" });
-			const jinaProcessed = await processExtractedContentWithSpark(jinaText, ctx, jinaReasons, signal, prompt, {
-				...sparkContext,
-				method: "jina",
+			const jinaFetchMs = Date.now() - jinaStartedAt;
+			const jinaText = jinaResult.text;
+			const jinaReasons = assessWeakness(jinaText, undefined, {
+				apiLike: sparkContext.contentKind === "api",
+				status: jinaResult.status,
 			});
-			if (jinaText && (jinaProcessed.quality === "OK" || jinaReasons.length <= manualReasons.length)) {
+			const jinaAssessment = await assessCandidate(
+				jinaText,
+				jinaReasons,
+				ctx,
+				signal,
+				prompt,
+				{ ...sparkContext, method: "jina" },
+				onUpdate,
+			);
+			const jinaDiagnostics: AttemptDiagnostic = {
+				strategy: "jina",
+				cache: "none",
+				status: jinaResult.status,
+				proxyStatus: jinaResult.proxyStatus,
+				finalUrl: jinaResult.finalUrl,
+				serviceUrl: jinaResult.serviceUrl,
+				fetchMs: jinaFetchMs,
+				extractMs: 0,
+				originalChars: jinaText.length,
+				extractedChars: jinaText.length,
+				truncated: false,
+				quality: jinaAssessment.quality,
+				qualityReason: jinaAssessment.reason,
+			};
+			attempts.push(jinaDiagnostics);
+			if (jinaText && (jinaAssessment.quality === "OK" || jinaReasons.length <= weakReasons.length)) {
 				result = {
 					...result,
 					method: "jina",
 					content: jinaText,
-					quality: jinaProcessed.quality,
-					qualityReason: jinaProcessed.reason,
-					answer: jinaProcessed.promptAnswer,
-					tldr: jinaProcessed.tldr,
+					quality: jinaAssessment.quality,
+					qualityReason: jinaAssessment.reason,
+					answer: jinaAssessment.promptAnswer,
+					tldr: jinaAssessment.tldr,
 					files: {
 						...result.files,
 						jina: saveText(join(result.artifactDir, "jina.md"), jinaText),
 					},
-					meta: { ...(result.meta || {}), weakReasons: jinaReasons },
+					meta: {
+						...(result.meta || {}),
+						status: jinaResult.status,
+						weakReasons: jinaReasons,
+						diagnostics: jinaDiagnostics,
+					},
 				};
-				manualReasons = jinaReasons;
-				processed = jinaProcessed;
+				weakReasons = jinaReasons;
+				assessment = jinaAssessment;
 			}
-		} catch {
-			// ignore jina failure
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			attempts.push({
+				strategy: "jina",
+				cache: "none",
+				fetchMs: Date.now() - jinaStartedAt,
+				error: errorMessage(error),
+			});
 		}
 	}
 
-	if (processed.quality === "WEAK") {
+	if (assessment.quality === "WEAK") {
 		if (client) {
 			onUpdate?.({ content: [{ type: "text", text: `Escalating to Firecrawl... (timeout ${NETWORK_STEP_TIMEOUT_MS / 1000}s)` }] });
-			const scraped: any = await withTimeout(
-				scrapeWithFirecrawl(client, result.url),
-				NETWORK_STEP_TIMEOUT_MS,
-				"Firecrawl scrape",
-			);
-			const fcMarkdown = scraped?.markdown || scraped?.data?.markdown || "";
-			const fcHtml = scraped?.html || scraped?.data?.html || "";
-			const fcTitle = scraped?.metadata?.title || scraped?.data?.metadata?.title;
-			const fcContent = fcMarkdown || stripMarkdown(fcHtml);
-			if (fcContent) {
-				const fcReasons = assessWeakness(fcContent, fcHtml, { apiLike: sparkContext.contentKind === "api" });
-				const fcProcessed = await processExtractedContentWithSpark(fcContent, ctx, fcReasons, signal, prompt, {
-					...sparkContext,
-					method: "firecrawl",
-					contentType: fcHtml ? "text/html" : sparkContext.contentType,
+			const firecrawlStartedAt = Date.now();
+			try {
+				const scraped: any = await withTimeout(
+					scrapeWithFirecrawl(client, route.fetchUrl, signal),
+					NETWORK_STEP_TIMEOUT_MS,
+					"Firecrawl scrape",
+				);
+				const firecrawlFetchMs = Date.now() - firecrawlStartedAt;
+				const fcMarkdown = scraped?.markdown || scraped?.data?.markdown || "";
+				const fcHtml = scraped?.html || scraped?.data?.html || "";
+				const fcMetadata = scraped?.metadata || scraped?.data?.metadata || {};
+				const fcTitle = fcMetadata?.title;
+				const fcStatus = Number(fcMetadata?.statusCode || fcMetadata?.status || 0) || undefined;
+				for (const [label, value] of [["Firecrawl markdown", fcMarkdown], ["Firecrawl HTML", fcHtml]] as const) {
+					const bytes = Buffer.byteLength(value, "utf8");
+					if (bytes > config.maxTextResponseBytes) {
+						throw new ResponseSizeLimitError(label, config.maxTextResponseBytes, bytes);
+					}
+				}
+				const extractStartedAt = Date.now();
+				const fcContent = fcMarkdown || stripMarkdown(fcHtml);
+				const fcExtractMs = Date.now() - extractStartedAt;
+				if (fcContent) {
+					const fcReasons = assessWeakness(fcContent, fcHtml, {
+						apiLike: sparkContext.contentKind === "api",
+						status: fcStatus,
+					});
+					const fcAssessment = await assessCandidate(
+						fcContent,
+						fcReasons,
+						ctx,
+						signal,
+						prompt,
+						{
+							...sparkContext,
+							method: "firecrawl",
+							status: fcStatus,
+							contentType: fcHtml ? "text/html" : sparkContext.contentType,
+						},
+						onUpdate,
+					);
+					const firecrawlDiagnostics: AttemptDiagnostic = {
+						strategy: "firecrawl",
+						cache: "none",
+						status: fcStatus,
+						finalUrl: String(fcMetadata?.sourceURL || fcMetadata?.url || result.url),
+						fetchMs: firecrawlFetchMs,
+						extractMs: fcExtractMs,
+						originalChars: (fcHtml || fcMarkdown).length,
+						extractedChars: fcContent.length,
+						truncated: false,
+						quality: fcAssessment.quality,
+						qualityReason: fcAssessment.reason,
+					};
+					attempts.push(firecrawlDiagnostics);
+					result = {
+						method: "firecrawl",
+						url: result.url,
+						title: fcTitle,
+						content: fcContent,
+						quality: fcAssessment.quality,
+						qualityReason: fcAssessment.reason,
+						answer: fcAssessment.promptAnswer,
+						tldr: fcAssessment.tldr,
+						artifactDir: result.artifactDir,
+						files: {
+							...result.files,
+							firecrawlMarkdown: fcMarkdown ? saveText(join(result.artifactDir, "firecrawl.md"), fcMarkdown) : "",
+							firecrawlHtml: fcHtml ? saveText(join(result.artifactDir, "firecrawl.html"), fcHtml) : "",
+						},
+						meta: {
+							...(result.meta || {}),
+							status: fcStatus ?? result.meta?.status,
+							weakReasons: fcReasons,
+							firecrawl: scraped,
+							diagnostics: firecrawlDiagnostics,
+						},
+					};
+					weakReasons = fcReasons;
+					assessment = fcAssessment;
+				} else {
+					attempts.push({
+						strategy: "firecrawl",
+						cache: "none",
+						status: fcStatus,
+						fetchMs: firecrawlFetchMs,
+						extractedChars: 0,
+						error: "Firecrawl returned no extractable content",
+					});
+				}
+			} catch (error) {
+				if (signal?.aborted) throw error;
+				attempts.push({
+					strategy: "firecrawl",
+					cache: "none",
+					fetchMs: Date.now() - firecrawlStartedAt,
+					error: errorMessage(error),
 				});
-				result = {
-					method: "firecrawl",
-					url: result.url,
-					title: fcTitle,
-					content: fcContent,
-					quality: fcProcessed.quality,
-					qualityReason: fcProcessed.reason,
-					answer: fcProcessed.promptAnswer,
-					tldr: fcProcessed.tldr,
-					artifactDir: result.artifactDir,
-					files: {
-						...result.files,
-						firecrawlMarkdown: fcMarkdown ? saveText(join(result.artifactDir, "firecrawl.md"), fcMarkdown) : "",
-						firecrawlHtml: fcHtml ? saveText(join(result.artifactDir, "firecrawl.html"), fcHtml) : "",
-					},
-					meta: { ...(result.meta || {}), weakReasons: fcReasons, firecrawl: scraped },
-				};
-				processed = fcProcessed;
 			}
 		}
 	}
 
-	if (!result.answer && processed.promptAnswer) result.answer = processed.promptAnswer;
-	if (!result.tldr && processed.tldr) result.tldr = processed.tldr;
-	if (!result.quality) result.quality = processed.quality;
-	if (!result.qualityReason) result.qualityReason = processed.reason;
-	const suppressTldr = result.quality === "OK" && result.content.length < MIN_CHARS_FOR_TLDR;
+	if (assessment.quality === "OK" && prompt && !result.answer) {
+		onUpdate?.({ content: [{ type: "text", text: "Answering focused question from extracted content..." }] });
+		const currentDiagnostics = result.meta?.diagnostics as AttemptDiagnostic | undefined;
+		const focused = await processExtractedContentWithSpark(result.content, ctx, [], signal, prompt, {
+			...sparkContext,
+			finalUrl: currentDiagnostics?.finalUrl || result.url,
+			status: result.meta?.status as number | undefined,
+			method: result.method,
+		});
+		if (focused.quality === "OK") {
+			result.answer = focused.promptAnswer;
+		}
+	}
+
+	if (
+		assessment.quality === "OK" &&
+		!prompt &&
+		result.content.length > config.summaryThresholdChars &&
+		!result.tldr
+	) {
+		onUpdate?.({ content: [{ type: "text", text: "Extracted content is oversized. Summarizing it..." }] });
+		const currentDiagnostics = result.meta?.diagnostics as AttemptDiagnostic | undefined;
+		const summarized = await processExtractedContentWithSpark(result.content, ctx, [], signal, undefined, {
+			...sparkContext,
+			finalUrl: currentDiagnostics?.finalUrl || result.url,
+			status: result.meta?.status as number | undefined,
+			method: result.method,
+		});
+		if (summarized.quality === "OK") {
+			result.tldr = summarized.tldr;
+		}
+	}
+
+	result.quality = assessment.quality;
+	result.qualityReason = assessment.reason;
+	result.output = selectContentOutput({
+		content: result.content,
+		quality: assessment.quality,
+		prompt,
+		answer: result.answer,
+		tldr: result.tldr,
+		summaryThresholdChars: config.summaryThresholdChars,
+		previewChars: config.previewChars,
+	});
+	const selectedDiagnostics = (result.meta?.diagnostics as AttemptDiagnostic | undefined) || {
+		strategy: result.method,
+		cache: "none" as const,
+	};
+	const diagnostics = {
+		...selectedDiagnostics,
+		selectedStrategy: selectedDiagnostics.strategy,
+		attempts,
+		outputMode: result.output.kind,
+		outputTruncated: result.output.truncated,
+	};
+	result.meta = { ...(result.meta || {}), diagnostics };
+
 	return {
 		text: formatFetchOutput(result),
-		details: {
+			details: {
 			method: result.method,
 			url: result.url,
+			requestedUrl: route.requestedUrl,
+			canonicalUrl: route.canonicalUrl,
+			fetchUrl: route.fetchUrl,
+			dedupeKey: route.dedupeKey,
+			adapterId: route.adapterId,
+			rewritten: route.rewritten,
+			expectedContentType: route.expectedContentType,
 			title: result.title,
 			quality: result.quality,
 			qualityReason: result.qualityReason,
 			status: result.meta?.status,
 			localFetchError: result.meta?.localFetchError,
 			contentType: result.meta?.contentType,
+			strategy: selectedDiagnostics.strategy,
+			cache: selectedDiagnostics.cache || "none",
+			finalUrl: selectedDiagnostics.finalUrl || result.url,
+			fetchMs: selectedDiagnostics.fetchMs,
+			extractMs: selectedDiagnostics.extractMs,
+			originalBytes: selectedDiagnostics.originalBytes,
+			originalChars: selectedDiagnostics.originalChars,
+			extractedChars: selectedDiagnostics.extractedChars ?? result.content.length,
+			truncated: Boolean(selectedDiagnostics.truncated) || result.output.truncated,
+			diagnostics,
+			limits: {
+				maxTextResponseBytes: config.maxTextResponseBytes,
+				maxPdfResponseBytes: config.maxPdfResponseBytes,
+				maxFirecrawlResponseBytes: config.maxFirecrawlResponseBytes,
+			},
+			extractor: result.meta?.extractor,
+			extractorError: result.meta?.extractorError,
+			author: result.meta?.author,
+			published: result.meta?.published,
+			description: result.meta?.description,
+			wordCount: result.meta?.wordCount,
 			headers: result.meta?.headers,
 			artifactDir: result.artifactDir,
 			files: result.files,
 			answer: result.answer,
-			tldr: suppressTldr ? undefined : result.tldr,
-			tldrOmittedForShortPayload: suppressTldr,
+			tldr: result.output.kind === "summary" ? result.tldr : undefined,
+			outputMode: result.output.kind,
 			prompt,
 			contentChars: result.content.length,
 			youtubeTranscriptStatus: result.meta?.youtubeTranscriptStatus,

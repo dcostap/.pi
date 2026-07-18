@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { hyperlink, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
+import { ConcurrencyLimiter } from "./concurrency-limiter.ts";
 import { fetchUrl } from "./fetch-url.ts";
 import { crawlWithFirecrawl, getFirecrawlClient, searchWithFirecrawl } from "./firecrawl.ts";
 import { join } from "node:path";
@@ -121,12 +122,13 @@ function renderGitHubInjectedBlock(output: string, expanded: boolean, theme: any
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
+	const fetchLimiter = new ConcurrencyLimiter(config.maxConcurrentFetches);
 
 	pi.registerTool({
 		name: "fetch_url",
 		label: "Fetch URL",
 		description:
-			"Fetch one specific URL with local extraction first, external GitHub repo inspect/cache handling, and Firecrawl fallback when needed.",
+			"Fetch one specific URL with local extraction first, deterministic extracted content for ordinary pages, external GitHub repo inspect/cache handling, and remote fallback when needed. Oversized pages are summarized and full artifacts are saved locally.",
 		promptSnippet: "Fetch a specific URL/page/PDF, or cache an external GitHub repo locally for inspection and return its checkout path.",
 		promptGuidelines: [
 			"Use fetch_url when the user gives a specific URL or asks to inspect one exact page.",
@@ -170,6 +172,35 @@ export default function (pi: ExtensionAPI) {
 				const quality = d.quality === "OK" ? theme.fg("success", "OK") : d.quality ? theme.fg("warning", String(d.quality)) : "";
 				text += `\n${theme.fg("success", "Quality:")} ${quality}${d.qualityReason ? ` — ${String(d.qualityReason).trim()}` : ""}`;
 			}
+			if (d.strategy) {
+				const timing = [
+					typeof d.fetchMs === "number" ? `fetch ${d.fetchMs}ms` : "",
+					typeof d.extractMs === "number" ? `extract ${d.extractMs}ms` : "",
+				].filter(Boolean).join(" · ");
+				const status = typeof d.status === "number" ? ` · HTTP ${d.status}` : "";
+				text += `\n${theme.fg("success", "Strategy:")} ${theme.fg("accent", String(d.strategy))}${status}${timing ? ` · ${theme.fg("dim", timing)}` : ""}`;
+			}
+			if (d.adapterId && d.adapterId !== "default") {
+				text += `\n${theme.fg("success", "Adapter:")} ${theme.fg("accent", String(d.adapterId))}`;
+				if (d.rewritten && d.fetchUrl) text += `\n${theme.fg("success", "Fetch target:")} ${theme.fg("dim", String(d.fetchUrl))}`;
+			}
+			if (expanded && Array.isArray(d.diagnostics?.attempts) && d.diagnostics.attempts.length > 0) {
+				text += `\n${theme.fg("success", "Attempts:")}`;
+				for (const attempt of d.diagnostics.attempts) {
+					const parts = [
+						attempt.strategy,
+						typeof attempt.status === "number" ? `HTTP ${attempt.status}` : "",
+						typeof attempt.fetchMs === "number" ? `${attempt.fetchMs}ms` : "",
+						attempt.quality || "",
+					].filter(Boolean);
+					text += `\n- ${theme.fg(attempt.error ? "warning" : "dim", parts.join(" · "))}`;
+					if (attempt.error) text += theme.fg("muted", ` — ${oneLine(attempt.error, 120)}`);
+				}
+			}
+			if (d.method === "direct" && d.extractor) {
+				text += `\n${theme.fg("success", "Extractor:")} ${theme.fg("accent", String(d.extractor))}`;
+				if (d.extractorError) text += theme.fg("muted", ` — Defuddle fallback: ${oneLine(d.extractorError, 100)}`);
+			}
 			if (d.youtubeTranscriptStatus === "used") text += `\n${theme.fg("success", "YouTube transcript:")} ${theme.fg("success", "yt-dlp captions used")}`;
 			if (d.youtubeTranscriptStatus === "unavailable") text += `\n${theme.fg("warning", "YouTube transcript:")} ${theme.fg("muted", `yt-dlp unavailable/no captions${d.youtubeTranscriptError ? ` — ${oneLine(d.youtubeTranscriptError, 90)}` : ""}`)}`;
 			if (d.answer) text += `\n\n${theme.fg("success", "Answer:")}\n${String(d.answer).trim()}`;
@@ -185,11 +216,21 @@ export default function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
-			return {
-				content: [{ type: "text", text: result.text }],
-				details: result.details,
-			};
+			if (fetchLimiter.active >= fetchLimiter.maxConcurrency) {
+				onUpdate?.({
+					content: [{ type: "text", text: `Waiting for a fetch slot (${fetchLimiter.active} active, ${fetchLimiter.pending} queued)...` }],
+				});
+			}
+			const release = await fetchLimiter.acquire(signal);
+			try {
+				const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
+				return {
+					content: [{ type: "text", text: result.text }],
+					details: result.details,
+				};
+			} finally {
+				release();
+			}
 		},
 	});
 
@@ -229,7 +270,7 @@ export default function (pi: ExtensionAPI) {
 			const client = await getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Searching with Firecrawl..." }] });
-			const result: any = await searchWithFirecrawl(client, params.query, 10);
+			const result: any = await searchWithFirecrawl(client, params.query, 10, signal);
 			const dir = makeArtifactDir(config.fetchesDir, "search", params.query);
 			const files = {
 				json: saveJson(join(dir, "result.json"), result),
@@ -286,7 +327,7 @@ export default function (pi: ExtensionAPI) {
 			const client = await getFirecrawlClient(config);
 			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
 			onUpdate?.({ content: [{ type: "text", text: "Crawling with Firecrawl..." }] });
-			const result: any = await crawlWithFirecrawl(client, params.url, 20);
+			const result: any = await crawlWithFirecrawl(client, params.url, 20, signal);
 			const dir = makeArtifactDir(config.crawlDir, "crawl", params.url);
 			const jsonPath = saveJson(join(dir, "result.json"), result);
 			const docs = result?.data || [];

@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionConfig } from "./config.ts";
+import { readResponseText } from "./response-body.ts";
 import { ensureDir, listTree, readMaybe } from "./utils.ts";
 
 const execFileAsync = promisify(execFile);
@@ -122,7 +123,8 @@ export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
 	try {
 		const url = new URL(input);
 		const parts = url.pathname.split("/").filter(Boolean);
-		if (url.hostname === "raw.githubusercontent.com" && parts.length >= 4) {
+		const hostname = url.hostname.replace(/^www\./, "").toLowerCase();
+		if (hostname === "raw.githubusercontent.com" && parts.length >= 4) {
 			return {
 				owner: parts[0],
 				repo: parts[1],
@@ -130,7 +132,7 @@ export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
 				rest: parts.slice(2),
 			};
 		}
-		if (url.hostname !== "github.com" || parts.length < 2) return undefined;
+		if (hostname !== "github.com" || parts.length < 2) return undefined;
 		const [owner, repo, mode, ...rest] = parts;
 		if (!owner || !repo) return undefined;
 
@@ -212,26 +214,41 @@ async function checkout(repoDir: string, ref: string, signal?: AbortSignal, onPr
 	await withProgress(onProgress, `Checking out ${ref}...`, () => git(["checkout", "--force", ref], repoDir, signal));
 }
 
-async function fetchGitHubJson(apiPath: string) {
+async function fetchGitHubJson(apiPath: string, maxBytes: number, signal?: AbortSignal) {
 	const res = await fetch(`https://api.github.com${apiPath}`, {
 		headers: {
 			Accept: "application/vnd.github+json",
 			"User-Agent": "Pi-Web-Smart-Fetch/0.1",
 			"X-GitHub-Api-Version": "2022-11-28",
 		},
+		signal,
 	});
+	const text = await readResponseText(res, maxBytes, "GitHub API response", signal);
 	if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
-	return await res.json();
+	return text ? JSON.parse(text) : {};
 }
 
 function formatUser(user: any): string {
 	return user?.login ? `@${user.login}` : "unknown";
 }
 
-async function handleGitHubPullOrIssue(parsed: Extract<ParsedGitHubUrl, { mode: "pull" | "issue" }>, url: string): Promise<GitHubResolution> {
+async function handleGitHubPullOrIssue(
+	config: ExtensionConfig,
+	parsed: Extract<ParsedGitHubUrl, { mode: "pull" | "issue" }>,
+	url: string,
+	signal?: AbortSignal,
+): Promise<GitHubResolution> {
 	if (parsed.mode === "pull") {
-		const pr: any = await fetchGitHubJson(`/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`);
-		const files: any[] = await fetchGitHubJson(`/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}/files?per_page=100`);
+		const pr: any = await fetchGitHubJson(
+			`/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`,
+			config.maxTextResponseBytes,
+			signal,
+		);
+		const files: any[] = await fetchGitHubJson(
+			`/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}/files?per_page=100`,
+			config.maxTextResponseBytes,
+			signal,
+		);
 		const preview = [
 			`Pull request: ${parsed.owner}/${parsed.repo}#${parsed.number}`,
 			`Title: ${pr.title}`,
@@ -251,8 +268,16 @@ async function handleGitHubPullOrIssue(parsed: Extract<ParsedGitHubUrl, { mode: 
 		return { kind: "github", url, owner: parsed.owner, repo: parsed.repo, preview };
 	}
 
-	const issue: any = await fetchGitHubJson(`/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.number}`);
-	const comments: any[] = await fetchGitHubJson(`/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.number}/comments?per_page=20`);
+	const issue: any = await fetchGitHubJson(
+		`/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.number}`,
+		config.maxTextResponseBytes,
+		signal,
+	);
+	const comments: any[] = await fetchGitHubJson(
+		`/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.number}/comments?per_page=20`,
+		config.maxTextResponseBytes,
+		signal,
+	);
 	const preview = [
 		`Issue: ${parsed.owner}/${parsed.repo}#${parsed.number}`,
 		`Title: ${issue.title}`,
@@ -271,7 +296,7 @@ async function handleGitHubPullOrIssue(parsed: Extract<ParsedGitHubUrl, { mode: 
 export async function handleGitHubUrl(config: ExtensionConfig, url: string, onProgress?: ProgressReporter, signal?: AbortSignal): Promise<GitHubResolution> {
 	const parsed = parseGitHubUrl(url);
 	if (!parsed) throw new Error("Not a GitHub URL");
-	if (parsed.mode === "pull" || parsed.mode === "issue") return handleGitHubPullOrIssue(parsed, url);
+	if (parsed.mode === "pull" || parsed.mode === "issue") return handleGitHubPullOrIssue(config, parsed, url, signal);
 
 	const sourceUrl = parsed as Extract<ParsedGitHubUrl, { mode: "root" | "tree" | "blob" | "raw" }>;
 	return await withRepoLock(config, sourceUrl.owner, sourceUrl.repo, onProgress, async () => {
