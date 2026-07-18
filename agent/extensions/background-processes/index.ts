@@ -15,7 +15,7 @@ import { BackgroundProcessManager, WaitAbortedError } from "./manager.ts";
 import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
 import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
-import { renderBackgroundStartCall } from "./ui/tool-call.ts";
+import { renderBackgroundToolCall, renderBackgroundToolResult } from "./ui/tool-call.ts";
 
 const StartParameters = Type.Object({
 	command: Type.String({ minLength: 1, description: "Non-interactive bash command to run using the same local backend as Pi's built-in bash tool" }),
@@ -88,7 +88,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		promptSnippet: "Start a long non-interactive bash command in the background; completion is delivered automatically",
 		parameters: StartParameters,
 		renderCall(args, theme, context) {
-			return renderBackgroundStartCall(args, theme, context.lastComponent as Text | undefined);
+			return renderBackgroundToolCall("bash_bg_start", args, theme, context.lastComponent as Text | undefined);
+		},
+		renderResult(result, options, theme, context) {
+			return renderBackgroundToolResult("bash_bg_start", result, options, theme, context.lastComponent as Text | undefined, context.isError);
 		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
@@ -120,6 +123,12 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		label: "bash background status",
 		description: "Return a nonblocking status and bounded recent-output snapshot for one background bash process.",
 		parameters: IdParameters,
+		renderCall(args, theme, context) {
+			return renderBackgroundToolCall("bash_bg_status", args, theme, context.lastComponent as Text | undefined);
+		},
+		renderResult(result, options, theme, context) {
+			return renderBackgroundToolResult("bash_bg_status", result, options, theme, context.lastComponent as Text | undefined, context.isError);
+		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const snapshot = requireManager(ctx).get(params.id, true);
 			return {
@@ -134,6 +143,12 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		label: "bash background list",
 		description: "List tracked background bash processes without waiting or including bash command output.",
 		parameters: Type.Object({}),
+		renderCall(args, theme, context) {
+			return renderBackgroundToolCall("bash_bg_list", args, theme, context.lastComponent as Text | undefined);
+		},
+		renderResult(result, options, theme, context) {
+			return renderBackgroundToolResult("bash_bg_list", result, options, theme, context.lastComponent as Text | undefined, context.isError);
+		},
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			latestContext = ctx;
 			const snapshots = manager?.list() ?? [];
@@ -149,6 +164,12 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		label: "bash background wait",
 		description: "Wait for selected background bash processes to settle. Timeout or cancellation leaves them running.",
 		parameters: WaitParameters,
+		renderCall(args, theme, context) {
+			return renderBackgroundToolCall("bash_bg_wait", args, theme, context.lastComponent as Text | undefined);
+		},
+		renderResult(result, options, theme, context) {
+			return renderBackgroundToolResult("bash_bg_wait", result, options, theme, context.lastComponent as Text | undefined, context.isError);
+		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const activeManager = requireManager(ctx);
 			try {
@@ -184,6 +205,12 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		label: "bash background stop",
 		description: "Request termination of selected background bash processes through the same local backend as Pi's built-in bash tool.",
 		parameters: IdsParameters,
+		renderCall(args, theme, context) {
+			return renderBackgroundToolCall("bash_bg_kill", args, theme, context.lastComponent as Text | undefined);
+		},
+		renderResult(result, options, theme, context) {
+			return renderBackgroundToolResult("bash_bg_kill", result, options, theme, context.lastComponent as Text | undefined, context.isError);
+		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background stop aborted before termination began");
 			const results = await requireManager(ctx).kill(params.ids, 5000);

@@ -1,6 +1,9 @@
 import { mock } from "bun:test";
 
 mock.module("@earendil-works/pi-coding-agent", () => ({
+	keyHint(_keybinding: string, description: string) {
+		return `ctrl+e ${description}`;
+	},
 	formatSize(bytes: number) {
 		if (bytes < 1024) return `${bytes}B`;
 		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
