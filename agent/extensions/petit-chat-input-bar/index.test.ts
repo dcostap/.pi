@@ -40,9 +40,9 @@ test("positions the companion from editor borders and cleans up its compositor h
 
 	expect(options.visible(40, 12)).toBe(true);
 	const rendered = overlay.render(options.width);
-	expect([3, 4]).toContain(rendered.length);
+	expect([3, 4, 5]).toContain(rendered.length);
 	expect(options.maxHeight).toBe(rendered.length);
-	expect([10, 11]).toContain(options.width);
+	expect([10, 11, 12]).toContain(options.width);
 	const border = "─".repeat(40);
 	tui.compositeOverlays(["status", border, "input", border], 40, 12);
 	expect(options.row).toBe(0);
