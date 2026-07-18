@@ -12,7 +12,7 @@ import { parseJinaTargetMetadata } from "./jina-response.ts";
 import { assessWeakness, resolveBodyContentType } from "./quality-signals.ts";
 import { readResponseBuffer, readResponseText, ResponseSizeLimitError } from "./response-body.ts";
 import { processExtractedContentWithSpark } from "./summarize.ts";
-import { resolveUrl, type UrlResolution } from "./url-routing.ts";
+import { resolveUrl, thirdPartyFallbackBlockReason, type UrlResolution } from "./url-routing.ts";
 import { makeArtifactDir, saveBuffer, saveText, safeName, stripMarkdown } from "./utils.ts";
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
@@ -171,6 +171,53 @@ function isTextLike(contentType: string): boolean {
 	);
 }
 
+const BINARY_FILE_EXTENSION = /\.(?:ttf|otf|woff2?|eot|zip|gz|tgz|bz2|xz|7z|rar|png|jpe?g|gif|webp|ico|mp3|m4a|wav|ogg|mp4|mov|avi|webm|exe|dll|so|dylib|wasm|docx?|xlsx?|pptx?)(?:[?#].*)?$/i;
+
+function isProbablyBinary(contentType: string, url: string): boolean {
+	if (isProbablyPdf(contentType, url) || isTextLike(contentType)) return false;
+	return (
+		BINARY_FILE_EXTENSION.test(url) ||
+		contentType.startsWith("font/") ||
+		contentType.startsWith("image/") ||
+		contentType.startsWith("audio/") ||
+		contentType.startsWith("video/") ||
+		contentType.includes("octet-stream") ||
+		contentType.includes("zip") ||
+		contentType.includes("compressed") ||
+		contentType.startsWith("application/") ||
+		contentType.startsWith("model/")
+	);
+}
+
+function binarySignature(buffer: Buffer): string | undefined {
+	if (buffer.length >= 4 && buffer.subarray(0, 4).equals(Buffer.from([0x00, 0x01, 0x00, 0x00]))) return "TrueType font";
+	const ascii4 = buffer.subarray(0, 4).toString("ascii");
+	if (ascii4 === "OTTO") return "OpenType font";
+	if (ascii4 === "wOFF") return "WOFF font";
+	if (ascii4 === "wOF2") return "WOFF2 font";
+	if (buffer.length >= 4 && buffer.subarray(0, 4).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d]))) return "WebAssembly module";
+	if (buffer.length >= 4 && buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) return "ZIP archive";
+	if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "PNG image";
+	return undefined;
+}
+
+function binaryResultContent(contentType: string, byteLength: number, signature?: string): string {
+	return [
+		"Binary response fetched successfully.",
+		`Content-Type: ${contentType || "application/octet-stream"}`,
+		`Size: ${byteLength} bytes`,
+		signature ? `Detected signature: ${signature}` : undefined,
+	].filter(Boolean).join("\n");
+}
+
+function fileNameFromUrl(url: string, fallback: string): string {
+	try {
+		return safeName(basename(new URL(url).pathname) || fallback);
+	} catch {
+		return safeName(basename(url) || fallback);
+	}
+}
+
 function isMarkdownLike(contentType: string): boolean {
 	return contentType.includes("markdown") || contentType.includes("text/plain; profile=markdown");
 }
@@ -227,7 +274,7 @@ async function tryFetchYouTubeTranscript(
 	if (signal?.aborted) onParentAbort();
 	else signal?.addEventListener("abort", onParentAbort, { once: true });
 	const sizeMonitor = setInterval(() => {
-		for (const name of readdirSync(artifactDir).filter((entry) => /^youtube-transcript\..*\.vtt$/i.test(entry))) {
+		for (const name of readdirSync(artifactDir).filter((entry) => /^youtube-transcript\..*\.vtt(?:\.part)?$/i.test(entry))) {
 			const file = join(artifactDir, name);
 			try {
 				const size = statSync(file).size;
@@ -523,6 +570,38 @@ async function localFetch(
 				},
 			};
 		}
+		if (isProbablyBinary(curl.contentType, curl.finalUrl)) {
+			const signature = binarySignature(curl.body);
+			const content = binaryResultContent(curl.contentType, curl.body.byteLength, signature);
+			files.binary = saveBuffer(join(artifactDir, fileNameFromUrl(curl.finalUrl, "download.bin")), curl.body);
+			return {
+				method: "direct" as const,
+				url: curl.finalUrl,
+				content,
+				artifactDir,
+				files,
+				meta: {
+					contentType: curl.contentType,
+					status: curl.status,
+					headers: curl.responseHeaders,
+					contentKind: "binary",
+					isApiLike: true,
+					binarySignature: signature,
+					weakReasons: assessWeakness(content, undefined, { apiLike: true, status: curl.status }),
+					diagnostics: {
+						strategy: "curl-tls-fallback",
+						cache: "none",
+						status: curl.status,
+						finalUrl: curl.finalUrl,
+						fetchMs: curl.fetchMs,
+						extractMs: 0,
+						originalBytes: curl.body.byteLength,
+						extractedChars: content.length,
+						truncated: false,
+					},
+				},
+			};
+		}
 		const html = curl.body.toString("utf8");
 		files.rawHtml = saveText(join(artifactDir, "raw.html"), html);
 		const extractStartedAt = Date.now();
@@ -603,6 +682,41 @@ async function localFetch(
 					finalUrl,
 					fetchMs,
 					extractMs: Date.now() - extractStartedAt,
+					originalBytes: buffer.byteLength,
+					extractedChars: content.length,
+					truncated: false,
+				},
+			},
+		};
+	}
+
+	if (isProbablyBinary(actualContentType, finalUrl)) {
+		const buffer = await readResponseBuffer(res, config.maxTextResponseBytes, "Binary response", signal);
+		const fetchMs = Date.now() - startedAt;
+		const signature = binarySignature(buffer);
+		const content = binaryResultContent(actualContentType, buffer.byteLength, signature);
+		files.binary = saveBuffer(join(artifactDir, fileNameFromUrl(finalUrl, "download.bin")), buffer);
+		return {
+			method: "direct" as const,
+			url: finalUrl,
+			content,
+			artifactDir,
+			files,
+			meta: {
+				contentType: actualContentType || "application/octet-stream",
+				status: res.status,
+				headers: responseHeaders,
+				contentKind: "binary",
+				isApiLike: true,
+				binarySignature: signature,
+				weakReasons: assessWeakness(content, undefined, { apiLike: true, status: res.status }),
+				diagnostics: {
+					strategy: "http",
+					cache: "none",
+					status: res.status,
+					finalUrl,
+					fetchMs,
+					extractMs: 0,
 					originalBytes: buffer.byteLength,
 					extractedChars: content.length,
 					truncated: false,
@@ -716,6 +830,9 @@ function formatFetchOutput(result: FetchResult): string {
 		result.meta?.published ? `Published: ${result.meta.published}` : undefined,
 		typeof result.meta?.wordCount === "number" ? `Word count: ${result.meta.wordCount}` : undefined,
 		result.quality ? `Quality: ${result.quality}${result.qualityReason ? ` — ${result.qualityReason}` : ""}` : undefined,
+		result.meta?.thirdPartyFallbackBlocked
+			? `Third-party fallbacks: skipped (${result.meta.thirdPartyFallbackBlocked})`
+			: undefined,
 		result.output?.note ? `\nNote:\n\n${result.output.note}` : undefined,
 		result.output?.text ? `\n${outputLabel}:\n\n${result.output.text}` : undefined,
 		`\nArtifacts:`,
@@ -774,7 +891,7 @@ async function assessCandidate(
 		finalUrl?: string;
 		contentType?: string;
 		status?: number;
-		contentKind?: "api" | "html" | "pdf" | "text" | "unknown";
+		contentKind?: "api" | "binary" | "html" | "pdf" | "text" | "unknown";
 		method?: string;
 		headers?: Record<string, string>;
 	},
@@ -816,8 +933,8 @@ export async function fetchUrl(
 			fetchUrl: route.fetchUrl,
 			dedupeKey: route.dedupeKey,
 			adapterId: route.adapterId,
-			strategy: "github-checkout",
-			cache: "managed",
+			strategy: gh.strategy,
+			cache: gh.cache,
 			fetchMs: Date.now() - githubStartedAt,
 			owner: gh.owner,
 			repo: gh.repo,
@@ -924,7 +1041,7 @@ export async function fetchUrl(
 		finalUrl: (result.meta?.diagnostics as AttemptDiagnostic | undefined)?.finalUrl || route.fetchUrl,
 		contentType: result.meta?.contentType as string | undefined,
 		status: result.meta?.status as number | undefined,
-		contentKind: (result.meta?.contentKind as "api" | "html" | "pdf" | "text" | "unknown" | undefined) || "unknown",
+		contentKind: (result.meta?.contentKind as "api" | "binary" | "html" | "pdf" | "text" | "unknown" | undefined) || "unknown",
 		method: result.method,
 		headers: (result.meta?.headers as Record<string, string> | undefined) || undefined,
 	};
@@ -935,8 +1052,18 @@ export async function fetchUrl(
 	result.answer = assessment.promptAnswer;
 	result.tldr = assessment.tldr;
 	attempts.push(attemptFromResult(result, assessment));
+	const fallbackBlocked = thirdPartyFallbackBlockReason(route.fetchUrl);
+	if (assessment.quality === "WEAK" && fallbackBlocked) {
+		result.meta = { ...(result.meta || {}), thirdPartyFallbackBlocked: fallbackBlocked };
+		onUpdate?.({
+			content: [{
+				type: "text",
+				text: `Extraction looked weak, but third-party fallbacks were skipped to avoid forwarding credentials (${fallbackBlocked}).`,
+			}],
+		});
+	}
 
-	if (assessment.quality === "WEAK") {
+	if (assessment.quality === "WEAK" && !fallbackBlocked) {
 		onUpdate?.({ content: [{ type: "text", text: `Extraction looked weak (${assessment.reason}). Trying Jina Reader...` }] });
 		const jinaStartedAt = Date.now();
 		try {
@@ -1018,7 +1145,7 @@ export async function fetchUrl(
 		}
 	}
 
-	if (assessment.quality === "WEAK") {
+	if (assessment.quality === "WEAK" && !fallbackBlocked) {
 		if (client) {
 			onUpdate?.({ content: [{ type: "text", text: `Escalating to Firecrawl... (timeout ${NETWORK_STEP_TIMEOUT_MS / 1000}s)` }] });
 			const firecrawlStartedAt = Date.now();
@@ -1208,6 +1335,7 @@ export async function fetchUrl(
 			extractedChars: selectedDiagnostics.extractedChars ?? result.content.length,
 			truncated: Boolean(selectedDiagnostics.truncated) || result.output.truncated,
 			diagnostics,
+			thirdPartyFallbackBlocked: fallbackBlocked,
 			limits: {
 				maxTextResponseBytes: config.maxTextResponseBytes,
 				maxPdfResponseBytes: config.maxPdfResponseBytes,

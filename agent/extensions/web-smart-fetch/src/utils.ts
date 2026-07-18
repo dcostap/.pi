@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,8 +18,10 @@ export function ensureDir(path: string): string {
 
 export function makeArtifactDir(baseDir: string, prefix: string, key: string): string {
 	const stamp = new Date().toISOString().replace(/[.:]/g, "-");
-	const dir = join(baseDir, `${prefix}_${stamp}_${sha1(key).slice(0, 10)}`);
-	return ensureDir(dir);
+	ensureDir(baseDir);
+	// mkdtempSync adds an atomic random suffix, so identical concurrent calls
+	// cannot share fixed artifact filenames and overwrite one another.
+	return mkdtempSync(join(baseDir, `${prefix}_${stamp}_${sha1(key).slice(0, 10)}_`));
 }
 
 export function saveText(path: string, text: string): string {

@@ -19,6 +19,10 @@ type UrlAdapter = {
 };
 
 function removeUnbalancedTrailingDelimiters(value: string): string {
+	// Query values legitimately and commonly end in ')' or ']'. There is no
+	// reliable way to distinguish those from prose punctuation, so preserve the
+	// query verbatim rather than silently changing the requested resource.
+	if (value.includes("?")) return value;
 	let result = value;
 	for (const [open, close] of [["(", ")"], ["[", "]"]] as const) {
 		while (result.endsWith(close)) {
@@ -83,11 +87,44 @@ export function urlDedupeKey(input: unknown): string {
 	return url.toString();
 }
 
+const SENSITIVE_QUERY_KEY = /^(?:access[-_]?token|api[-_]?key|auth(?:orization)?|code|credential|expires?|jwt|key-pair-id|password|passphrase|secret|session(?:id)?|sig(?:nature)?|signed|token|x-amz-.+|x-goog-.+)$/i;
+
+export function thirdPartyFallbackBlockReason(input: unknown): string | undefined {
+	const url = new URL(normalizeUrl(input));
+	for (const [key, value] of url.searchParams) {
+		if (SENSITIVE_QUERY_KEY.test(key)) return `sensitive query parameter: ${key}`;
+		if (/^bearer\s+/i.test(value) || /^[a-z\d_-]+\.[a-z\d_-]+\.[a-z\d_-]+$/i.test(value)) {
+			return `credential-like query value: ${key}`;
+		}
+	}
+	return undefined;
+}
+
 function host(url: URL): string {
 	return url.hostname.replace(/^www\./, "").toLowerCase();
 }
 
 const adapters: readonly UrlAdapter[] = [
+	{
+		id: "github-raw",
+		handler: "direct",
+		matches: (url) => host(url) === "raw.githubusercontent.com",
+	},
+	{
+		id: "github-blob-raw",
+		handler: "direct",
+		matches: (url) => {
+			const parts = url.pathname.split("/").filter(Boolean);
+			return host(url) === "github.com" && parts.length >= 5 && parts[2] === "blob";
+		},
+		rewrite: (url) => {
+			const parts = url.pathname.split("/").filter(Boolean);
+			const rewritten = new URL(`https://raw.githubusercontent.com/${parts[0]}/${parts[1]}/${parts.slice(3).join("/")}`);
+			// GitHub blob query parameters (for example ?plain=1) are page options,
+			// not raw-file transport parameters, and may contain sensitive values.
+			return { fetchUrl: rewritten };
+		},
+	},
 	{
 		id: "github",
 		handler: "github",

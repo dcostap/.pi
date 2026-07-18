@@ -14,10 +14,16 @@ Pi extension for:
 - deterministic ordinary-page handling
   - usable extracted content up to the configured threshold is returned directly
   - the fast model is used for focused questions, oversized summaries, and ambiguous quality only
-- GitHub URLs handled specially via local cached checkout
+- GitHub URLs use the cheapest targeted path
+  - `raw.githubusercontent.com` files are fetched directly and never wait on a repository cache lock
+  - GitHub `/blob/` pages are rewritten to direct raw-file requests
+  - GitHub `/tree/` paths use the Contents API first, with a sparse checkout fallback
+  - repository roots use an atomic `--depth=1 --filter=blob:none --sparse` cache
+  - Git/API operations and repository-lock waits time out after five minutes
 - weak local extraction escalates automatically
   - Jina Reader first
   - Firecrawl if configured
+  - credential-bearing/signed URLs never escalate to third-party readers automatically
 - HTTP errors, empty responses, challenge pages, thin HTML, and JS shells are explicit escalation signals
 - fetch results include selected strategy, status, timing, extraction sizes, truncation state, and per-attempt diagnostics
 - abort-aware concurrency limiting protects parallel `fetch_url` batches
@@ -27,7 +33,9 @@ Pi extension for:
 - oversized results auto-summarize with:
   - the configured `fastCheap` model role (`/fast-model status`, `/fast-model set provider/model`)
 - if `fetch_url` gets a `prompt`, it answers from extracted content; weak extraction escalates to Firecrawl when configured
-- full artifacts always saved locally
+- full artifacts always saved locally in per-request, atomically unique directories
+- Firecrawl crawl failures/cancellations are errors, and crawl startup plus polling share one deadline
+- fetched content is explicitly framed as untrusted data for fast-model quality checks and summaries
 
 ## Config
 

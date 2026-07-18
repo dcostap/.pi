@@ -15,8 +15,9 @@ async function requestFirecrawl(
 	path: string,
 	init?: RequestInit,
 	parentSignal?: AbortSignal,
+	timeoutMs = FIRECRAWL_TIMEOUT_MS,
 ): Promise<any> {
-	const timeoutSignal = AbortSignal.timeout(FIRECRAWL_TIMEOUT_MS);
+	const timeoutSignal = AbortSignal.timeout(Math.max(1, Math.floor(timeoutMs)));
 	const signal = parentSignal ? AbortSignal.any([parentSignal, timeoutSignal]) : timeoutSignal;
 	const response = await fetch(`${client.apiUrl}${path}`, {
 		...init,
@@ -39,6 +40,36 @@ async function requestFirecrawl(
 		throw new Error(`Firecrawl request failed (${path}): ${message}`);
 	}
 	return body;
+}
+
+function remainingMs(deadline: number, jobId?: string): number {
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) {
+		throw new Error(`Firecrawl crawl timed out after ${FIRECRAWL_TIMEOUT_MS / 1000}s${jobId ? ` (job ${jobId})` : ""}`);
+	}
+	return remaining;
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) {
+		return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("Firecrawl crawl aborted"));
+	}
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(done, ms);
+		const onAbort = () => {
+			cleanup();
+			reject(signal?.reason instanceof Error ? signal.reason : new Error("Firecrawl crawl aborted"));
+		};
+		function cleanup() {
+			clearTimeout(timeout);
+			signal?.removeEventListener("abort", onAbort);
+		}
+		function done() {
+			cleanup();
+			resolve();
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 export async function getFirecrawlClient(config: ExtensionConfig): Promise<FirecrawlClient | undefined> {
@@ -71,6 +102,7 @@ export async function searchWithFirecrawl(client: FirecrawlClient, query: string
 }
 
 export async function crawlWithFirecrawl(client: FirecrawlClient, url: string, limit = 20, signal?: AbortSignal) {
+	const deadline = Date.now() + FIRECRAWL_TIMEOUT_MS;
 	const started = await requestFirecrawl(client, "/v2/crawl", {
 		method: "POST",
 		body: JSON.stringify({
@@ -78,16 +110,25 @@ export async function crawlWithFirecrawl(client: FirecrawlClient, url: string, l
 			limit,
 			scrapeOptions: { formats: ["markdown"], timeout: FIRECRAWL_TIMEOUT_MS },
 		}),
-	}, signal);
+	}, signal, remainingMs(deadline));
 	const id = started?.id;
 	if (!id) throw new Error("Firecrawl crawl did not return a job id");
 
-	const deadline = Date.now() + FIRECRAWL_TIMEOUT_MS;
-	while (Date.now() < deadline) {
+	while (true) {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Firecrawl crawl aborted");
-		const status = await requestFirecrawl(client, `/v2/crawl/${encodeURIComponent(id)}`, undefined, signal);
-		if (["completed", "failed", "cancelled"].includes(status?.status)) return status;
-		await new Promise((resolve) => setTimeout(resolve, 2_000));
+		const status = await requestFirecrawl(
+			client,
+			`/v2/crawl/${encodeURIComponent(id)}`,
+			undefined,
+			signal,
+			remainingMs(deadline, id),
+		);
+		const state = String(status?.status || "").toLowerCase();
+		if (state === "completed") return status;
+		if (state === "failed" || state === "cancelled") {
+			const reason = status?.error || status?.message || "no reason provided";
+			throw new Error(`Firecrawl crawl ${state} (job ${id}): ${reason}`);
+		}
+		await abortableDelay(Math.min(2_000, remainingMs(deadline, id)), signal);
 	}
-	throw new Error(`Firecrawl crawl timed out after ${FIRECRAWL_TIMEOUT_MS / 1000}s (job ${id})`);
 }

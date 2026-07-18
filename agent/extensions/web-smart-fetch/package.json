@@ -9,7 +9,7 @@
     ]
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test src/content-policy.test.ts src/quality-signals.test.ts src/response-body.test.ts src/concurrency-limiter.test.ts src/url-routing.test.ts src/jina-response.test.ts"
+    "test": "node --experimental-strip-types --test src/content-policy.test.ts src/quality-signals.test.ts src/response-body.test.ts src/concurrency-limiter.test.ts src/url-routing.test.ts src/jina-response.test.ts src/firecrawl.test.ts src/utils.test.ts"
   },
   "dependencies": {
     "defuddle": "^0.19.1",

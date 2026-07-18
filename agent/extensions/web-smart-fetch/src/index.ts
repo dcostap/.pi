@@ -72,18 +72,23 @@ function renderToolOutputBlock(output: string, expanded: boolean, theme: any, ma
 	return text;
 }
 
-function githubPayloadKind(output: string): { label: string; note: string } {
+function githubPayloadKind(output: string, strategy?: string): { label: string; note: string } {
 	const firstLine = output.trimStart().split(/\r?\n/, 1)[0] || "";
+	const fromApi = strategy === "github-api";
 	if (firstLine.startsWith("File: ")) {
 		return {
 			label: "file contents preview",
-			note: "The agent received the file header plus file text from the cached checkout (tool payload capped by fetch_url).",
+			note: fromApi
+				? "The agent received file metadata/content from the GitHub API without cloning the repository."
+				: "The agent received the file header plus file text from the sparse cached checkout (tool payload capped by fetch_url).",
 		};
 	}
 	if (firstLine.startsWith("Directory: ")) {
 		return {
 			label: "directory listing",
-			note: "The agent received a listing of this folder from the cached checkout, not every file's contents.",
+			note: fromApi
+				? "The agent received this folder listing from the GitHub API without cloning the repository."
+				: "The agent received a listing of this folder from the sparse cached checkout, not every file's contents.",
 		};
 	}
 	if (firstLine.startsWith("Repository: ")) {
@@ -128,12 +133,12 @@ export default function (pi: ExtensionAPI) {
 		name: "fetch_url",
 		label: "Fetch URL",
 		description:
-			"Fetch one specific URL with local extraction first, deterministic extracted content for ordinary pages, external GitHub repo inspect/cache handling, and remote fallback when needed. Oversized pages are summarized and full artifacts are saved locally.",
-		promptSnippet: "Fetch a specific URL/page/PDF, or cache an external GitHub repo locally for inspection and return its checkout path.",
+			"Fetch one specific URL with local extraction first, deterministic extracted content for ordinary pages, direct GitHub raw/blob fetching, GitHub API tree inspection, sparse repository caching, and remote fallback when needed. Oversized pages are summarized and full artifacts are saved locally.",
+		promptSnippet: "Fetch a specific URL/page/PDF, inspect a GitHub path without cloning, or sparsely cache an external GitHub repository root.",
 		promptGuidelines: [
 			"Use fetch_url when the user gives a specific URL or asks to inspect one exact page.",
 			"When several URLs are worth fetching, batch 2-4 independent fetch_url calls in parallel; don't fetch whole result lists by default.",
-			"Use fetch_url instead of git clone for external GitHub repos you only need to inspect; it caches locally and returns the checkout path.",
+			"Use fetch_url instead of git clone for external GitHub repos you only need to inspect; raw files are fetched directly, tree paths use the GitHub API, and repository roots use a shallow sparse cache.",
 			"If the user asks you to clone a GitHub repo into the workspace so they can modify it, use normal git/workspace commands instead.",
 		],
 		parameters: Type.Object({
@@ -158,7 +163,7 @@ export default function (pi: ExtensionAPI) {
 			if (d.method) text += ` ${theme.fg("muted", d.method)}`;
 			if (d.method === "github") {
 				const output = textOutput(result);
-				const payload = githubPayloadKind(output);
+				const payload = githubPayloadKind(output, d.strategy);
 				if (d.owner && d.repo) text += `\n${theme.fg("success", "Repository:")} ${theme.fg("accent", `${d.owner}/${d.repo}`)}`;
 				if (d.ref) text += `\n${theme.fg("success", "Ref:")} ${theme.fg("dim", String(d.ref))}`;
 				if (d.localPath) text += `\n${theme.fg("success", "Local path:")} ${theme.fg("dim", String(d.localPath))}`;
