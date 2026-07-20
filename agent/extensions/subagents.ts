@@ -4,9 +4,10 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DynamicBorder, getMarkdownTheme, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
+import { StringEnum, type Model } from "@earendil-works/pi-ai";
 import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { buildConversationTranscript } from "./_shared/conversation-transcript.ts";
 
 const REVIEW_TOOL_NAME = "launch_review_subagents";
 const GENERIC_TOOL_NAME = "launch_generic_subagents";
@@ -24,6 +25,7 @@ const LIVE_CONTEXT_WIDTH = "100.0%/1000k".length;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type SubagentKind = "review" | "generic";
+type ContextMode = "fresh" | "transcript";
 
 type CommonSubagentParams = {
 	description: string;
@@ -37,6 +39,7 @@ type ReviewerParams = CommonSubagentParams & {
 
 type ReviewLaunchParams = {
 	what_to_review: string;
+	context?: ContextMode;
 	reviewers: ReviewerParams[];
 };
 
@@ -46,6 +49,7 @@ type GenericSubagentParams = CommonSubagentParams & {
 
 type GenericLaunchParams = {
 	task: string;
+	context?: ContextMode;
 	subagents: GenericSubagentParams[];
 };
 
@@ -57,6 +61,8 @@ type ResolvedTask = CommonSubagentParams & {
 	systemPromptPath: string;
 	userPrompt: string;
 	mainTask: string;
+	contextMode: ContextMode;
+	conversationTranscript?: string;
 	whatToReview?: string;
 	focus?: string;
 	assignment?: string;
@@ -83,6 +89,7 @@ type RuntimeState = {
 	sessionName: string;
 	sandboxDir: string;
 	mainTask: string;
+	contextMode: ContextMode;
 	whatToReview?: string;
 	focus?: string;
 	assignment?: string;
@@ -474,8 +481,21 @@ function buildSubagentInstructionsFile(task: ResolvedTask, cwd: string): string 
 	return task.kind === "review" ? buildReviewSubagentInstructions(task, cwd) : buildGenericSubagentInstructions(task, cwd);
 }
 
+function buildTranscriptPromptSection(task: ResolvedTask): string[] {
+	if (task.contextMode !== "transcript" || !task.conversationTranscript) return [];
+	return [
+		"<main_session_transcript>",
+		"The following is a plain-text transcript of the completed conversation in the main session. It ends before the main session's current user request and in-progress assistant turn. Use it only as background context for the assignment below.",
+		"",
+		task.conversationTranscript,
+		"</main_session_transcript>",
+		"",
+	];
+}
+
 function buildReviewSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
 	const parts = [
+		...buildTranscriptPromptSection(task),
 		"<persistent_code_review_subagent_instructions>",
 		buildReviewSubagentInstructions(task, cwd),
 		"</persistent_code_review_subagent_instructions>",
@@ -500,6 +520,7 @@ function buildReviewSubagentUserPrompt(task: ResolvedTask, cwd: string): string 
 
 function buildGenericSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
 	const parts = [
+		...buildTranscriptPromptSection(task),
 		"<persistent_generic_subagent_instructions>",
 		buildGenericSubagentInstructions(task, cwd),
 		"</persistent_generic_subagent_instructions>",
@@ -518,7 +539,7 @@ function buildGenericSubagentUserPrompt(task: ResolvedTask, cwd: string): string
 function buildMainSystemPromptAddition(): string {
 	return [
 		"Review subagents:",
-		`- You have a ${REVIEW_TOOL_NAME} tool that launches fresh same-cwd Pi code review subagent sessions in parallel.`,
+		`- You have a ${REVIEW_TOOL_NAME} tool that launches same-cwd Pi code review subagent sessions in parallel.`,
 		"- Review subagents are specifically for code reviews. Use them for reviewing code, diffs, implementation plans with code impact, or concrete code-review targets.",
 		"- Only launch review subagents when the user explicitly asks for subagents/parallel agents to review code, or unmistakably asks you to delegate code review work to other agents.",
 		`- You may launch at most ${MAX_SUBAGENTS} review subagents in one tool call. If the user asks for multiple reviewers, use one parallel tool call rather than sequential calls when possible.`,
@@ -531,7 +552,7 @@ function buildMainSystemPromptAddition(): string {
 		"- Model overrides may be loose names, but you should resolve ambiguity before launching when possible. If a name could refer to multiple providers/models, ask the user which provider/model they mean instead of guessing. You can inspect models with `pi --list-models <query>` if needed.",
 		"",
 		"Generic subagents:",
-		`- You also have a ${GENERIC_TOOL_NAME} tool that launches fresh same-cwd Pi generic subagent sessions in parallel.`,
+		`- You also have a ${GENERIC_TOOL_NAME} tool that launches same-cwd Pi generic subagent sessions in parallel.`,
 		"- Generic subagents do not receive the code review rubric or any task-specific output format. Provide the complete task and any per-subagent assignment yourself.",
 		"- Use generic subagents only when the user explicitly asks for subagents/parallel agents/delegation, or unmistakably wants independent parallel investigation or exploration.",
 		"- Do not use generic subagents for code review tasks; use the review subagent tool for code reviews.",
@@ -540,6 +561,10 @@ function buildMainSystemPromptAddition(): string {
 		"- The generic tool returns a final per-subagent stats summary followed by each subagent's final answer. Synthesize results for the user, deduplicate, and call out disagreements or uncertainty.",
 		"- By default generic subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-subagent `model` and/or `thinking`.",
 		"- Generic subagent model overrides follow the same ambiguity rules as review subagents: ask the user to clarify rather than guessing among multiple possible model matches.",
+		"",
+		"Subagent context:",
+		"- Both launch tools default to fresh context. Unless the user explicitly asks for prior conversation context or a transcript, omit `context` so the fresh default is used.",
+		"- Set `context` to `transcript` only when explicitly requested. This pastes the completed main-session user/assistant transcript and summaries into each subagent prompt, ending before the current user request and in-progress assistant turn.",
 	].join("\n");
 }
 
@@ -616,8 +641,9 @@ function buildSubagentPromptHeader(states: RuntimeState[], includePerSubagentDet
 	const first = states[0];
 	const mainTask = states.find((state) => state.mainTask)?.mainTask;
 	const lines: string[] = [];
+	if (first) lines.push(`Context: ${first.contextMode}`);
 	if (mainTask) {
-		lines.push(first?.kind === "generic" ? "Generic task prompt sent to subagents:" : "Code review target prompt sent to subagents:", "<<<", mainTask, ">>>");
+		lines.push("", first?.kind === "generic" ? "Generic task prompt sent to subagents:" : "Code review target prompt sent to subagents:", "<<<", mainTask, ">>>");
 	}
 	if (!includePerSubagentDetails) return lines.join("\n");
 	const detailLines = states
@@ -947,10 +973,16 @@ async function finalizeTasks(
 async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<PreparedTasks> {
 	const errors: string[] = [];
 	const whatToReview = cleanText(params.what_to_review || "");
+	const contextMode = params.context ?? "fresh";
 	if (!whatToReview) errors.push("what_to_review is required and should describe only the code review target");
+	if (contextMode !== "fresh" && contextMode !== "transcript") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one code review subagent");
 	if (Array.isArray(params.reviewers) && params.reviewers.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} code review subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
+	const conversationTranscript = contextMode === "transcript"
+		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
+		: undefined;
+	if (contextMode === "transcript" && !conversationTranscript) return { errors: ["transcript context was requested, but the main session has no completed conversation before the current turn"] };
 
 	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
 	const currentModelRef = getCurrentModelRef(ctx);
@@ -966,6 +998,8 @@ async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionCont
 			index,
 			sessionName: `${REVIEW_SESSION_PREFIX} ${common.description}`,
 			mainTask: whatToReview,
+			contextMode,
+			conversationTranscript,
 			whatToReview,
 			focus: focus || undefined,
 		});
@@ -978,10 +1012,16 @@ async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionCont
 async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<PreparedTasks> {
 	const errors: string[] = [];
 	const task = cleanText(params.task || "");
+	const contextMode = params.context ?? "fresh";
 	if (!task) errors.push("task is required and should contain the full generic subagent task");
+	if (contextMode !== "fresh" && contextMode !== "transcript") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.subagents) || params.subagents.length === 0) errors.push("subagents must contain at least one generic subagent");
 	if (Array.isArray(params.subagents) && params.subagents.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} generic subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
+	const conversationTranscript = contextMode === "transcript"
+		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
+		: undefined;
+	if (contextMode === "transcript" && !conversationTranscript) return { errors: ["transcript context was requested, but the main session has no completed conversation before the current turn"] };
 
 	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
 	const currentModelRef = getCurrentModelRef(ctx);
@@ -997,6 +1037,8 @@ async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionCo
 			index,
 			sessionName: `${GENERIC_SESSION_PREFIX} ${common.description}`,
 			mainTask: task,
+			contextMode,
+			conversationTranscript,
 			assignment: assignment || undefined,
 		});
 	});
@@ -1204,6 +1246,7 @@ function buildFinalToolResult(results: ChildResult[]) {
 		const metadata = `> ${formatStatusRow(state, false)}`;
 		const specificAssignment = state.kind === "review" ? state.focus : state.assignment;
 		const details = [
+			`- **Context:** ${state.contextMode}`,
 			specificAssignment ? `- **${state.kind === "review" ? "Focus" : "Assignment"}:** ${specificAssignment}` : "",
 			`- **Attempts / model turns / duration:** ${countLabel(state.attempt, "attempt")} · ${countLabel(state.usage.turns, "turn")} · ${formatDuration(state.updatedAt - state.startedAt)}`,
 			`- **Tokens:** ${formatExactTokens(totalTokens(state.usage))} total (input ${formatExactTokens(state.usage.input)} · output ${formatExactTokens(state.usage.output)} · cache read ${formatExactTokens(state.usage.cacheRead)} · cache write ${formatExactTokens(state.usage.cacheWrite)})`,
@@ -1236,6 +1279,7 @@ function buildFinalToolResult(results: ChildResult[]) {
 				sessionFile: result.state.sessionFile,
 				sandboxDir: result.state.sandboxDir,
 				mainTask: result.state.mainTask,
+				contextMode: result.state.contextMode,
 				whatToReview: result.state.whatToReview,
 				focus: result.state.focus,
 				assignment: result.state.assignment,
@@ -1279,6 +1323,7 @@ function renderFinalSubagentResult(result: any, prefix: string, theme: Theme): C
 		const specificAssignment = item.kind === "review" ? item.focus : item.assignment;
 		const usage = item.usage as UsageStats;
 		const info = [
+			`context: ${item.contextMode ?? "fresh"}`,
 			specificAssignment ? `${item.kind === "review" ? "focus" : "assignment"}: ${specificAssignment}` : "",
 			`${countLabel(item.attempts ?? item.attempt ?? 1, "attempt")} · ${countLabel(usage?.turns ?? 0, "turn")} · ${formatDuration(item.durationMs ?? 0)}`,
 			`tokens: ${formatExactTokens(totalTokens(usage))} total (input ${formatExactTokens(usage.input)} · output ${formatExactTokens(usage.output)} · cache read ${formatExactTokens(usage.cacheRead)} · cache write ${formatExactTokens(usage.cacheWrite)})`,
@@ -1308,9 +1353,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: REVIEW_TOOL_NAME,
 		label: "Launch Code Review Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi code review subagents in parallel. The extension injects the code review rubric and output format; callers should provide only what code to review and optional neutral focus areas.`,
+		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi code review subagents in parallel. Context defaults to fresh; an explicitly requested transcript can be pasted into each prompt. The extension injects the code review rubric and output format.`,
 		parameters: Type.Object({
 			what_to_review: Type.String({ description: "Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
+			context: Type.Optional(StringEnum(["fresh", "transcript"] as const, { description: "Optional context mode. Omit unless the user explicitly requests one. Defaults to fresh. transcript pastes the completed main-session conversation ending before the current turn." })),
 			reviewers: Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
@@ -1344,6 +1390,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				assignment: task.assignment,
 				modelRef: task.modelRef,
 				thinking: task.thinking,
+				contextMode: task.contextMode,
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
@@ -1396,9 +1443,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: GENERIC_TOOL_NAME,
 		label: "Launch Generic Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} fresh same-cwd Pi generic subagents in parallel. No code review rubric or task-specific output format is injected; callers must provide the complete task and any per-subagent assignment.`,
+		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi generic subagents in parallel. Context defaults to fresh; an explicitly requested transcript can be pasted into each prompt. No task-specific output format is injected.`,
 		parameters: Type.Object({
 			task: Type.String({ description: "Complete generic task to give every subagent. Include all relevant context and desired output shape." }),
+			context: Type.Optional(StringEnum(["fresh", "transcript"] as const, { description: "Optional context mode. Omit unless the user explicitly requests one. Defaults to fresh. transcript pastes the completed main-session conversation ending before the current turn." })),
 			subagents: Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Generic Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated subagents." }),
@@ -1432,6 +1480,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				assignment: task.assignment,
 				modelRef: task.modelRef,
 				thinking: task.thinking,
+				contextMode: task.contextMode,
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",

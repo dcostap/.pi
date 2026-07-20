@@ -1,30 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-function textFromContent(content: unknown) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  return content
-    .map((block) => {
-      if (!block || typeof block !== "object") return "";
-      if (!("type" in block)) return "";
-
-      if (
-        block.type === "text" &&
-        "text" in block &&
-        typeof block.text === "string"
-      ) {
-        return block.text;
-      }
-
-      if (block.type === "image") return "[image]";
-
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
+import { buildConversationTranscript } from "./_shared/conversation-transcript.ts";
 
 function runClipboardProcess(
   command: string,
@@ -83,59 +59,18 @@ export default function (pi: ExtensionAPI) {
     description:
       "Copy all previous user/assistant messages and summaries in this thread to the clipboard",
     handler: async (_args, ctx) => {
-      let branchEntries = ctx.sessionManager.getBranch();
+      const transcript = buildConversationTranscript(
+        ctx.sessionManager.getBranch(),
+        !ctx.isIdle(),
+      );
 
-      // If copy-all is invoked while the agent is still working, copy only the
-      // already-completed conversation. The active turn is still WIP and may not
-      // be fully persisted yet, so ignore everything from the latest user
-      // message onward.
-      if (!ctx.isIdle()) {
-        for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
-          const entry = branchEntries[index];
-          if (entry?.type === "message" && entry.message.role === "user") {
-            branchEntries = branchEntries.slice(0, index);
-            break;
-          }
-        }
-      }
-
-      const sections = branchEntries
-        .map((entry) => {
-          if (entry.type === "message") {
-            const message = entry.message;
-            if (message.role !== "user" && message.role !== "assistant") return undefined;
-
-            const content = textFromContent(message.content).trim();
-            if (!content) return undefined;
-
-            return `${message.role.toUpperCase()}:\n${content}`;
-          }
-
-          if (entry.type === "compaction") {
-            const summary = entry.summary?.trim();
-            if (!summary) return undefined;
-            return `COMPACTION SUMMARY:\n${summary}`;
-          }
-
-          if (entry.type === "branch_summary") {
-            const summary = entry.summary?.trim();
-            if (!summary) return undefined;
-            return `BRANCH SUMMARY:\n${summary}`;
-          }
-
-          return undefined;
-        })
-        .filter((section): section is string => Boolean(section));
-
-      const text = sections.join("\n\n---\n\n");
-
-      if (!text) {
+      if (!transcript.text) {
         ctx.ui.notify("No user, assistant, or summary messages to copy", "info");
         return;
       }
 
-      await copyToClipboard(text);
-      ctx.ui.notify(`Copied ${sections.length} sections to clipboard`, "info");
+      await copyToClipboard(transcript.text);
+      ctx.ui.notify(`Copied ${transcript.sectionCount} sections to clipboard`, "info");
     },
   });
 }
