@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { DynamicBorder, getMarkdownTheme, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getMarkdownTheme, SessionManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
 import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -25,7 +25,7 @@ const LIVE_CONTEXT_WIDTH = "100.0%/1000k".length;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type SubagentKind = "review" | "generic";
-type ContextMode = "fresh" | "transcript";
+type ContextMode = "fresh" | "transcript" | "clone";
 
 type CommonSubagentParams = {
 	description: string;
@@ -63,6 +63,8 @@ type ResolvedTask = CommonSubagentParams & {
 	mainTask: string;
 	contextMode: ContextMode;
 	conversationTranscript?: string;
+	initialSessionFile?: string;
+	promptCacheKey?: string;
 	whatToReview?: string;
 	focus?: string;
 	assignment?: string;
@@ -563,8 +565,9 @@ function buildMainSystemPromptAddition(): string {
 		"- Generic subagent model overrides follow the same ambiguity rules as review subagents: ask the user to clarify rather than guessing among multiple possible model matches.",
 		"",
 		"Subagent context:",
-		"- Both launch tools default to fresh context. Unless the user explicitly asks for prior conversation context or a transcript, omit `context` so the fresh default is used.",
+		"- Both launch tools default to fresh context. Unless the user explicitly requests a context mode, omit `context` so the fresh default is used.",
 		"- Set `context` to `transcript` only when explicitly requested. This pastes the completed main-session user/assistant transcript and summaries into each subagent prompt, ending before the current user request and in-progress assistant turn.",
+		"- Set `context` to `clone` only when explicitly requested. This starts each subagent from a native clone of the main session ending immediately before the current user request, then appends the subagent instructions and assignment.",
 	].join("\n");
 }
 
@@ -730,7 +733,10 @@ class RpcClient {
 
 	start(signal?: AbortSignal): void {
 		const args = ["--mode", "rpc", "--name", this.task.sessionName];
-		if (this.state.attempt > 1 && this.state.sessionFile) args.push("--session", this.state.sessionFile);
+		const sessionFile = this.state.attempt > 1 && this.state.sessionFile
+			? this.state.sessionFile
+			: this.task.initialSessionFile;
+		if (sessionFile) args.push("--session", sessionFile);
 		if (this.task.modelRef) args.push("--model", this.task.modelRef);
 		if (this.task.thinking) args.push("--thinking", this.task.thinking);
 
@@ -742,6 +748,7 @@ class RpcClient {
 			env: {
 				...process.env,
 				PI_SUBAGENT_SANDBOX: this.task.sandboxDir,
+				...(this.task.promptCacheKey ? { PI_SUBAGENT_PROMPT_CACHE_KEY: this.task.promptCacheKey } : {}),
 			},
 		});
 
@@ -901,6 +908,32 @@ type PendingResolvedTask = Omit<ResolvedTask, "sandboxDir" | "systemPromptPath" 
 
 type PreparedTasks = { tasks?: ResolvedTask[]; errors?: string[] };
 
+function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): string | undefined {
+	const sourceSessionFile = ctx.sessionManager.getSessionFile();
+	if (!ctx.sessionManager.isPersisted() || !sourceSessionFile) {
+		throw new Error("clone context requires a persisted main session");
+	}
+
+	const branch = ctx.sessionManager.getBranch();
+	let latestUserIndex = -1;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry?.type === "message" && entry.message.role === "user") {
+			latestUserIndex = index;
+			break;
+		}
+	}
+	if (latestUserIndex < 0) throw new Error("clone context could not find the current user message");
+
+	const cloneLeafId = branch[latestUserIndex - 1]?.id;
+	if (!cloneLeafId) return undefined;
+
+	const source = SessionManager.open(sourceSessionFile, ctx.sessionManager.getSessionDir());
+	const clonedSessionFile = source.createBranchedSession(cloneLeafId);
+	if (!clonedSessionFile) throw new Error("failed to create cloned subagent session");
+	return clonedSessionFile;
+}
+
 function resolveCommonSubagentParams(
 	params: CommonSubagentParams,
 	index: number,
@@ -962,7 +995,17 @@ async function finalizeTasks(
 		const sandboxDir = path.join(sandboxRoot, unique);
 		await mkdir(sandboxDir, { recursive: true });
 		const systemPromptPath = path.join(sandboxDir, systemPromptFileName);
-		const finalTask: ResolvedTask = { ...task, sandboxDir, systemPromptPath, userPrompt: "" };
+		const initialSessionFile = task.contextMode === "clone"
+			? createClonedSessionBeforeLatestUser(ctx)
+			: undefined;
+		const finalTask: ResolvedTask = {
+			...task,
+			sandboxDir,
+			systemPromptPath,
+			userPrompt: "",
+			initialSessionFile,
+			promptCacheKey: task.contextMode === "clone" ? ctx.sessionManager.getSessionId() : undefined,
+		};
 		finalTask.userPrompt = buildUserPrompt(finalTask, ctx.cwd);
 		await writeFile(systemPromptPath, buildSubagentInstructionsFile(finalTask, ctx.cwd), "utf8");
 		withSandboxes.push(finalTask);
@@ -975,7 +1018,7 @@ async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionCont
 	const whatToReview = cleanText(params.what_to_review || "");
 	const contextMode = params.context ?? "fresh";
 	if (!whatToReview) errors.push("what_to_review is required and should describe only the code review target");
-	if (contextMode !== "fresh" && contextMode !== "transcript") errors.push(`unsupported context mode "${String(contextMode)}"`);
+	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one code review subagent");
 	if (Array.isArray(params.reviewers) && params.reviewers.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} code review subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
@@ -1014,7 +1057,7 @@ async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionCo
 	const task = cleanText(params.task || "");
 	const contextMode = params.context ?? "fresh";
 	if (!task) errors.push("task is required and should contain the full generic subagent task");
-	if (contextMode !== "fresh" && contextMode !== "transcript") errors.push(`unsupported context mode "${String(contextMode)}"`);
+	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.subagents) || params.subagents.length === 0) errors.push("subagents must contain at least one generic subagent");
 	if (Array.isArray(params.subagents) && params.subagents.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} generic subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
@@ -1346,6 +1389,14 @@ function renderFinalSubagentResult(result: any, prefix: string, theme: Theme): C
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+	pi.on("before_provider_request", (event) => {
+		const promptCacheKey = process.env.PI_SUBAGENT_PROMPT_CACHE_KEY;
+		if (!promptCacheKey || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
+		const payload = event.payload as Record<string, unknown>;
+		if (Object.hasOwn(payload, "prompt_cache_key")) return { ...payload, prompt_cache_key: promptCacheKey };
+		if (Object.hasOwn(payload, "promptCacheKey")) return { ...payload, promptCacheKey };
+	});
+
 	pi.on("before_agent_start", (event) => ({
 		systemPrompt: `${event.systemPrompt}\n\n${buildMainSystemPromptAddition()}`,
 	}));
@@ -1353,10 +1404,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: REVIEW_TOOL_NAME,
 		label: "Launch Code Review Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi code review subagents in parallel. Context defaults to fresh; an explicitly requested transcript can be pasted into each prompt. The extension injects the code review rubric and output format.`,
+		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi code review subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. The extension injects the code review rubric and output format.`,
 		parameters: Type.Object({
 			what_to_review: Type.String({ description: "Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
-			context: Type.Optional(StringEnum(["fresh", "transcript"] as const, { description: "Optional context mode. Omit unless the user explicitly requests one. Defaults to fresh. transcript pastes the completed main-session conversation ending before the current turn." })),
+			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
 			reviewers: Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
@@ -1394,6 +1445,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
+				sessionFile: task.initialSessionFile,
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 				attempt: 1,
 				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
@@ -1443,10 +1495,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: GENERIC_TOOL_NAME,
 		label: "Launch Generic Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi generic subagents in parallel. Context defaults to fresh; an explicitly requested transcript can be pasted into each prompt. No task-specific output format is injected.`,
+		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi generic subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. No task-specific output format is injected.`,
 		parameters: Type.Object({
 			task: Type.String({ description: "Complete generic task to give every subagent. Include all relevant context and desired output shape." }),
-			context: Type.Optional(StringEnum(["fresh", "transcript"] as const, { description: "Optional context mode. Omit unless the user explicitly requests one. Defaults to fresh. transcript pastes the completed main-session conversation ending before the current turn." })),
+			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
 			subagents: Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Generic Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated subagents." }),
@@ -1484,6 +1536,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
+				sessionFile: task.initialSessionFile,
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 				attempt: 1,
 				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
