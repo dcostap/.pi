@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { highlightCode, keyHint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { normalizeTitle } from "../prompt.ts";
 import { sanitizeTerminalText } from "../sanitize.ts";
@@ -56,8 +56,10 @@ export function renderBackgroundToolCall(
 		const commandDisplay = command || "...";
 		const qualifiers = [title, workingDirectory ? `in ${workingDirectory}` : ""].filter(Boolean);
 		const suffix = qualifiers.length > 0 ? theme.fg("muted", ` (${qualifiers.join(" • ")})`) : "";
-		// Pi's native bash renderer styles "$ <command>" as one bold tool-title span.
-		component.setText(`${prefix} ${theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`))}${suffix}`);
+		const highlightedCommand = command
+			? highlightCode(commandDisplay, "bash").join("\n")
+			: theme.fg("toolOutput", commandDisplay);
+		component.setText(`${prefix} ${theme.fg("toolTitle", theme.bold("$ "))}${highlightedCommand}${suffix}`);
 		return component;
 	}
 

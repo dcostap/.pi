@@ -13,7 +13,7 @@ describe("background start tool-call rendering", () => {
 			theme,
 		);
 
-		expect(component.render(200).join("\n")).toBe("bash_bg_start $ bun test ./src (Unit tests)");
+		expect(component.render(200).join("\n")).toBe("bash_bg_start $ <bash>bun test ./src</bash> (Unit tests)");
 	});
 
 	test("updates the existing component and strips terminal control sequences", () => {
@@ -25,7 +25,7 @@ describe("background start tool-call rendering", () => {
 		);
 
 		expect(updated).toBe(component);
-		expect(updated.render(200).join("\n")).toBe("bash_bg_start $ safe command (New title)");
+		expect(updated.render(200).join("\n")).toBe("bash_bg_start $ <bash>safe command</bash> (New title)");
 	});
 
 	test("prefixes every background tool and summarizes its arguments", () => {

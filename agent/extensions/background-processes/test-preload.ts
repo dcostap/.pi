@@ -1,6 +1,9 @@
 import { mock } from "bun:test";
 
 mock.module("@earendil-works/pi-coding-agent", () => ({
+	highlightCode(code: string, language?: string) {
+		return code.split("\n").map((line) => `<${language}>${line}</${language}>`);
+	},
 	keyHint(_keybinding: string, description: string) {
 		return `ctrl+e ${description}`;
 	},
