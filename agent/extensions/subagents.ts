@@ -11,13 +11,14 @@ import { buildConversationTranscript } from "./_shared/conversation-transcript.t
 
 const REVIEW_TOOL_NAME = "launch_review_subagents";
 const GENERIC_TOOL_NAME = "launch_generic_subagents";
-const MAX_SUBAGENTS = 20;
 const REVIEW_SESSION_PREFIX = "[Review Subagent]";
 const GENERIC_SESSION_PREFIX = "[Generic Subagent]";
 const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' conclusions and statements; be discerning, analytical, and self-reliant. You make your own conclusions.";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-const MAX_SUBAGENT_ATTEMPTS = 2;
-const SUBAGENT_RETRY_DELAY_MS = 1_000;
+const MAX_SUBAGENT_RETRIES = 4;
+const MAX_SUBAGENT_ATTEMPTS = 1 + MAX_SUBAGENT_RETRIES;
+const SUBAGENT_INITIAL_RETRY_DELAY_MS = 1_000;
+const SUBAGENT_RETRY_DELAY_INCREMENT_MS = 2_000;
 const LIVE_STATUS_WIDTH = "◐ preparing".length;
 const LIVE_CACHE_WIDTH = "CH100.0%".length;
 const LIVE_COST_WIDTH = "$99.999".length;
@@ -483,6 +484,10 @@ function buildSubagentInstructionsFile(task: ResolvedTask, cwd: string): string 
 	return task.kind === "review" ? buildReviewSubagentInstructions(task, cwd) : buildGenericSubagentInstructions(task, cwd);
 }
 
+function subagentRetryDelayMs(completedAttempt: number): number {
+	return SUBAGENT_INITIAL_RETRY_DELAY_MS + (completedAttempt - 1) * SUBAGENT_RETRY_DELAY_INCREMENT_MS;
+}
+
 function buildTranscriptPromptSection(task: ResolvedTask): string[] {
 	if (task.contextMode !== "transcript" || !task.conversationTranscript) return [];
 	return [
@@ -544,7 +549,7 @@ function buildMainSystemPromptAddition(): string {
 		`- You have a ${REVIEW_TOOL_NAME} tool that launches same-cwd Pi code review subagent sessions in parallel.`,
 		"- Review subagents are specifically for code reviews. Use them for reviewing code, diffs, implementation plans with code impact, or concrete code-review targets.",
 		"- Only launch review subagents when the user explicitly asks for subagents/parallel agents to review code, or unmistakably asks you to delegate code review work to other agents.",
-		`- You may launch at most ${MAX_SUBAGENTS} review subagents in one tool call. If the user asks for multiple reviewers, use one parallel tool call rather than sequential calls when possible.`,
+		"- If the user asks for multiple reviewers, use one parallel tool call rather than sequential calls when possible.",
 		"- The tool already injects the standard code review rubric and output format into each review subagent prompt.",
 		"- When calling the review tool, specify only what code to review and optional neutral focus areas. Do not paste review instructions, formatting requirements, expected verdicts, or suspected findings into the review target.",
 		"- Avoid biasing review subagents. Do not tell them what bugs you expect unless the user explicitly asked to verify a specific concern; if so, label it as user-provided focus.",
@@ -558,7 +563,6 @@ function buildMainSystemPromptAddition(): string {
 		"- Generic subagents do not receive the code review rubric or any task-specific output format. Provide the complete task and any per-subagent assignment yourself.",
 		"- Use generic subagents only when the user explicitly asks for subagents/parallel agents/delegation, or unmistakably wants independent parallel investigation or exploration.",
 		"- Do not use generic subagents for code review tasks; use the review subagent tool for code reviews.",
-		`- You may launch at most ${MAX_SUBAGENTS} generic subagents in one tool call.`,
 		"- Each generic subagent is a brand-new session named `[Generic Subagent] <description>`. Choose short, distinctive descriptions.",
 		"- The generic tool returns a final per-subagent stats summary followed by each subagent's final answer. Synthesize results for the user, deduplicate, and call out disagreements or uncertainty.",
 		"- By default generic subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-subagent `model` and/or `thinking`.",
@@ -1020,7 +1024,6 @@ async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionCont
 	if (!whatToReview) errors.push("what_to_review is required and should describe only the code review target");
 	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one code review subagent");
-	if (Array.isArray(params.reviewers) && params.reviewers.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} code review subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
 	const conversationTranscript = contextMode === "transcript"
 		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
@@ -1059,7 +1062,6 @@ async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionCo
 	if (!task) errors.push("task is required and should contain the full generic subagent task");
 	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.subagents) || params.subagents.length === 0) errors.push("subagents must contain at least one generic subagent");
-	if (Array.isArray(params.subagents) && params.subagents.length > MAX_SUBAGENTS) errors.push(`at most ${MAX_SUBAGENTS} generic subagents may be launched at once`);
 	if (errors.length > 0) return { errors };
 	const conversationTranscript = contextMode === "transcript"
 		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
@@ -1221,7 +1223,7 @@ async function runSubagentWithRetries(task: ResolvedTask, ctx: ExtensionContext,
 		state.updatedAt = Date.now();
 		emit();
 		try {
-			await delay(SUBAGENT_RETRY_DELAY_MS, signal);
+			await delay(subagentRetryDelayMs(attempt), signal);
 		} catch {
 			state.status = "aborted";
 			state.error = "aborted by user";
@@ -1404,7 +1406,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: REVIEW_TOOL_NAME,
 		label: "Launch Code Review Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi code review subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. The extension injects the code review rubric and output format.`,
+		description: "Launch one or more same-cwd Pi code review subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. The extension injects the code review rubric and output format.",
 		parameters: Type.Object({
 			what_to_review: Type.String({ description: "Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
 			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
@@ -1415,7 +1417,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
 					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
 				}),
-				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Code review subagents to launch in parallel, max ${MAX_SUBAGENTS}.` },
+				{ minItems: 1, description: "Code review subagents to launch in parallel." },
 			),
 		}),
 		async execute(_toolCallId, params: ReviewLaunchParams, signal, onUpdate, ctx) {
@@ -1495,7 +1497,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: GENERIC_TOOL_NAME,
 		label: "Launch Generic Subagents",
-		description: `Launch 1-${MAX_SUBAGENTS} same-cwd Pi generic subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. No task-specific output format is injected.`,
+		description: "Launch one or more same-cwd Pi generic subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. No task-specific output format is injected.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Complete generic task to give every subagent. Include all relevant context and desired output shape." }),
 			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
@@ -1506,7 +1508,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
 					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
 				}),
-				{ minItems: 1, maxItems: MAX_SUBAGENTS, description: `Generic subagents to launch in parallel, max ${MAX_SUBAGENTS}.` },
+				{ minItems: 1, description: "Generic subagents to launch in parallel." },
 			),
 		}),
 		async execute(_toolCallId, params: GenericLaunchParams, signal, onUpdate, ctx) {
