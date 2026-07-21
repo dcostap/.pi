@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DynamicBorder, getMarkdownTheme, SessionManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
@@ -19,6 +20,8 @@ const MAX_SUBAGENT_RETRIES = 4;
 const MAX_SUBAGENT_ATTEMPTS = 1 + MAX_SUBAGENT_RETRIES;
 const SUBAGENT_INITIAL_RETRY_DELAY_MS = 1_000;
 const SUBAGENT_RETRY_DELAY_INCREMENT_MS = 2_000;
+const MAX_LAUNCH_MANIFEST_BYTES = 10 * 1024 * 1024;
+const MAX_REPORTED_VALIDATION_ERRORS = 50;
 const LIVE_STATUS_WIDTH = "◐ preparing".length;
 const LIVE_CACHE_WIDTH = "CH100.0%".length;
 const LIVE_COST_WIDTH = "$99.999".length;
@@ -44,6 +47,10 @@ type ReviewLaunchParams = {
 	reviewers: ReviewerParams[];
 };
 
+type ReviewToolParams = Partial<ReviewLaunchParams> & {
+	input_file?: string;
+};
+
 type GenericSubagentParams = CommonSubagentParams & {
 	assignment?: string;
 };
@@ -52,6 +59,23 @@ type GenericLaunchParams = {
 	task: string;
 	context?: ContextMode;
 	subagents: GenericSubagentParams[];
+};
+
+type GenericToolParams = Partial<GenericLaunchParams> & {
+	input_file?: string;
+};
+
+type LaunchManifestMetadata = {
+	path: string;
+	sha256: string;
+	bytes: number;
+	entries: number;
+};
+
+type ResolvedLaunchInput<T> = {
+	params?: T;
+	manifest?: LaunchManifestMetadata;
+	errors?: string[];
 };
 
 type ResolvedTask = CommonSubagentParams & {
@@ -124,6 +148,195 @@ type LiveStatPart = { kind: "cache" | "cost" | "context"; text: string; known: b
 
 function cleanText(value: string): string {
 	return value.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+	return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function reportValidationErrors(errors: string[]): string[] {
+	if (errors.length <= MAX_REPORTED_VALIDATION_ERRORS) return errors;
+	return [
+		...errors.slice(0, MAX_REPORTED_VALIDATION_ERRORS),
+		`...and ${errors.length - MAX_REPORTED_VALIDATION_ERRORS} more validation error(s)`,
+	];
+}
+
+function validateKnownKeys(value: Record<string, unknown>, allowed: readonly string[], location: string, errors: string[]): void {
+	const allowedSet = new Set(allowed);
+	for (const key of Object.keys(value)) {
+		if (!allowedSet.has(key)) errors.push(`${location}.${key}: unknown property`);
+	}
+}
+
+function validateRequiredString(value: Record<string, unknown>, key: string, location: string, errors: string[]): void {
+	const candidate = value[key];
+	if (typeof candidate !== "string") {
+		errors.push(`${location}.${key}: required non-empty string`);
+		return;
+	}
+	if (!cleanText(candidate)) errors.push(`${location}.${key}: must not be empty`);
+}
+
+function validateOptionalString(value: Record<string, unknown>, key: string, location: string, errors: string[]): void {
+	if (!hasOwn(value, key)) return;
+	const candidate = value[key];
+	if (typeof candidate !== "string") {
+		errors.push(`${location}.${key}: expected string`);
+		return;
+	}
+	if (!cleanText(candidate)) errors.push(`${location}.${key}: must not be empty when provided`);
+}
+
+function validateOptionalContext(value: Record<string, unknown>, location: string, errors: string[]): void {
+	if (!hasOwn(value, "context")) return;
+	if (value.context !== "fresh" && value.context !== "transcript" && value.context !== "clone") {
+		errors.push(`${location}.context: expected one of fresh, transcript, clone`);
+	}
+}
+
+function validateCommonSubagentEntry(value: unknown, location: string, extraKey: "focus" | "assignment", errors: string[]): void {
+	if (!isRecord(value)) {
+		errors.push(`${location}: expected object`);
+		return;
+	}
+	validateKnownKeys(value, ["description", extraKey, "model", "thinking"], location, errors);
+	validateRequiredString(value, "description", location, errors);
+	validateOptionalString(value, extraKey, location, errors);
+	validateOptionalString(value, "model", location, errors);
+	if (hasOwn(value, "thinking") && !(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) {
+		errors.push(`${location}.thinking: expected one of ${THINKING_LEVELS.join(", ")}`);
+	}
+}
+
+function validateReviewLaunchRequest(value: unknown, location: string): { params?: ReviewLaunchParams; errors: string[] } {
+	const errors: string[] = [];
+	if (!isRecord(value)) return { errors: [`${location}: expected JSON object`] };
+
+	validateKnownKeys(value, ["what_to_review", "context", "reviewers"], location, errors);
+	validateRequiredString(value, "what_to_review", location, errors);
+	validateOptionalContext(value, location, errors);
+	if (!Array.isArray(value.reviewers) || value.reviewers.length === 0) {
+		errors.push(`${location}.reviewers: required non-empty array`);
+	} else {
+		value.reviewers.forEach((reviewer, index) => validateCommonSubagentEntry(reviewer, `${location}.reviewers[${index}]`, "focus", errors));
+	}
+
+	return errors.length > 0 ? { errors } : { params: value as unknown as ReviewLaunchParams, errors };
+}
+
+function validateGenericLaunchRequest(value: unknown, location: string): { params?: GenericLaunchParams; errors: string[] } {
+	const errors: string[] = [];
+	if (!isRecord(value)) return { errors: [`${location}: expected JSON object`] };
+
+	validateKnownKeys(value, ["task", "context", "subagents"], location, errors);
+	validateRequiredString(value, "task", location, errors);
+	validateOptionalContext(value, location, errors);
+	if (!Array.isArray(value.subagents) || value.subagents.length === 0) {
+		errors.push(`${location}.subagents: required non-empty array`);
+	} else {
+		value.subagents.forEach((subagent, index) => validateCommonSubagentEntry(subagent, `${location}.subagents[${index}]`, "assignment", errors));
+	}
+
+	return errors.length > 0 ? { errors } : { params: value as unknown as GenericLaunchParams, errors };
+}
+
+async function readLaunchManifest(inputFile: unknown, cwd: string): Promise<{ value?: unknown; metadata?: LaunchManifestMetadata; errors?: string[] }> {
+	if (typeof inputFile !== "string" || !cleanText(inputFile)) {
+		return { errors: ["input_file: required non-empty string"] };
+	}
+
+	const normalized = cleanText(inputFile).replace(/^@/, "");
+	const resolvedPath = path.resolve(cwd, normalized);
+	let fileStat: Awaited<ReturnType<typeof stat>>;
+	try {
+		fileStat = await stat(resolvedPath);
+	} catch (error) {
+		return { errors: [`input_file: cannot read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	if (!fileStat.isFile()) return { errors: [`input_file: expected a regular file: ${resolvedPath}`] };
+	if (fileStat.size > MAX_LAUNCH_MANIFEST_BYTES) {
+		return { errors: [`input_file: file is ${fileStat.size} bytes; maximum is ${MAX_LAUNCH_MANIFEST_BYTES} bytes`] };
+	}
+
+	let bytes: Buffer;
+	try {
+		bytes = await readFile(resolvedPath);
+	} catch (error) {
+		return { errors: [`input_file: failed to read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	if (bytes.byteLength > MAX_LAUNCH_MANIFEST_BYTES) {
+		return { errors: [`input_file: file grew to ${bytes.byteLength} bytes while reading; maximum is ${MAX_LAUNCH_MANIFEST_BYTES} bytes`] };
+	}
+
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch (error) {
+		return { errors: [`input_file: expected valid UTF-8: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	if (!text.trim()) return { errors: ["input_file: file is empty"] };
+
+	let value: unknown;
+	try {
+		value = JSON.parse(text);
+	} catch (error) {
+		return { errors: [`input_file: invalid JSON: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+
+	let canonicalPath = resolvedPath;
+	try {
+		canonicalPath = await realpath(resolvedPath);
+	} catch {
+		// The already-read resolved path remains sufficient for diagnostics.
+	}
+	return {
+		value,
+		metadata: {
+			path: canonicalPath,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+			bytes: bytes.byteLength,
+			entries: 0,
+		},
+	};
+}
+
+async function resolveReviewLaunchInput(params: ReviewToolParams, cwd: string): Promise<ResolvedLaunchInput<ReviewLaunchParams>> {
+	if (!isRecord(params)) return { errors: ["tool input: expected object"] };
+	if (hasOwn(params, "input_file")) {
+		const invocationErrors: string[] = [];
+		validateKnownKeys(params, ["input_file"], "tool input", invocationErrors);
+		if (invocationErrors.length > 0) return { errors: invocationErrors };
+		const loaded = await readLaunchManifest(params.input_file, cwd);
+		if (loaded.errors) return { errors: loaded.errors };
+		if (loaded.metadata && isRecord(loaded.value) && Array.isArray(loaded.value.reviewers)) loaded.metadata.entries = loaded.value.reviewers.length;
+		const validated = validateReviewLaunchRequest(loaded.value, "manifest");
+		return { params: validated.params, manifest: loaded.metadata, errors: validated.errors.length > 0 ? validated.errors : undefined };
+	}
+
+	const validated = validateReviewLaunchRequest(params, "tool input");
+	return { params: validated.params, errors: validated.errors.length > 0 ? validated.errors : undefined };
+}
+
+async function resolveGenericLaunchInput(params: GenericToolParams, cwd: string): Promise<ResolvedLaunchInput<GenericLaunchParams>> {
+	if (!isRecord(params)) return { errors: ["tool input: expected object"] };
+	if (hasOwn(params, "input_file")) {
+		const invocationErrors: string[] = [];
+		validateKnownKeys(params, ["input_file"], "tool input", invocationErrors);
+		if (invocationErrors.length > 0) return { errors: invocationErrors };
+		const loaded = await readLaunchManifest(params.input_file, cwd);
+		if (loaded.errors) return { errors: loaded.errors };
+		if (loaded.metadata && isRecord(loaded.value) && Array.isArray(loaded.value.subagents)) loaded.metadata.entries = loaded.value.subagents.length;
+		const validated = validateGenericLaunchRequest(loaded.value, "manifest");
+		return { params: validated.params, manifest: loaded.metadata, errors: validated.errors.length > 0 ? validated.errors : undefined };
+	}
+
+	const validated = validateGenericLaunchRequest(params, "tool input");
+	return { params: validated.params, errors: validated.errors.length > 0 ? validated.errors : undefined };
 }
 
 function oneLine(value: string, max = 120): string {
@@ -572,6 +785,10 @@ function buildMainSystemPromptAddition(): string {
 		"- Both launch tools default to fresh context. Unless the user explicitly requests a context mode, omit `context` so the fresh default is used.",
 		"- Set `context` to `transcript` only when explicitly requested. This pastes the completed main-session user/assistant transcript and summaries into each subagent prompt, ending before the current user request and in-progress assistant turn.",
 		"- Set `context` to `clone` only when explicitly requested. This starts each subagent from a native clone of the main session ending immediately before the current user request, then appends the subagent instructions and assignment.",
+		"",
+		"Programmatic subagent manifests:",
+		"- Either launch tool may be called with `input_file` by itself instead of inline launch fields. The UTF-8 JSON file must contain the complete normal request object for that tool and is strictly validated before any subagent starts.",
+		"- Use `input_file` when code generated a large or dynamic launch request, so the tool call does not need to repeat every subagent entry.",
 	].join("\n");
 }
 
@@ -1283,9 +1500,12 @@ function buildFinalStats(states: RuntimeState[]): { text: string; summary: Recor
 	};
 }
 
-function buildFinalToolResult(results: ChildResult[]) {
+function buildFinalToolResult(results: ChildResult[], manifest?: LaunchManifestMetadata) {
 	const states = results.map((result) => result.state);
 	const stats = buildFinalStats(states);
+	const overallText = manifest
+		? `${stats.text}\n- **Input manifest:** \`${manifest.path}\` · ${countLabel(manifest.entries, "entry")} · ${manifest.bytes.toLocaleString("en-US")} bytes · SHA-256 \`${manifest.sha256}\``
+		: stats.text;
 	const answers = results.map(({ state }, index) => {
 		const title = `## Subagent ${index + 1} — ${state.sessionName}`;
 		const metadata = `> ${formatStatusRow(state, false)}`;
@@ -1310,11 +1530,12 @@ function buildFinalToolResult(results: ChildResult[]) {
 		: "";
 	const answersSection = ["# Subagent Answers", priorityLegend, ...answers].filter(Boolean).join("\n\n");
 	return {
-		content: [{ type: "text" as const, text: [stats.text, assignmentContext, answersSection, "---", FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
+		content: [{ type: "text" as const, text: [overallText, assignmentContext, answersSection, "---", FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
 		details: {
 			failures,
 			summary: stats.summary,
-			overallText: stats.text,
+			overallText,
+			manifest,
 			assignmentContext,
 			priorityLegend,
 			results: results.map((result) => ({
@@ -1390,6 +1611,15 @@ function renderFinalSubagentResult(result: any, prefix: string, theme: Theme): C
 	return container;
 }
 
+function buildLaunchValidationFailure(label: string, errors: string[], manifest?: LaunchManifestMetadata) {
+	const reportedErrors = reportValidationErrors(errors);
+	return {
+		content: [{ type: "text" as const, text: [`${label} were not launched because validation failed:`, ...reportedErrors.map((error) => `- ${error}`)].join("\n") }],
+		details: { errors: reportedErrors, totalErrors: errors.length, manifest },
+		isError: true,
+	};
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event) => {
 		const promptCacheKey = process.env.PI_SUBAGENT_PROMPT_CACHE_KEY;
@@ -1406,28 +1636,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: REVIEW_TOOL_NAME,
 		label: "Launch Code Review Subagents",
-		description: "Launch one or more same-cwd Pi code review subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. The extension injects the code review rubric and output format.",
+		description: "Launch one or more same-cwd Pi code review subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. The extension injects the code review rubric and output format.",
 		parameters: Type.Object({
-			what_to_review: Type.String({ description: "Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." }),
+			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: what_to_review, optional context, and reviewers. Must be supplied by itself." })),
+			what_to_review: Type.Optional(Type.String({ description: "Required in inline mode. Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." })),
 			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
-			reviewers: Type.Array(
+			reviewers: Type.Optional(Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
 					focus: Type.Optional(Type.String({ description: "Optional neutral focus area, such as 'data safety' or 'performance'. Do not include suspected findings unless the user explicitly asked to verify them." })),
 					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
 					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
-				}),
+				}, { additionalProperties: false }),
 				{ minItems: 1, description: "Code review subagents to launch in parallel." },
-			),
-		}),
-		async execute(_toolCallId, params: ReviewLaunchParams, signal, onUpdate, ctx) {
-			const prepared: PreparedTasks = await prepareReviewTasks(params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
+			)),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params: ReviewToolParams, signal, onUpdate, ctx) {
+			const resolvedInput = await resolveReviewLaunchInput(params, ctx.cwd).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] } as ResolvedLaunchInput<ReviewLaunchParams>));
+			if (resolvedInput.errors?.length || !resolvedInput.params) {
+				return buildLaunchValidationFailure("Code review subagents", resolvedInput.errors ?? ["launch request did not resolve to valid parameters"], resolvedInput.manifest);
+			}
+			const prepared: PreparedTasks = await prepareReviewTasks(resolvedInput.params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
 			if (prepared.errors?.length) {
-				return {
-					content: [{ type: "text", text: [`Code review subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
-					details: { errors: prepared.errors },
-					isError: true,
-				};
+				return buildLaunchValidationFailure("Code review subagents", prepared.errors, resolvedInput.manifest);
 			}
 
 			const tasks = prepared.tasks ?? [];
@@ -1467,14 +1698,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					state.status = "aborted";
 					state.error = "aborted before launch";
 				}
-				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })));
+				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })), resolvedInput.manifest);
 			}
 
 			const results = await Promise.all(tasks.map((task, index) => runSubagentWithRetries(task, ctx, activeStates[index]!, emit, signal)));
 			emit();
-			return buildFinalToolResult(results);
+			return buildFinalToolResult(results, resolvedInput.manifest);
 		},
 		renderCall(args, theme) {
+			const inputFile = typeof (args as any)?.input_file === "string" ? oneLine((args as any).input_file, 80) : "";
+			if (inputFile) return new Text(`${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `manifest ${inputFile}`)}`, 0, 0);
 			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
 			const label = `${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}`;
 			return new Text(label, 0, 0);
@@ -1497,28 +1730,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: GENERIC_TOOL_NAME,
 		label: "Launch Generic Subagents",
-		description: "Launch one or more same-cwd Pi generic subagents in parallel. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. No task-specific output format is injected.",
+		description: "Launch one or more same-cwd Pi generic subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. No task-specific output format is injected.",
 		parameters: Type.Object({
-			task: Type.String({ description: "Complete generic task to give every subagent. Include all relevant context and desired output shape." }),
+			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: task, optional context, and subagents. Must be supplied by itself." })),
+			task: Type.Optional(Type.String({ description: "Required in inline mode. Complete generic task to give every subagent. Include all relevant context and desired output shape." })),
 			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
-			subagents: Type.Array(
+			subagents: Type.Optional(Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Generic Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated subagents." }),
 					assignment: Type.Optional(Type.String({ description: "Optional per-subagent assignment, angle, or scope. This is appended to the shared task." })),
 					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
 					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
-				}),
+				}, { additionalProperties: false }),
 				{ minItems: 1, description: "Generic subagents to launch in parallel." },
-			),
-		}),
-		async execute(_toolCallId, params: GenericLaunchParams, signal, onUpdate, ctx) {
-			const prepared: PreparedTasks = await prepareGenericTasks(params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
+			)),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params: GenericToolParams, signal, onUpdate, ctx) {
+			const resolvedInput = await resolveGenericLaunchInput(params, ctx.cwd).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] } as ResolvedLaunchInput<GenericLaunchParams>));
+			if (resolvedInput.errors?.length || !resolvedInput.params) {
+				return buildLaunchValidationFailure("Generic subagents", resolvedInput.errors ?? ["launch request did not resolve to valid parameters"], resolvedInput.manifest);
+			}
+			const prepared: PreparedTasks = await prepareGenericTasks(resolvedInput.params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
 			if (prepared.errors?.length) {
-				return {
-					content: [{ type: "text", text: [`Generic subagents were not launched because validation failed:`, ...prepared.errors.map((error) => `- ${error}`)].join("\n") }],
-					details: { errors: prepared.errors },
-					isError: true,
-				};
+				return buildLaunchValidationFailure("Generic subagents", prepared.errors, resolvedInput.manifest);
 			}
 
 			const tasks = prepared.tasks ?? [];
@@ -1558,14 +1792,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					state.status = "aborted";
 					state.error = "aborted before launch";
 				}
-				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })));
+				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })), resolvedInput.manifest);
 			}
 
 			const results = await Promise.all(tasks.map((task, index) => runSubagentWithRetries(task, ctx, activeStates[index]!, emit, signal)));
 			emit();
-			return buildFinalToolResult(results);
+			return buildFinalToolResult(results, resolvedInput.manifest);
 		},
 		renderCall(args, theme) {
+			const inputFile = typeof (args as any)?.input_file === "string" ? oneLine((args as any).input_file, 80) : "";
+			if (inputFile) return new Text(`${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `manifest ${inputFile}`)}`, 0, 0);
 			const count = Array.isArray((args as any)?.subagents) ? (args as any).subagents.length : 0;
 			const label = `${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `${count} subagent${count === 1 ? "" : "s"}`)}`;
 			return new Text(label, 0, 0);
