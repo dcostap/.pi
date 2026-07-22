@@ -118,6 +118,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 				maxRunning: 8,
 				maxEntries: 32,
 				maxOutputBytes: 1024 * 1024,
+				persistFullOutput: false,
 			});
 			manager.subscribe((event) => {
 				if (event.kind === "pruned") backgroundOutputs.forget(event.id);

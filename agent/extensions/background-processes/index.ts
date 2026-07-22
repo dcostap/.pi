@@ -9,6 +9,7 @@ import {
 	formatList,
 	formatProcess,
 	formatStartResult,
+	formatWaitUpdate,
 	formatWaitResult,
 } from "./formatting.ts";
 import { BackgroundProcessManager, WaitAbortedError } from "./manager.ts";
@@ -84,7 +85,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_start",
 		label: "bash background start",
-		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool and return immediately. Recent merged output is retained in bounded memory.\n\n${BACKGROUND_PROCESS_PROMPT}`,
+		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool and return immediately. Recent merged output is retained in bounded memory. Output beyond Pi's standard 50KB/2000-line inline limit is saved to a temporary full-output file.\n\n${BACKGROUND_PROCESS_PROMPT}`,
 		promptSnippet: "Start a long non-interactive bash command in the background; completion is delivered automatically",
 		parameters: StartParameters,
 		renderCall(args, theme, context) {
@@ -162,7 +163,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_wait",
 		label: "bash background wait",
-		description: "Wait for selected background bash processes to settle. Timeout or cancellation leaves them running.",
+		description: "Wait for selected background bash processes to settle while streaming a bounded live output preview. Timeout or cancellation leaves them running.",
 		parameters: WaitParameters,
 		renderCall(args, theme, context) {
 			return renderBackgroundToolCall("bash_bg_wait", args, theme, context.lastComponent as Text | undefined);
@@ -176,10 +177,14 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 				const result = await activeManager.wait(params.ids, {
 					timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
 					signal,
-					onUpdate: (runningIds) => {
+					updateIntervalMs: 100,
+					onUpdate: (runningIds, snapshots) => {
 						onUpdate?.({
-							content: [{ type: "text", text: runningIds.length > 0 ? `Still running: ${runningIds.join(", ")}` : "Finalizing background results…" }],
-							details: { runningIds },
+							content: [{ type: "text", text: formatWaitUpdate(snapshots) }],
+							details: {
+								runningIds,
+								processes: snapshots.map(compactDetails),
+							},
 						});
 					},
 				});
@@ -289,5 +294,7 @@ function compactDetails(snapshot: ReturnType<BackgroundProcessManager["get"]>) {
 		killRequested: snapshot.killRequested,
 		capturedBytes: snapshot.output.totalBytes,
 		droppedBytes: snapshot.output.droppedBytes,
+		totalLines: snapshot.output.totalLines,
+		fullOutputPath: snapshot.output.fullOutputPath,
 	};
 }

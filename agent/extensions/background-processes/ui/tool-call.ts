@@ -107,9 +107,10 @@ export function renderBackgroundToolResult(
 		return component;
 	}
 
-	const styled = text.split("\n").map((line) => styleResultLine(toolName, line, options.isPartial, theme));
-	const visible = options.expanded ? styled : collapseResult(toolName, styled, theme);
-	component.setText(`\n${visible.join("\n")}`);
+	const lines = text.split("\n");
+	const visible = options.expanded ? lines : collapseResult(toolName, lines, options.isPartial);
+	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme));
+	component.setText(`\n${styled.join("\n")}`);
 	return component;
 }
 
@@ -130,10 +131,12 @@ function cleanInline(value: string): string {
 
 function styleResultLine(toolName: BackgroundToolName, line: string, isPartial: boolean, theme: Theme): string {
 	if (!line) return "";
-	if (isPartial) return theme.fg("warning", line);
 	if (line === "---") return theme.fg("borderMuted", line);
-	if (/^\[(?:Response truncated|Only the newest)/u.test(line)) return theme.fg("warning", line);
+	if (/^\.\.\. \(\d+ (?:hidden|earlier) lines,/u.test(line)) return theme.fg("muted", line);
+	if (/^\[(?:Full output|Output truncated|Response truncated|Only the newest)/u.test(line)) return theme.fg("warning", line);
 	if (/^\((?:no output|no output yet)\)$/u.test(line)) return theme.fg("muted", line);
+	if (/^(?:Elapsed|Took) \d/u.test(line)) return theme.fg("muted", line);
+	if (isPartial && /^Waiting for background process output/u.test(line)) return theme.fg("warning", line);
 	if (/^Use bash_bg_/u.test(line)) return theme.fg("dim", line);
 	if (/^(?:All requested background processes settled\.|No background processes are tracked\.)$/u.test(line)) {
 		return theme.fg("success", line);
@@ -186,15 +189,38 @@ function styleStatus(value: string, theme: Theme): string {
 	return theme.fg(color, value);
 }
 
-function collapseResult(toolName: BackgroundToolName, lines: string[], theme: Theme): string[] {
+function collapseResult(toolName: BackgroundToolName, lines: string[], isPartial: boolean): string[] {
+	if (toolName === "bash_bg_wait" && isPartial) return collapseWaitPreview(lines);
+
 	const limit = toolName === "bash_bg_status" ? 14 : toolName === "bash_bg_wait" ? 22 : 18;
 	if (toolName === "bash_bg_start" || lines.length <= limit) return lines;
 
 	const tailCount = toolName === "bash_bg_status" ? 5 : 8;
 	const headCount = Math.max(4, limit - tailCount - 1);
 	const hidden = lines.length - headCount - tailCount;
-	const hint =
-		theme.fg("muted", `... (${hidden} hidden lines,`) +
-		` ${keyHint("app.tools.expand", "to expand")})`;
+	const hint = `... (${hidden} hidden lines, ${keyHint("app.tools.expand", "to expand")})`;
 	return [...lines.slice(0, headCount), hint, ...lines.slice(-tailCount)];
+}
+
+function collapseWaitPreview(lines: string[]): string[] {
+	const footerStart = lines.findIndex((line) => /^\[(?:Full output|Output truncated)/u.test(line));
+	const elapsedIndex = lines.findLastIndex((line) => /^(?:Elapsed|Took) \d/u.test(line));
+	const bodyEndCandidates = [footerStart, elapsedIndex].filter((index) => index >= 0);
+	const bodyEnd = bodyEndCandidates.length > 0 ? Math.min(...bodyEndCandidates) : lines.length;
+	const body = trimBlankLines(lines.slice(0, bodyEnd));
+	const footer = trimBlankLines(lines.slice(bodyEnd));
+	const previewLines = 5;
+	if (body.length <= previewLines) return [...body, ...(footer.length > 0 ? ["", ...footer] : [])];
+
+	const hidden = body.length - previewLines;
+	const hint = `... (${hidden} earlier lines, ${keyHint("app.tools.expand", "to expand")})`;
+	return [hint, ...body.slice(-previewLines), ...(footer.length > 0 ? ["", ...footer] : [])];
+}
+
+function trimBlankLines(lines: string[]): string[] {
+	let start = 0;
+	let end = lines.length;
+	while (start < end && !lines[start]) start++;
+	while (end > start && !lines[end - 1]) end--;
+	return lines.slice(start, end);
 }

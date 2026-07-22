@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AUTO_BUDGET, formatAutomaticResults, formatProcess, formatStartResult, formatWaitResult, WAIT_TOTAL_BYTES } from "./formatting.ts";
+import { AUTO_BUDGET, formatAutomaticResults, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, WAIT_TOTAL_BYTES } from "./formatting.ts";
 import type { BackgroundProcessSnapshot } from "./manager.ts";
 
 function snapshot(id: string, output: string): BackgroundProcessSnapshot {
@@ -15,7 +15,7 @@ function snapshot(id: string, output: string): BackgroundProcessSnapshot {
 		killRequested: false,
 		settled: true,
 		automaticDelivery: "deferred",
-		output: { text: output, totalBytes: Buffer.byteLength(output), retainedBytes: Buffer.byteLength(output), droppedBytes: 0, truncated: false, version: 1 },
+		output: { text: output, totalBytes: Buffer.byteLength(output), totalLines: output ? output.split("\n").length : 0, retainedBytes: Buffer.byteLength(output), droppedBytes: 0, truncated: false, version: 1 },
 	};
 }
 
@@ -43,5 +43,19 @@ describe("bounded formatting", () => {
 		const output = `${"y".repeat(300)}\n`.repeat(300);
 		const text = formatWaitResult({ timedOut: false, settled: [snapshot("bg-1", output), snapshot("bg-2", output), snapshot("bg-3", output)], runningIds: [] });
 		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(WAIT_TOTAL_BYTES);
+	});
+
+	test("live wait updates include recent output, elapsed time, and full-output paths", () => {
+		const base = snapshot("bg-1", "building\nready");
+		const current = {
+			...base,
+			output: { ...base.output, totalBytes: 60 * 1024, totalLines: 2500, fullOutputPath: "C:/temp/pi-bash-bg.log" },
+		};
+		const text = formatWaitUpdate([current], 2500);
+
+		expect(text).toContain("building\nready");
+		expect(text).toContain("Full output: C:/temp/pi-bash-bg.log");
+		expect(text).toContain("Truncated:");
+		expect(text).toContain("Took 1.0s");
 	});
 });

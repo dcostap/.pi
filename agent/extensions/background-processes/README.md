@@ -15,7 +15,7 @@ It reuses Pi's public `createLocalBashOperations()` backend—the same local bac
 
 Bash commands receive no stdin. Do not add `&`, `start`, `Start-Process`, `nohup`, or daemonization flags: `bash_bg_start` already owns the background lifetime.
 
-Output is a merged stdout/stderr stream. Each process retains only its newest 1 MiB in memory. Older bytes are discarded; version 1 intentionally has no persistent full-log spill.
+Output is a merged stdout/stderr stream. Waiting shows a live, auto-truncated tail like Pi's built-in bash tool. Each process retains only its newest 1 MiB in memory, and output beyond Pi's standard 50KB/2000-line inline limit is also streamed to a temporary full-output file whose path is shown in tool results.
 
 ## Tests
 

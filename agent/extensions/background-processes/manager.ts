@@ -1,5 +1,5 @@
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
-import { TailBuffer, type TailBufferSnapshot } from "./tail-buffer.ts";
+import { BackgroundOutputCapture, type BackgroundOutputSnapshot } from "./output-capture.ts";
 
 export type BackgroundProcessStatus = "running" | "done" | "failed" | "killed";
 export type AutomaticDeliveryState = "none" | "deferred" | "sending" | "injected" | "consumed";
@@ -17,7 +17,7 @@ export interface BackgroundProcessSnapshot {
 	readonly killRequested: boolean;
 	readonly settled: boolean;
 	readonly automaticDelivery: AutomaticDeliveryState;
-	readonly output: TailBufferSnapshot;
+	readonly output: BackgroundOutputSnapshot;
 }
 
 interface BackgroundProcessEntry {
@@ -27,7 +27,7 @@ interface BackgroundProcessEntry {
 	readonly cwd: string;
 	readonly createdAt: number;
 	readonly controller: AbortController;
-	readonly output: TailBuffer;
+	readonly output: BackgroundOutputCapture;
 	completion: Promise<void>;
 	status: BackgroundProcessStatus;
 	settledAt?: number;
@@ -47,13 +47,14 @@ export interface BackgroundProcessManagerOptions {
 	maxRunning?: number;
 	maxEntries?: number;
 	maxOutputBytes?: number;
+	persistFullOutput?: boolean;
 	now?: () => number;
 }
 
 export interface WaitOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
-	onUpdate?: (runningIds: string[]) => void;
+	onUpdate?: (runningIds: string[], snapshots: BackgroundProcessSnapshot[]) => void;
 	updateIntervalMs?: number;
 }
 
@@ -89,6 +90,7 @@ export class BackgroundProcessManager {
 	private readonly maxRunning: number;
 	private readonly maxEntries: number;
 	private readonly maxOutputBytes: number;
+	private readonly persistFullOutput: boolean;
 	private readonly now: () => number;
 	private nextId = 1;
 	private disposed = false;
@@ -100,6 +102,7 @@ export class BackgroundProcessManager {
 		this.maxRunning = options.maxRunning ?? 8;
 		this.maxEntries = options.maxEntries ?? 32;
 		this.maxOutputBytes = options.maxOutputBytes ?? 1024 * 1024;
+		this.persistFullOutput = options.persistFullOutput ?? true;
 		this.now = options.now ?? Date.now;
 	}
 
@@ -122,7 +125,7 @@ export class BackgroundProcessManager {
 			cwd,
 			createdAt: this.now(),
 			controller,
-			output: new TailBuffer(this.maxOutputBytes),
+			output: new BackgroundOutputCapture(this.maxOutputBytes, this.persistFullOutput),
 			completion: Promise.resolve(),
 			status: "running",
 			killRequested: false,
@@ -144,6 +147,7 @@ export class BackgroundProcessManager {
 				},
 			});
 		} catch (error) {
+			entry.output.finish();
 			this.settleFailure(entry, error);
 			entry.completion = Promise.resolve();
 			return this.snapshotEntry(entry);
@@ -151,10 +155,12 @@ export class BackgroundProcessManager {
 
 		entry.completion = execution
 			.then(({ exitCode }) => {
+				entry.output.finish();
 				if (exitCode === 0) this.settle(entry, "done", exitCode);
 				else this.settle(entry, "failed", exitCode);
 			})
 			.catch((error) => {
+				entry.output.finish();
 				if (entry.killRequested && error instanceof Error && error.message === "aborted") {
 					this.settle(entry, "killed", null);
 					return;
@@ -206,12 +212,16 @@ export class BackgroundProcessManager {
 		return new Promise<WaitResult>((resolve, reject) => {
 			let finished = false;
 			let timeout: ReturnType<typeof setTimeout> | undefined;
-			let updateTimer: ReturnType<typeof setInterval> | undefined;
+			let updateTimer: ReturnType<typeof setTimeout> | undefined;
+			let updateHeartbeat: ReturnType<typeof setInterval> | undefined;
+			let emitUpdate: (() => void) | undefined;
+			const selectedIds = new Set(unique);
 
 			const cleanup = () => {
 				unsubscribe();
 				if (timeout) clearTimeout(timeout);
-				if (updateTimer) clearInterval(updateTimer);
+				if (updateTimer) clearTimeout(updateTimer);
+				if (updateHeartbeat) clearInterval(updateHeartbeat);
 				options.signal?.removeEventListener("abort", onAbort);
 			};
 
@@ -246,6 +256,12 @@ export class BackgroundProcessManager {
 					finish("disposed");
 					return;
 				}
+				if (event?.kind === "output" && selectedIds.has(event.id) && emitUpdate && !updateTimer) {
+					updateTimer = setTimeout(() => {
+						updateTimer = undefined;
+						emitUpdate?.();
+					}, options.updateIntervalMs ?? 100);
+				}
 				if (entries.every((entry) => entry.settled)) finish("complete");
 			};
 
@@ -256,9 +272,12 @@ export class BackgroundProcessManager {
 				timeout = setTimeout(() => finish("timeout"), Math.max(0, options.timeoutMs));
 			}
 			if (options.onUpdate) {
-				const emitUpdate = () => options.onUpdate?.(entries.filter((entry) => !entry.settled).map((entry) => entry.id));
+				emitUpdate = () => options.onUpdate?.(
+					entries.filter((entry) => !entry.settled).map((entry) => entry.id),
+					entries.map((entry) => this.snapshotEntry(entry)),
+				);
 				emitUpdate();
-				updateTimer = setInterval(emitUpdate, options.updateIntervalMs ?? 1000);
+				updateHeartbeat = setInterval(emitUpdate, 1000);
 			}
 			if (options.signal) {
 				if (options.signal.aborted) {

@@ -70,6 +70,22 @@ describe("background tool-result rendering", () => {
 		expect(expanded.render(200).join("\n")).toContain("line 10\n");
 	});
 
+	test("renders live wait output like the built-in bash preview", () => {
+		const output = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
+		const text = `${output}\n\n[Full output: C:/temp/pi-bash-bg.log. Truncated: showing the latest 10 of 3000 lines]\n\nElapsed 12.3s`;
+		const result = { content: [{ type: "text", text }] };
+		const collapsed = renderBackgroundToolResult("bash_bg_wait", result, { expanded: false, isPartial: true }, theme);
+		const expanded = renderBackgroundToolResult("bash_bg_wait", result, { expanded: true, isPartial: true }, theme);
+		const collapsedText = collapsed.render(200).join("\n");
+
+		expect(collapsedText).toContain("5 earlier lines, ctrl+e to expand");
+		expect(collapsedText).not.toContain("line 5\n");
+		expect(collapsedText).toContain("line 6\nline 7\nline 8\nline 9\nline 10");
+		expect(collapsedText).toContain("Full output: C:/temp/pi-bash-bg.log");
+		expect(collapsedText).toContain("Elapsed 12.3s");
+		expect(expanded.render(200).join("\n")).toContain("line 1\n");
+	});
+
 	test("highlights inventory and stop outcomes", () => {
 		const styledTheme = {
 			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,

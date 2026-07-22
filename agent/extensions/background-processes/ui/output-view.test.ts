@@ -13,7 +13,7 @@ function snapshot(text: string): BackgroundProcessSnapshot {
 		killRequested: false,
 		settled: false,
 		automaticDelivery: "none",
-		output: { text, totalBytes: Buffer.byteLength(text), retainedBytes: Buffer.byteLength(text), droppedBytes: 0, truncated: false, version: 1 },
+		output: { text, totalBytes: Buffer.byteLength(text), totalLines: text ? text.split("\n").length : 0, retainedBytes: Buffer.byteLength(text), droppedBytes: 0, truncated: false, version: 1 },
 	};
 }
 

@@ -13,7 +13,7 @@ function makeSnapshot(): BackgroundProcessSnapshot {
 		killRequested: false,
 		settled: false,
 		automaticDelivery: "none",
-		output: { text: "ready\nlistening", totalBytes: 15, retainedBytes: 15, droppedBytes: 0, truncated: false, version: 1 },
+		output: { text: "ready\nlistening", totalBytes: 15, totalLines: 2, retainedBytes: 15, droppedBytes: 0, truncated: false, version: 1 },
 	};
 }
 

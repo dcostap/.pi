@@ -86,6 +86,23 @@ describe("BackgroundProcessManager", () => {
 		expect(manager.getDeferred()).toEqual([]);
 	});
 
+	test("wait streams throttled output snapshots", async () => {
+		const operations = new FakeOperations();
+		const manager = new BackgroundProcessManager(operations);
+		manager.start("live", "Live", ".");
+		const updates: string[] = [];
+		const waiting = manager.wait(["bg-1"], {
+			updateIntervalMs: 1,
+			onUpdate: (_runningIds, snapshots) => updates.push(snapshots[0]!.output.text),
+		});
+
+		operations.output("live", "first line\n");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(updates.at(-1)).toBe("first line\n");
+		operations.complete("live");
+		await waiting;
+	});
+
 	test("wait timeout consumes only settled entries and leaves others running", async () => {
 		const operations = new FakeOperations();
 		const manager = new BackgroundProcessManager(operations);

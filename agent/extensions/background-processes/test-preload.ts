@@ -1,6 +1,11 @@
 import { mock } from "bun:test";
 
+const DEFAULT_MAX_BYTES = 50 * 1024;
+const DEFAULT_MAX_LINES = 2000;
+
 mock.module("@earendil-works/pi-coding-agent", () => ({
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
 	highlightCode(code: string, language?: string) {
 		return code.split("\n").map((line) => `<${language}>${line}</${language}>`);
 	},

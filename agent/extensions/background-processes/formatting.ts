@@ -1,4 +1,9 @@
-import { formatSize, truncateTail } from "@earendil-works/pi-coding-agent";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	truncateTail,
+} from "@earendil-works/pi-coding-agent";
 import type { BackgroundProcessSnapshot, KillResultItem, WaitResult } from "./manager.ts";
 import { sanitizeTerminalText } from "./sanitize.ts";
 
@@ -11,6 +16,7 @@ export const STATUS_BUDGET: OutputBudget = { maxBytes: 24 * 1024, maxLines: 400 
 export const AUTO_BUDGET: OutputBudget = { maxBytes: 12 * 1024, maxLines: 80 };
 export const WAIT_ENTRY_BUDGET: OutputBudget = { maxBytes: 16 * 1024, maxLines: 250 };
 export const WAIT_TOTAL_BYTES = 48 * 1024;
+export const WAIT_LIVE_BUDGET: OutputBudget = { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES };
 
 export function formatDuration(milliseconds: number): string {
 	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -49,6 +55,8 @@ export function formatProcess(
 		`Captured: ${formatSize(snapshot.output.totalBytes)}` +
 			(snapshot.output.truncated ? ` (${formatSize(snapshot.output.droppedBytes)} discarded from the oldest output)` : ""),
 	);
+	if (snapshot.output.fullOutputPath) lines.push(`Full output: ${snapshot.output.fullOutputPath}`);
+	if (snapshot.output.fileError) lines.push(`Full output could not be saved: ${cleanInline(snapshot.output.fileError)}`);
 
 	const sanitized = sanitizeTerminalText(snapshot.output.text).replace(/\s+$/u, "");
 	if (!sanitized) {
@@ -65,6 +73,33 @@ export function formatProcess(
 		lines.push(`[Only the newest ${formatSize(snapshot.output.retainedBytes)} remains in memory.]`);
 	}
 	return lines.join("\n");
+}
+
+export function formatWaitUpdate(snapshots: BackgroundProcessSnapshot[], now = Date.now()): string {
+	if (snapshots.length === 0) return "Waiting for background process output…";
+	const multiple = snapshots.length > 1;
+	return snapshots.map((snapshot) => {
+		const lines: string[] = [];
+		if (multiple) lines.push(`${snapshot.id} — ${cleanInline(snapshot.title)}`, "");
+
+		const sanitized = sanitizeTerminalText(snapshot.output.text).replace(/\s+$/u, "");
+		const bounded = truncateTail(sanitized, WAIT_LIVE_BUDGET);
+		lines.push(bounded.content || (snapshot.settled ? "(no output)" : "(no output yet)"));
+
+		const warnings: string[] = [];
+		if (snapshot.output.fullOutputPath) warnings.push(`Full output: ${snapshot.output.fullOutputPath}`);
+		if (snapshot.output.fileError) warnings.push(`Full output could not be saved: ${cleanInline(snapshot.output.fileError)}`);
+		if (snapshot.output.totalLines > DEFAULT_MAX_LINES) {
+			warnings.push(`Truncated: showing the latest ${bounded.outputLines} of ${snapshot.output.totalLines} lines`);
+		} else if (snapshot.output.totalBytes > DEFAULT_MAX_BYTES || bounded.truncated) {
+			warnings.push(`Truncated: ${bounded.outputLines} lines shown (${formatSize(DEFAULT_MAX_BYTES)} limit)`);
+		}
+		if (warnings.length > 0) lines.push("", `[${warnings.join(". ")}]`);
+
+		const elapsed = (snapshot.settledAt ?? now) - snapshot.createdAt;
+		lines.push("", `${snapshot.settled ? "Took" : "Elapsed"} ${formatPreciseDuration(elapsed)}`);
+		return lines.join("\n");
+	}).join("\n\n---\n\n");
 }
 
 export function formatList(snapshots: BackgroundProcessSnapshot[], now = Date.now()): string {
@@ -123,4 +158,8 @@ export function formatAutomaticResults(snapshots: BackgroundProcessSnapshot[]): 
 
 export function cleanInline(text: string): string {
 	return sanitizeTerminalText(text).replace(/[\r\n]+/gu, " ").replace(/\s+/gu, " ").trim();
+}
+
+function formatPreciseDuration(milliseconds: number): string {
+	return `${(Math.max(0, milliseconds) / 1000).toFixed(1)}s`;
 }
