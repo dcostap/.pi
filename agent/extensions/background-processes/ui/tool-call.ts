@@ -25,12 +25,15 @@ export interface BackgroundToolCallArgs extends BackgroundStartCallArgs {
 
 export interface BackgroundToolResult {
 	content: Array<{ type: string; text?: string }>;
+	details?: unknown;
 }
 
 export interface BackgroundToolResultOptions {
 	expanded: boolean;
 	isPartial: boolean;
 }
+
+export type BackgroundTitleLookup = (id: string) => string | undefined;
 
 export function renderBackgroundStartCall(
 	args: BackgroundStartCallArgs,
@@ -45,6 +48,7 @@ export function renderBackgroundToolCall(
 	args: BackgroundToolCallArgs,
 	theme: Theme,
 	previous?: Text,
+	lookupTitle?: BackgroundTitleLookup,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 	const prefix = theme.fg("toolTitle", theme.bold(toolName));
@@ -64,19 +68,19 @@ export function renderBackgroundToolCall(
 	}
 
 	if (toolName === "bash_bg_status") {
-		component.setText(`${prefix}${formatIds([args.id], theme)}`);
+		component.setText(`${prefix}${formatIds([args.id], theme, lookupTitle)}`);
 		return component;
 	}
 
 	if (toolName === "bash_bg_wait") {
 		const timeout = typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined;
 		const suffix = timeout === undefined ? "" : theme.fg("muted", ` (timeout ${timeout}s)`);
-		component.setText(`${prefix}${formatIds(args.ids, theme)}${suffix}`);
+		component.setText(`${prefix}${formatIds(args.ids, theme, lookupTitle)}${suffix}`);
 		return component;
 	}
 
 	if (toolName === "bash_bg_kill") {
-		component.setText(`${prefix}${formatIds(args.ids, theme)}`);
+		component.setText(`${prefix}${formatIds(args.ids, theme, lookupTitle)}`);
 		return component;
 	}
 
@@ -91,6 +95,7 @@ export function renderBackgroundToolResult(
 	theme: Theme,
 	previous?: Text,
 	isError = false,
+	lookupTitle?: BackgroundTitleLookup,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 	const text = sanitizeTerminalText(
@@ -109,15 +114,22 @@ export function renderBackgroundToolResult(
 
 	const lines = text.split("\n");
 	const visible = options.expanded ? lines : collapseResult(toolName, lines, options.isPartial);
-	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme));
+	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme, lookupTitle));
 	component.setText(`\n${styled.join("\n")}`);
 	return component;
 }
 
-function formatIds(value: unknown, theme: Theme): string {
+function formatIds(value: unknown, theme: Theme, lookupTitle?: BackgroundTitleLookup): string {
 	const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
 	const ids = values.filter((item): item is string => typeof item === "string").map(cleanInline);
-	return ids.length > 0 ? ` ${theme.fg("accent", ids.join(", "))}` : "";
+	if (ids.length === 0) return "";
+	const rendered = ids.map((id) => {
+		const title = lookupTitle?.(id);
+		return title
+			? `${theme.fg("accent", id)} ${theme.fg("muted", `(${cleanInline(title)})`)}`
+			: theme.fg("accent", id);
+	});
+	return ` ${rendered.join(", ")}`;
 }
 
 function stringArg(value: unknown, inline = true): string {
@@ -129,7 +141,13 @@ function cleanInline(value: string): string {
 	return sanitizeTerminalText(value).replace(/[\r\n]+/gu, " ").replace(/\s+/gu, " ").trim();
 }
 
-function styleResultLine(toolName: BackgroundToolName, line: string, isPartial: boolean, theme: Theme): string {
+function styleResultLine(
+	toolName: BackgroundToolName,
+	line: string,
+	isPartial: boolean,
+	theme: Theme,
+	lookupTitle?: BackgroundTitleLookup,
+): string {
 	if (!line) return "";
 	if (line === "---") return theme.fg("borderMuted", line);
 	if (/^\.\.\. \(\d+ (?:hidden|earlier) lines,/u.test(line)) return theme.fg("muted", line);
@@ -158,10 +176,14 @@ function styleResultLine(toolName: BackgroundToolName, line: string, isPartial: 
 		return `${theme.fg("accent", theme.bold(listEntry[1]!))} ${styleStatus(`[${listEntry[2]}]`, theme)} ${theme.fg("toolOutput", listEntry[3]!)}`;
 	}
 
-	const killEntry = line.match(/^(bg-\d+):\s*(.*)$/u);
+	const killEntry = line.match(/^(bg-\d+)(?: \((.*)\))?:\s*(.*)$/u);
 	if (toolName === "bash_bg_kill" && killEntry) {
-		const color = /pending|requested but/u.test(killEntry[2]!) ? "warning" : "success";
-		return `${theme.fg("accent", theme.bold(killEntry[1]!))}: ${theme.fg(color, killEntry[2]!)}`;
+		const id = killEntry[1]!;
+		const title = killEntry[2] || lookupTitle?.(id);
+		const outcome = killEntry[3]!;
+		const alias = title ? ` ${theme.fg("muted", `(${cleanInline(title)})`)}` : "";
+		const color = /pending|requested but/u.test(outcome) ? "warning" : "success";
+		return `${theme.fg("accent", theme.bold(id))}${alias}: ${theme.fg(color, outcome)}`;
 	}
 
 	const labeled = line.match(/^([A-Za-z ]+):\s*(.*)$/u);

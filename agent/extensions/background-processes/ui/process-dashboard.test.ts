@@ -29,6 +29,7 @@ class FakeManager {
 
 const theme = {
 	fg: (_color: string, text: string) => text,
+	bg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
 } as any;
 
@@ -47,8 +48,12 @@ describe("ProcessDashboard", () => {
 		let closes = 0;
 		const dashboard = new ProcessDashboard(manager as any, theme, keybindings, () => renders++, () => closes++);
 		expect(dashboard.render(80).join("\n")).toContain("Background Processes");
+		expect(dashboard.render(80).join("\n")).toContain("1 running");
 		dashboard.handleInput("\r");
 		expect(dashboard.render(80).join("\n")).toContain("Output");
+		dashboard.handleInput("x");
+		expect(dashboard.render(80).join("\n")).toContain("Press x again to confirm");
+		expect(manager.killCalls).toEqual([]);
 		dashboard.handleInput("x");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(manager.killCalls).toEqual([["bg-1"]]);
@@ -57,5 +62,18 @@ describe("ProcessDashboard", () => {
 		expect(closes).toBe(1);
 		expect(manager.listener).toBeUndefined();
 		expect(renders).toBeGreaterThan(0);
+	});
+
+	test("keeps every framed line within the available width", () => {
+		const manager = new FakeManager();
+		manager.snapshot = {
+			...manager.snapshot,
+			title: "A very long process title that should be truncated without breaking the frame",
+			cwd: "C:/a/very/long/path/that/will/not/fit/in/a/narrow/dashboard",
+			command: "node ./a/very/long/path/to/a/server-entrypoint.js --with many arguments",
+		};
+		const dashboard = new ProcessDashboard(manager as any, theme, keybindings, () => {}, () => {});
+		for (const line of dashboard.render(52)) expect(line.length).toBeLessThanOrEqual(52);
+		dashboard.dispose();
 	});
 });

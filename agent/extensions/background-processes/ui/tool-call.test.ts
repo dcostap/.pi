@@ -38,6 +38,14 @@ describe("background start tool-call rendering", () => {
 		expect(renderBackgroundToolCall("bash_bg_kill", { ids: ["bg-4"] }, theme).render(200).join("\n"))
 			.toBe("bash_bg_kill bg-4");
 	});
+
+	test("shows readable process aliases beside ids when available", () => {
+		const title = (id: string) => id === "bg-2" ? "Dev server" : id === "bg-3" ? "Unit tests" : undefined;
+		expect(renderBackgroundToolCall("bash_bg_status", { id: "bg-2" }, theme, undefined, title).render(200).join("\n"))
+			.toBe("bash_bg_status bg-2 (Dev server)");
+		expect(renderBackgroundToolCall("bash_bg_wait", { ids: ["bg-2", "bg-3"] }, theme, undefined, title).render(200).join("\n"))
+			.toBe("bash_bg_wait bg-2 (Dev server), bg-3 (Unit tests)");
+	});
 });
 
 describe("background tool-result rendering", () => {
@@ -99,7 +107,7 @@ describe("background tool-result rendering", () => {
 		).render(200).join("\n");
 		const kill = renderBackgroundToolResult(
 			"bash_bg_kill",
-			{ content: [{ type: "text", text: "bg-2: termination observed (killed)" }] },
+			{ content: [{ type: "text", text: "bg-2 (Dev server): termination observed (killed)" }] },
 			{ expanded: false, isPartial: false },
 			styledTheme,
 		).render(200).join("\n");
@@ -107,5 +115,20 @@ describe("background tool-result rendering", () => {
 		expect(list).toContain("<success>[done]</success>");
 		expect(list).toContain("<accent>[running]</accent>");
 		expect(kill).toContain("<success>termination observed (killed)</success>");
+		expect(kill).toContain("<muted>(Dev server)</muted>");
+	});
+
+	test("can restore an alias from result details for older result text", () => {
+		const rendered = renderBackgroundToolResult(
+			"bash_bg_kill",
+			{ content: [{ type: "text", text: "bg-2: termination observed (killed)" }] },
+			{ expanded: false, isPartial: false },
+			theme,
+			undefined,
+			false,
+			(id) => id === "bg-2" ? "Dev server" : undefined,
+		).render(200).join("\n");
+
+		expect(rendered).toContain("bg-2 (Dev server): termination observed (killed)");
 	});
 });

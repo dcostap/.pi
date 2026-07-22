@@ -145,7 +145,7 @@ export function formatKillResults(results: KillResultItem[]): string {
 						: outcome === "termination-pending"
 							? "termination requested but settlement was not observed before the deadline"
 							: `termination observed (${snapshot.status})`;
-			return `${id}: ${detail}`;
+			return `${id} (${cleanInline(snapshot.title)}): ${detail}`;
 		})
 		.join("\n");
 }

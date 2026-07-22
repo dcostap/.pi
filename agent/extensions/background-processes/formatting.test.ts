@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AUTO_BUDGET, formatAutomaticResults, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, WAIT_TOTAL_BYTES } from "./formatting.ts";
+import { AUTO_BUDGET, formatAutomaticResults, formatKillResults, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, WAIT_TOTAL_BYTES } from "./formatting.ts";
 import type { BackgroundProcessSnapshot } from "./manager.ts";
 
 function snapshot(id: string, output: string): BackgroundProcessSnapshot {
@@ -30,6 +30,12 @@ describe("bounded formatting", () => {
 		const text = formatProcess(snapshot("bg-1", "safe\x1b]0;secret\x07end"));
 		expect(text).toContain("safeend");
 		expect(text).not.toContain("secret");
+	});
+
+	test("kill results keep the readable title beside the process id", () => {
+		const process = { ...snapshot("bg-2", ""), title: "Dev server", status: "killed" as const };
+		const text = formatKillResults([{ id: process.id, outcome: "killed", snapshot: process }]);
+		expect(text).toBe("bg-2 (Dev server): termination observed (killed)");
 	});
 
 	test("automatic batches honor their total byte budget", () => {
