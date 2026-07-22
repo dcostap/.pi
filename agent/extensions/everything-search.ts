@@ -55,7 +55,7 @@ type PreparedEverythingSearch = {
 };
 
 const EVERYTHING_HOST = process.env.EVERYTHING_HOST || "localhost";
-const EVERYTHING_PORT = process.env.EVERYTHING_PORT || "54367";
+const EVERYTHING_PORT = process.env.EVERYTHING_PORT || "5777";
 const EVERYTHING_MAX_RESULTS = Math.max(1, Number(process.env.EVERYTHING_MAX_RESULTS) || 255);
 const EVERYTHING_INSTALL_CHECK_TIMEOUT_MS = Math.max(25, Number(process.env.EVERYTHING_INSTALL_CHECK_TIMEOUT_MS) || 120);
 
