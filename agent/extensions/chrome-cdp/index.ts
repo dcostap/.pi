@@ -1,29 +1,45 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
+import { CDP, TargetSessionPool, abortableSleep, connectDiscoveredCdp, raceWithAbort, throwIfAborted } from "./protocol.ts";
+import { type Locator, callOnObject, describeLocator, hasLocator, readLocatorMetadata, releaseLocator, resolveLocator, withResolvedLocator } from "./locator.ts";
+import { getAxTree } from "./accessibility.ts";
+import { DiagnosticsStore, formatDiagnostics, type DiagnosticLevel } from "./diagnostics.ts";
+import { clearInspectorState, disposeInspectorSession, inspectLocator } from "./inspector.ts";
 
 const RUNTIME_DIR = resolve(tmpdir(), "pi-chrome-cdp");
-mkdirSync(RUNTIME_DIR, { recursive: true });
+mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+const runtimeStat = lstatSync(RUNTIME_DIR);
+if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink()) throw new Error(`Unsafe Chrome CDP runtime directory: ${RUNTIME_DIR}`);
+if (process.platform !== "win32") chmodSync(RUNTIME_DIR, 0o700);
 
 // ── output size guards ──
 const MAX_INLINE_BYTES = 2_000;   // max bytes sent to LLM inline; rest goes to files
 const FIRST_LOOK_BYTES = 1_200;    // preview bytes embedded in the summary for LLM
 const MAX_SNAP_LINES = 80;         // cap AX tree lines
+const diagnosticsStore = new DiagnosticsStore();
 
 // ── file-dumping (same pattern as web-smart-fetch) ──
 
 function makeDumpFile(label: string): string {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const safe = label.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").slice(0, 60);
-  return resolve(RUNTIME_DIR, `cdp_${ts}_${safe}`);
+  return resolve(RUNTIME_DIR, `cdp_${ts}_${randomUUID().slice(0, 8)}_${safe}`);
+}
+
+function makeFilePrivate(path: string): void {
+  if (process.platform !== "win32") chmodSync(path, 0o600);
 }
 
 function dumpToFile(label: string, text: string): string {
   const path = makeDumpFile(label);
-  writeFileSync(path, text, "utf8");
+  writeFileSync(path, text, { encoding: "utf8", mode: 0o600 });
+  makeFilePrivate(path);
   return path;
 }
 
@@ -47,7 +63,8 @@ function maybeDump(label: string, text: string, extraMeta?: string): string {
 function writeTextOutput(outputPath: string, text: string): string {
   const out = resolve(outputPath);
   mkdirSync(dirname(out), { recursive: true });
-  writeFileSync(out, text, "utf8");
+  writeFileSync(out, text, { encoding: "utf8", mode: 0o600 });
+  makeFilePrivate(out);
   return out;
 }
 
@@ -77,52 +94,95 @@ function evalExpressionFromParams(params: { expression?: string; expressionPath?
   return params.expressionPath ? readExpressionFile(params.expressionPath) : (params.expression || "document.title");
 }
 
+const ACTIONS = [
+  "list", "snap", "html", "inspect", "diagnostics", "eval", "script", "wait", "net",
+  "nav", "reload", "open", "download", "raw", "click", "clickxy", "type", "press", "shot", "viewport",
+] as const;
+
+const locatorSchema = Type.Object({
+  selector: Type.Optional(Type.String({ description: "CSS selector; can be combined with role/name/text filters" })),
+  role: Type.Optional(Type.String({ description: "Accessible or implicit role, e.g. button, link, textbox" })),
+  name: Type.Optional(Type.String({ description: "Accessible name filter" })),
+  text: Type.Optional(Type.String({ description: "Visible text filter" })),
+  exact: Type.Optional(Type.Boolean({ description: "Use exact case-insensitive name/text/role matching instead of substring matching" })),
+  index: Type.Optional(Type.Number({ description: "Zero-based match index when a locator matches multiple elements" })),
+});
+
 const chromeCdpParams = Type.Object({
-  action: Type.Union([
-    Type.Literal("list"),
-    Type.Literal("snap"),
-    Type.Literal("html"),
-    Type.Literal("eval"),
-    Type.Literal("script"),
-    Type.Literal("wait"),
-    Type.Literal("net"),
-    Type.Literal("nav"),
-    Type.Literal("reload"),
-    Type.Literal("open"),
-    Type.Literal("download"),
-    Type.Literal("raw"),
-    Type.Literal("click"),
-    Type.Literal("clickxy"),
-    Type.Literal("type"),
-    Type.Literal("shot"),
-  ], { description: "CDP action to perform" }),
+  action: StringEnum(ACTIONS, { description: "CDP action to perform" }),
   target: Type.Optional(Type.String({ description: "Target tab id prefix from list output, or a distinctive substring of the tab URL/title" })),
-  selector: Type.Optional(Type.String({ description: "CSS selector for html or click actions" })),
+  ...locatorSchema.properties,
+  locator: Type.Optional(locatorSchema),
+  locatorText: Type.Optional(Type.String({ description: "Visible-text locator filter; use this or nested locator.text when action=type because top-level text is the text to insert" })),
+  waitFor: Type.Optional(locatorSchema),
   expression: Type.Optional(Type.String({ description: "JavaScript expression for eval/wait" })),
   expressionPath: Type.Optional(Type.String({ description: "Path to a local JavaScript file to evaluate for eval/script" })),
   url: Type.Optional(Type.String({ description: "URL for nav/open/download" })),
-  text: Type.Optional(Type.String({ description: "Text for type" })),
+  text: Type.Optional(Type.String({ description: "Text to insert for type; for other locator-aware actions, a visible-text locator filter" })),
+  clearFirst: Type.Optional(Type.Boolean({ description: "For type, clear the target before inserting text" })),
+  key: Type.Optional(Type.String({ description: "Key for press, e.g. Enter, Escape, Tab, ArrowDown, a" })),
+  button: Type.Optional(StringEnum(["left", "right", "middle"] as const, { description: "Mouse button for click/clickxy" })),
+  clickCount: Type.Optional(Type.Number({ description: "Click count, usually 1 or 2" })),
+  modifiers: Type.Optional(Type.Array(StringEnum(["Alt", "Control", "Meta", "Shift"] as const), { description: "Keyboard/mouse modifiers" })),
+  offsetX: Type.Optional(Type.Number({ description: "Click offset from the matched element's left edge in CSS pixels" })),
+  offsetY: Type.Optional(Type.Number({ description: "Click offset from the matched element's top edge in CSS pixels" })),
   x: Type.Optional(Type.Number({ description: "CSS pixel X coordinate for clickxy" })),
   y: Type.Optional(Type.Number({ description: "CSS pixel Y coordinate for clickxy" })),
-  outputPath: Type.Optional(Type.String({ description: "Optional output path for shot, html, eval, net, snap, raw, or download" })),
+  outputPath: Type.Optional(Type.String({ description: "Optional output path for shot, html, inspect, diagnostics, eval, net, snap, raw, or download" })),
   timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds for CDP commands and waits" })),
-  waitForSelector: Type.Optional(Type.String({ description: "CSS selector to wait for after nav or with action=wait" })),
-  waitExpression: Type.Optional(Type.String({ description: "JavaScript predicate/expression to wait for after nav or with action=wait" })),
-  settleMs: Type.Optional(Type.Number({ description: "Optional extra delay after nav/wait, in milliseconds" })),
+  waitForSelector: Type.Optional(Type.String({ description: "CSS selector to wait for after open/nav/reload/click/type, or with action=wait" })),
+  waitExpression: Type.Optional(Type.String({ description: "JavaScript predicate to wait for after open/nav/reload/click/type, or with action=wait" })),
+  settleMs: Type.Optional(Type.Number({ description: "Optional extra delay after an action or successful wait, in milliseconds" })),
   method: Type.Optional(Type.String({ description: "Raw CDP method for action=raw, e.g. DOM.getDocument" })),
   cdpParams: Type.Optional(Type.Any({ description: "Raw CDP params object for action=raw" })),
   useBrowserCookies: Type.Optional(Type.Boolean({ description: "For download, include cookies from the selected browser tab" })),
   headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Optional HTTP headers for download" })),
+  fullPage: Type.Optional(Type.Boolean({ description: "For shot, capture the full document" })),
+  clip: Type.Optional(Type.Object({
+    x: Type.Number(), y: Type.Number(), width: Type.Number(), height: Type.Number(),
+    scale: Type.Optional(Type.Number()),
+  }, { description: "For shot, explicit page-coordinate clip in CSS pixels" })),
+  imageFormat: Type.Optional(StringEnum(["png", "jpeg", "webp"] as const, { description: "Screenshot image format" })),
+  quality: Type.Optional(Type.Number({ description: "JPEG/WebP screenshot quality from 0 to 100" })),
+  captureBeyondViewport: Type.Optional(Type.Boolean({ description: "Allow screenshot clips outside the current viewport" })),
+  viewport: Type.Optional(Type.Object({
+    width: Type.Number(), height: Type.Number(),
+    deviceScaleFactor: Type.Optional(Type.Number()),
+    mobile: Type.Optional(Type.Boolean()),
+    scale: Type.Optional(Type.Number()),
+    screenWidth: Type.Optional(Type.Number()),
+    screenHeight: Type.Optional(Type.Number()),
+  })),
+  devicePreset: Type.Optional(StringEnum(["desktop", "laptop", "tablet", "mobile", "iphone-14", "pixel-7"] as const)),
+  clearViewport: Type.Optional(Type.Boolean({ description: "For viewport, clear the current device metrics override" })),
+  styleProperties: Type.Optional(Type.Array(Type.String(), { description: "Computed CSS properties to include in inspect" })),
+  includeAllStyles: Type.Optional(Type.Boolean({ description: "For inspect, include every computed style (usually large)" })),
+  includeCssVariables: Type.Optional(Type.Boolean({ description: "For inspect, include relevant computed CSS variables" })),
+  includeMatchedRules: Type.Optional(Type.Boolean({ description: "For inspect, include matched CSS rules and source locations" })),
+  includeInherited: Type.Optional(Type.Boolean({ description: "For inspect, include inherited matched rules" })),
+  includeConsoleLogs: Type.Optional(Type.Boolean({ description: "For diagnostics, include ordinary console log/info entries" })),
+  diagnosticsSinceMs: Type.Optional(Type.Number({ description: "For diagnostics, only return entries captured within this many milliseconds" })),
+  diagnosticLevels: Type.Optional(Type.Array(StringEnum(["error", "warning", "info", "log"] as const))),
+  clearDiagnostics: Type.Optional(Type.Boolean({ description: "Clear matching tab diagnostics after reading" })),
 });
 
-type ChromeCdpParams = {
-  action: "list" | "snap" | "html" | "eval" | "script" | "wait" | "net" | "nav" | "reload" | "open" | "download" | "raw" | "click" | "clickxy" | "type" | "shot";
+type ChromeCdpParams = Locator & {
+  action: typeof ACTIONS[number];
   target?: string;
-  selector?: string;
   expression?: string;
   expressionPath?: string;
   url?: string;
   text?: string;
+  clearFirst?: boolean;
+  locator?: Locator;
+  locatorText?: string;
+  waitFor?: Locator;
+  key?: string;
+  button?: "left" | "right" | "middle";
+  clickCount?: number;
+  modifiers?: Array<"Alt" | "Control" | "Meta" | "Shift">;
+  offsetX?: number;
+  offsetY?: number;
   x?: number;
   y?: number;
   outputPath?: string;
@@ -134,157 +194,143 @@ type ChromeCdpParams = {
   cdpParams?: any;
   useBrowserCookies?: boolean;
   headers?: Record<string, string>;
+  fullPage?: boolean;
+  clip?: { x: number; y: number; width: number; height: number; scale?: number };
+  imageFormat?: "png" | "jpeg" | "webp";
+  quality?: number;
+  captureBeyondViewport?: boolean;
+  viewport?: { width: number; height: number; deviceScaleFactor?: number; mobile?: boolean; scale?: number; screenWidth?: number; screenHeight?: number };
+  devicePreset?: "desktop" | "laptop" | "tablet" | "mobile" | "iphone-14" | "pixel-7";
+  clearViewport?: boolean;
+  styleProperties?: string[];
+  includeAllStyles?: boolean;
+  includeCssVariables?: boolean;
+  includeMatchedRules?: boolean;
+  includeInherited?: boolean;
+  includeConsoleLogs?: boolean;
+  diagnosticsSinceMs?: number;
+  diagnosticLevels?: DiagnosticLevel[];
+  clearDiagnostics?: boolean;
 };
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-class CDP {
-  #ws?: WebSocket;
-  #id = 0;
-  #closed = true;
-  #pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
-  #handlers = new Map<string, Set<(params: any) => void>>();
-  #closeHandlers = new Set<() => void>();
-
-  get isOpen() {
-    return !!this.#ws && !this.#closed;
-  }
-
-  async connect(wsUrl: string) {
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      const ws = new WebSocket(wsUrl);
-      this.#ws = ws;
-      this.#closed = false;
-      ws.onopen = () => resolvePromise();
-      ws.onerror = (e: any) => rejectPromise(new Error(`WebSocket error: ${e?.message || e?.type || "unknown"}`));
-      ws.onmessage = (ev) => {
-        const msg = JSON.parse(String(ev.data));
-        if (msg.id && this.#pending.has(msg.id)) {
-          const pending = this.#pending.get(msg.id)!;
-          this.#pending.delete(msg.id);
-          if (msg.error) pending.reject(new Error(msg.error.message || "CDP error"));
-          else pending.resolve(msg.result);
-          return;
-        }
-        if (msg.method && this.#handlers.has(msg.method)) {
-          for (const handler of this.#handlers.get(msg.method)!) handler(msg.params || {});
-        }
-      };
-      ws.onclose = () => {
-        this.#closed = true;
-        for (const [id, pending] of this.#pending) {
-          pending.reject(new Error(`WebSocket closed while waiting for response ${id}`));
-        }
-        this.#pending.clear();
-        for (const handler of this.#closeHandlers) handler();
-      };
-    });
-  }
-
-  send(method: string, params: any = {}, sessionId?: string, timeoutMs = 15000) {
-    const id = ++this.#id;
-    return new Promise<any>((resolvePromise, rejectPromise) => {
-      this.#pending.set(id, { resolve: resolvePromise, reject: rejectPromise });
-      const msg: any = { id, method, params };
-      if (sessionId) msg.sessionId = sessionId;
-      this.#ws!.send(JSON.stringify(msg));
-      setTimeout(() => {
-        if (!this.#pending.has(id)) return;
-        this.#pending.delete(id);
-        rejectPromise(new Error(`Timeout: ${method} after ${timeoutMs}ms`));
-      }, timeoutMs);
-    });
-  }
-
-  onEvent(method: string, handler: (params: any) => void) {
-    if (!this.#handlers.has(method)) this.#handlers.set(method, new Set());
-    this.#handlers.get(method)!.add(handler);
-    return () => this.#handlers.get(method)?.delete(handler);
-  }
-
-  waitForEvent(method: string, timeoutMs = 15000) {
-    let off: (() => void) | undefined;
-    let timer: NodeJS.Timeout | undefined;
-    const promise = new Promise<any>((resolvePromise, rejectPromise) => {
-      off = this.onEvent(method, (params) => {
-        clearTimeout(timer);
-        off?.();
-        resolvePromise(params);
-      });
-      timer = setTimeout(() => {
-        off?.();
-        rejectPromise(new Error(`Timeout waiting for event: ${method}`));
-      }, timeoutMs);
-    });
-    return {
-      promise,
-      cancel() {
-        clearTimeout(timer);
-        off?.();
-      },
-    };
-  }
-
-  onClose(handler: () => void) {
-    this.#closeHandlers.add(handler);
-    return () => this.#closeHandlers.delete(handler);
-  }
-
-  close() {
-    this.#ws?.close();
-  }
+function elementLocator(params: ChromeCdpParams): Locator {
+  if (hasLocator(params.locator)) return params.locator!;
+  return {
+    selector: params.selector,
+    role: params.role,
+    name: params.name,
+    text: params.locatorText ?? (params.action === "type" ? undefined : params.text),
+    exact: params.exact,
+    index: params.index,
+  };
 }
+
+const sleep = abortableSleep;
 
 let sharedCdp: CDP | undefined;
 let sharedCdpPromise: Promise<CDP> | undefined;
-const sessionCache = new Map<string, string>();
+let sharedConnectController: AbortController | undefined;
+const sharedConnectWaiters = new Map<Promise<CDP>, number>();
+let connectionGeneration = 0;
+const sessionPool = new TargetSessionPool();
+const navigationTails = new Map<string, Promise<void>>();
 
-async function getSharedCdp() {
-  if (sharedCdp?.isOpen) return sharedCdp;
-  if (sharedCdpPromise) return sharedCdpPromise;
+function clearCdpRuntimeState(): void {
+  sessionPool.clear();
+  navigationTails.clear();
+  diagnosticsStore.clear();
+  clearInspectorState();
+}
 
-  sharedCdpPromise = (async () => {
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    sharedCdp = cdp;
-    sessionCache.clear();
-    cdp.onClose(() => {
-      if (sharedCdp === cdp) sharedCdp = undefined;
-      sharedCdpPromise = undefined;
-      sessionCache.clear();
-    });
-    return cdp;
+async function withNavigationLock<T>(sessionId: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  const previous = navigationTails.get(sessionId) ?? Promise.resolve();
+  const run = (async () => {
+    await raceWithAbort(previous, signal);
+    throwIfAborted(signal);
+    return fn();
   })();
-
+  const tail = run.then(() => undefined, () => undefined);
+  navigationTails.set(sessionId, tail);
   try {
-    return await sharedCdpPromise;
-  } catch (e) {
-    sharedCdpPromise = undefined;
-    throw e;
+    return await run;
+  } finally {
+    if (navigationTails.get(sessionId) === tail) navigationTails.delete(sessionId);
   }
 }
 
-function getWsUrl() {
-  const home = homedir();
-  const local = process.env.LOCALAPPDATA || resolve(home, "AppData", "Local");
-  const candidates = [
-    process.env.CDP_PORT_FILE,
-    resolve(local, "Google", "Chrome", "User Data", "DevToolsActivePort"),
-    resolve(local, "Google", "Chrome", "User Data", "Default", "DevToolsActivePort"),
-    resolve(local, "Chromium", "User Data", "DevToolsActivePort"),
-    resolve(local, "BraveSoftware", "Brave-Browser", "User Data", "DevToolsActivePort"),
-    resolve(local, "Microsoft", "Edge", "User Data", "DevToolsActivePort"),
-    resolve(home, "Library", "Application Support", "Google", "Chrome", "DevToolsActivePort"),
-  ].filter(Boolean) as string[];
-
-  const portFile = candidates.find((p) => existsSync(p));
-  if (!portFile) throw new Error(`DevToolsActivePort not found. Tried: ${candidates.join(", ")}`);
-  const [port, path] = readFileSync(portFile, "utf8").trim().split("\n");
-  return `ws://127.0.0.1:${port}${path}`;
+function invalidateSharedConnection(closeSocket: boolean): void {
+  connectionGeneration++;
+  sharedConnectController?.abort();
+  sharedConnectController = undefined;
+  sharedCdpPromise = undefined;
+  const cdp = sharedCdp;
+  sharedCdp = undefined;
+  clearCdpRuntimeState();
+  if (closeSocket) cdp?.close();
 }
 
-async function getPages(cdp: CDP) {
-  const { targetInfos } = await cdp.send("Target.getTargets");
+async function getSharedCdp(signal?: AbortSignal) {
+  throwIfAborted(signal);
+  if (sharedCdp?.isOpen) return sharedCdp;
+  if (sharedCdp && !sharedCdp.isOpen) {
+    invalidateSharedConnection(true);
+  }
+  if (!sharedCdpPromise) {
+    const generation = connectionGeneration;
+    const controller = new AbortController();
+    sharedConnectController = controller;
+    const connecting = (async () => {
+      const cdp = await connectDiscoveredCdp({ signal: controller.signal });
+      if (generation !== connectionGeneration || sharedCdpPromise !== connecting) {
+        cdp.close();
+        throw new Error("Discarded stale Chrome CDP connection attempt");
+      }
+      sharedCdp = cdp;
+      sharedConnectController = undefined;
+      clearCdpRuntimeState();
+      cdp.onClose(() => {
+        if (sharedCdp === cdp) {
+          invalidateSharedConnection(false);
+        }
+      });
+      cdp.onEvent("Target.detachedFromTarget", ({ sessionId }: { sessionId?: string }) => {
+        if (!sessionId) return;
+        sessionPool.invalidateSession(sessionId);
+        diagnosticsStore.disposeSession(sessionId);
+        disposeInspectorSession(sessionId);
+      });
+      cdp.onEvent("Target.targetDestroyed", ({ targetId }: { targetId?: string }) => {
+      if (!targetId) return;
+      sessionPool.invalidateTarget(targetId);
+      diagnosticsStore.disposeTarget(targetId);
+    });
+      return cdp;
+    })();
+    sharedCdpPromise = connecting;
+    void connecting.catch(() => {
+      if (sharedCdpPromise === connecting) {
+        sharedCdpPromise = undefined;
+        if (sharedConnectController === controller) sharedConnectController = undefined;
+      }
+    });
+  }
+
+  const connecting = sharedCdpPromise;
+  sharedConnectWaiters.set(connecting, (sharedConnectWaiters.get(connecting) ?? 0) + 1);
+  try {
+    return await raceWithAbort(connecting, signal);
+  } finally {
+    const remaining = Math.max(0, (sharedConnectWaiters.get(connecting) ?? 1) - 1);
+    if (remaining === 0) sharedConnectWaiters.delete(connecting);
+    else sharedConnectWaiters.set(connecting, remaining);
+    if (sharedCdpPromise === connecting && !sharedCdp && remaining === 0 && signal?.aborted) {
+      sharedConnectController?.abort();
+    }
+  }
+}
+
+async function getPages(cdp: CDP, signal?: AbortSignal) {
+  const { targetInfos } = await cdp.send("Target.getTargets", {}, undefined, 15_000, signal);
   return targetInfos.filter((t: any) => t.type === "page" && !String(t.url || "").startsWith("chrome://"));
 }
 
@@ -336,14 +382,14 @@ function formatEvalError(exceptionDetails: any, expression: string): string {
   return `Eval failed: ${detail}\nExpression: ${exprSnippet}`;
 }
 
-async function evalStr(cdp: CDP, sessionId: string, expression: string, timeoutMs?: number) {
+async function evalStr(cdp: CDP, sessionId: string, expression: string, timeoutMs?: number, signal?: AbortSignal) {
   const timeout = normalizeTimeout(timeoutMs);
-  await cdp.send("Runtime.enable", {}, sessionId, timeout);
+  await cdp.send("Runtime.enable", {}, sessionId, timeout, signal);
   const result = await cdp.send("Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
-  }, sessionId, timeout);
+  }, sessionId, timeout, signal);
   if (result.exceptionDetails) {
     throw new Error(formatEvalError(result.exceptionDetails, expression));
   }
@@ -351,54 +397,47 @@ async function evalStr(cdp: CDP, sessionId: string, expression: string, timeoutM
   return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value ?? "");
 }
 
-async function snapshotStr(cdp: CDP, sessionId: string, outputPath?: string, timeoutMs?: number) {
-  const { nodes } = await cdp.send("Accessibility.getFullAXTree", {}, sessionId, normalizeTimeout(timeoutMs));
-  const lines: string[] = [];
-  let skipped = 0;
-  let total = 0;
-  for (const node of nodes) {
-    total++;
-    const role = node.role?.value || "";
-    const name = node.name?.value ?? "";
-    const value = node.value?.value;
-    if (role === "none" || role === "generic") { skipped++; continue; }
-    if (name === "" && (value === "" || value == null)) { skipped++; continue; }
-    const depth = Math.min((node.backendDOMNodeId ? 1 : 0) + ((node.childIds?.length || 0) ? 0 : 0), 10);
-    let line = `${"  ".repeat(depth)}[${role}]`;
-    if (name) line += ` ${name}`;
-    if (!(value === "" || value == null)) line += ` = ${JSON.stringify(value)}`;
-    lines.push(line);
-    if (lines.length >= MAX_SNAP_LINES) break;
-  }
-  const header = `${lines.length} nodes shown` + (total > lines.length ? ` (${total} total, ${skipped} skipped)` : "");
-  const text = header + "\n" + lines.join("\n");
-  return outputPath ? saveTextResult(outputPath, text) : text;
+async function snapshotStr(cdp: CDP, sessionId: string, outputPath?: string, timeoutMs?: number, signal?: AbortSignal) {
+  const tree = await getAxTree(cdp, sessionId, normalizeTimeout(timeoutMs), signal, true);
+  if (outputPath) return saveTextResult(outputPath, tree.text);
+  if (tree.lines.length <= MAX_SNAP_LINES) return tree.text;
+  const fullPath = dumpToFile("accessibility-tree.txt", tree.text);
+  const preview = tree.lines.slice(0, MAX_SNAP_LINES).join("\n");
+  return `${tree.shownNodes} accessible nodes (${tree.totalNodes} AX nodes, ${tree.skippedNodes} skipped)\n${preview}\n...\n[Full accessibility tree saved to ${fullPath}]`;
 }
 
-async function htmlStr(cdp: CDP, sessionId: string, selector?: string, outputPath?: string, timeoutMs?: number) {
-  const expr = selector
-    ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || 'Element not found'`
-    : "document.documentElement.outerHTML";
-  const raw = await evalStr(cdp, sessionId, expr, timeoutMs);
+async function htmlStr(cdp: CDP, sessionId: string, locator: Locator, outputPath?: string, timeoutMs?: number, signal?: AbortSignal) {
+  let raw: string;
+  if (hasLocator(locator)) {
+    raw = await withResolvedLocator(cdp, sessionId, locator, normalizeTimeout(timeoutMs), signal, (resolved) =>
+      callOnObject<string>(cdp, sessionId, resolved.objectId, "function(){ return this.outerHTML || this.textContent || ''; }", { timeoutMs: normalizeTimeout(timeoutMs), signal }),
+    );
+  } else {
+    raw = await evalStr(cdp, sessionId, "document.documentElement.outerHTML", timeoutMs, signal);
+  }
 
   // HTML is always too big — dump to file, return stats + path
   let stats = "";
   try {
     const s = await evalStr(cdp, sessionId,
       `JSON.stringify({bodyChildren: document.body?.children.length??0, totalElements: document.querySelectorAll('*').length, bodyTextChars: (document.body?.textContent||'').length})`,
-      timeoutMs
+      timeoutMs,
+      signal,
     );
     const parsed = JSON.parse(s);
     stats = `body:${parsed.bodyChildren} kids, ${parsed.totalElements} elements, ${parsed.bodyTextChars} text chars`;
-  } catch { /* best-effort */ }
+  } catch (error: any) {
+    if (error?.name === "AbortError") throw error;
+    // Statistics are best-effort.
+  }
 
   if (outputPath) return saveTextResult(outputPath, raw);
-  const label = selector ? `html_sel_${selector.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40)}` : "html_full";
+  const label = hasLocator(locator) ? `html_element_${describeLocator(locator).replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40)}` : "html_full";
   return maybeDump(label + ".html", raw, stats);
 }
 
-async function netStr(cdp: CDP, sessionId: string, outputPath?: string, timeoutMs?: number) {
-  const raw = await evalStr(cdp, sessionId, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name.substring(0, 200), type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize })))`, timeoutMs);
+async function netStr(cdp: CDP, sessionId: string, outputPath?: string, timeoutMs?: number, signal?: AbortSignal) {
+  const raw = await evalStr(cdp, sessionId, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name.substring(0, 200), type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize })))`, timeoutMs, signal);
   const entries: any[] = JSON.parse(raw);
   if (entries.length === 0) return "No resource entries";
   const totalSize = entries.reduce((s: number, e: any) => s + (typeof e.size === "number" ? e.size : 0), 0);
@@ -418,147 +457,424 @@ function formatBytes(n: number | undefined | null): string {
   return `${(n / 1048576).toFixed(1).padStart(4)}MB`;
 }
 
-async function clickStr(cdp: CDP, sessionId: string, selector?: string) {
-  if (!selector) throw new Error("selector is required for click");
-  const result = await evalStr(cdp, sessionId, `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return { ok:false, error:'Element not found' }; el.scrollIntoView({ block: 'center' }); el.click(); return { ok:true, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) }; })()`);
-  const parsed = JSON.parse(result);
-  if (!parsed.ok) throw new Error(parsed.error);
-  return `Clicked <${parsed.tag}> \"${parsed.text}\"`;
+function modifierMask(modifiers: ChromeCdpParams["modifiers"]): number {
+  let mask = 0;
+  for (const modifier of modifiers || []) {
+    if (modifier === "Alt") mask |= 1;
+    if (modifier === "Control") mask |= 2;
+    if (modifier === "Meta") mask |= 4;
+    if (modifier === "Shift") mask |= 8;
+  }
+  return mask;
 }
 
-async function clickXyStr(cdp: CDP, sessionId: string, x?: number, y?: number) {
+async function clickStr(cdp: CDP, sessionId: string, locator: Locator, options: {
+  button?: "left" | "right" | "middle";
+  clickCount?: number;
+  modifiers?: ChromeCdpParams["modifiers"];
+  offsetX?: number;
+  offsetY?: number;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}) {
+  const timeout = normalizeTimeout(options.timeoutMs);
+  return withResolvedLocator(cdp, sessionId, locator, timeout, options.signal, async (resolved) => {
+    const point = await callOnObject<any>(cdp, sessionId, resolved.objectId, `async function(offsetX, offsetY) {
+      if (!this.isConnected) return { ok:false, error:'Element is detached' };
+      if (this.disabled || this.getAttribute?.('aria-disabled') === 'true') return { ok:false, error:'Element is disabled' };
+      this.scrollIntoView({ block:'center', inline:'center', behavior:'instant' });
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const rect = this.getBoundingClientRect();
+      const style = getComputedStyle(this);
+      if (!(rect.width > 0 && rect.height > 0) || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) <= 0) {
+        return { ok:false, error:'Element is not visible', rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height} };
+      }
+      if (style.pointerEvents === 'none') return { ok:false, error:'Element has pointer-events:none' };
+      const x = offsetX == null ? rect.left + rect.width / 2 : rect.left + offsetX;
+      const y = offsetY == null ? rect.top + rect.height / 2 : rect.top + offsetY;
+      const hit = document.elementFromPoint(x, y);
+      if (!hit || !(hit === this || this.contains(hit))) {
+        return { ok:false, error:'Element is covered at the click point', covering:hit ? (hit.tagName + (hit.id ? '#' + hit.id : '')) : null, x, y };
+      }
+      return { ok:true, x, y, tag:this.tagName, text:(this.innerText || this.textContent || '').replace(/\\s+/g,' ').trim().slice(0,80) };
+    }`, {
+      arguments: [{ value: options.offsetX ?? null }, { value: options.offsetY ?? null }],
+      timeoutMs: timeout,
+      signal: options.signal,
+    });
+    if (!point.ok) throw new Error(`${point.error}${point.covering ? ` (covered by ${point.covering})` : ""}`);
+    const button = options.button || "left";
+    const clickCount = Math.max(1, Math.min(3, Math.round(options.clickCount ?? 1)));
+    const base = { x: point.x, y: point.y, button, clickCount, modifiers: modifierMask(options.modifiers) };
+    await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mouseMoved" }, sessionId, timeout, options.signal);
+    await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mousePressed" }, sessionId, timeout, options.signal);
+    await sleep(40, options.signal);
+    await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mouseReleased" }, sessionId, timeout, options.signal);
+    return `Clicked <${point.tag}> ${JSON.stringify(point.text)} at CSS (${Math.round(point.x)}, ${Math.round(point.y)})`;
+  });
+}
+
+async function clickXyStr(cdp: CDP, sessionId: string, x: number | undefined, y: number | undefined, options: {
+  button?: "left" | "right" | "middle"; clickCount?: number; modifiers?: ChromeCdpParams["modifiers"];
+  timeoutMs?: number; signal?: AbortSignal;
+}) {
   if (typeof x !== "number" || typeof y !== "number") throw new Error("x and y are required for clickxy");
-  const base = { x, y, button: "left", clickCount: 1, modifiers: 0 };
-  await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mouseMoved" }, sessionId);
-  await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mousePressed" }, sessionId);
-  await sleep(50);
-  await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mouseReleased" }, sessionId);
+  const timeout = normalizeTimeout(options.timeoutMs);
+  const base = {
+    x, y, button: options.button || "left",
+    clickCount: Math.max(1, Math.min(3, Math.round(options.clickCount ?? 1))),
+    modifiers: modifierMask(options.modifiers),
+  };
+  await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mouseMoved" }, sessionId, timeout, options.signal);
+  await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mousePressed" }, sessionId, timeout, options.signal);
+  await sleep(40, options.signal);
+  await cdp.send("Input.dispatchMouseEvent", { ...base, type: "mouseReleased" }, sessionId, timeout, options.signal);
   return `Clicked at CSS (${x}, ${y})`;
 }
 
-async function typeStr(cdp: CDP, sessionId: string, text?: string) {
-  if (!text) throw new Error("text is required for type");
-  await cdp.send("Input.insertText", { text }, sessionId);
-  return `Typed ${text.length} characters`;
+async function acquireInputTarget(cdp: CDP, sessionId: string, locator: Locator, timeout: number, signal?: AbortSignal) {
+  if (hasLocator(locator)) return resolveLocator(cdp, sessionId, locator, timeout, signal);
+  await cdp.send("Runtime.enable", {}, sessionId, timeout, signal);
+  const evaluated = await cdp.send("Runtime.evaluate", {
+    expression: "document.activeElement",
+    returnByValue: false,
+    objectGroup: "pi-chrome-cdp-input",
+  }, sessionId, timeout, signal);
+  const objectId = evaluated.result?.objectId;
+  if (!objectId) throw new Error("No element is focused; provide selector, role, name, or text");
+  const described = await cdp.send("DOM.describeNode", { objectId, depth: 0 }, sessionId, timeout, signal);
+  return {
+    objectId,
+    backendNodeId: described.node?.backendNodeId,
+    nodeId: described.node?.nodeId || undefined,
+    metadata: await readLocatorMetadata(cdp, sessionId, objectId, timeout, signal),
+  };
 }
 
-async function waitStr(cdp: CDP, sessionId: string, options: { selector?: string; expression?: string; timeoutMs?: number; settleMs?: number }) {
+async function typeStr(cdp: CDP, sessionId: string, locator: Locator, options: {
+  text?: string; clearFirst?: boolean; timeoutMs?: number; signal?: AbortSignal;
+}) {
+  if (options.text === undefined) throw new Error("text is required for type");
+  const timeout = normalizeTimeout(options.timeoutMs);
+  const resolved = await acquireInputTarget(cdp, sessionId, locator, timeout, options.signal);
+  try {
+    const prepared = await callOnObject<any>(cdp, sessionId, resolved.objectId, `function(clearFirst, locatorSpecified) {
+      const tag = String(this.tagName || '').toUpperCase();
+      const inputType = tag === 'INPUT' ? String(this.type || 'text').toLowerCase() : '';
+      const editableInput = tag === 'INPUT' && ['text','search','email','url','tel','password','number'].includes(inputType);
+      const editable = editableInput || tag === 'TEXTAREA' || !!this.isContentEditable;
+      const crossOriginFrame = tag === 'IFRAME' || tag === 'FRAME';
+      if (tag === 'INPUT' && !editableInput) return { ok:false, error:'Input type ' + inputType + ' does not accept inserted text', tag };
+      if (!editable && !crossOriginFrame) return { ok:false, error:'Target is not editable', tag };
+      if (crossOriginFrame && locatorSpecified) return { ok:false, error:'A frame locator cannot identify the focused editable element inside the frame; focus it first and call type without a locator', tag };
+      if (crossOriginFrame && clearFirst) return { ok:false, error:'clearFirst is unavailable for a focused cross-origin frame', tag };
+      if (this.disabled || this.getAttribute?.('aria-disabled') === 'true') return { ok:false, error:'Target is disabled', tag };
+      this.scrollIntoView?.({ block:'center', inline:'nearest', behavior:'instant' });
+      this.focus?.();
+      const focused = document.activeElement === this || this.contains?.(document.activeElement);
+      if (!focused && !crossOriginFrame) return { ok:false, error:'Could not focus target', tag };
+      const value = editable ? String(this.value ?? this.textContent ?? '') : null;
+      if (clearFirst) {
+        if (tag === 'INPUT' || tag === 'TEXTAREA') this.select();
+        else if (this.isContentEditable) {
+          const range = document.createRange(); range.selectNodeContents(this);
+          const selection = getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
+        }
+      }
+      return { ok:true, tag, editable, crossOriginFrame, before:value };
+    }`, { arguments: [{ value: !!options.clearFirst }, { value: hasLocator(locator) }], timeoutMs: timeout, signal: options.signal });
+    if (!prepared.ok) throw new Error(`${prepared.error}${prepared.tag ? ` (<${prepared.tag}>)` : ""}`);
+
+    if (options.clearFirst) {
+      const key = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 };
+      await cdp.send("Input.dispatchKeyEvent", { ...key, type: "keyDown" }, sessionId, timeout, options.signal);
+      await cdp.send("Input.dispatchKeyEvent", { ...key, type: "keyUp" }, sessionId, timeout, options.signal);
+    }
+    if (options.text.length > 0) {
+      await cdp.send("Input.insertText", { text: options.text }, sessionId, timeout, options.signal);
+    }
+    if (prepared.crossOriginFrame) {
+      return `Typed ${options.text.length} characters into the focused cross-origin frame (result could not be read back)`;
+    }
+
+    const verified = await readLocatorMetadata(cdp, sessionId, resolved.objectId, timeout, options.signal);
+    const value = String(verified.value ?? "");
+    if (options.text.length > 0 && !options.clearFirst && value === prepared.before) {
+      throw new Error(`Typing did not change <${verified.tag}>; the requested text was not inserted`);
+    }
+    if (options.text.length > 0 && options.clearFirst && value === "") {
+      throw new Error(`Typing left <${verified.tag}> empty; the requested text was not inserted`);
+    }
+    if (options.clearFirst && options.text.length === 0 && value !== "") {
+      throw new Error(`Clearing <${verified.tag}> failed; ${value.length} characters remain`);
+    }
+    const preview = value.slice(0, 120) + (value.length > 120 ? "…" : "");
+    return `Typed ${options.text.length} characters into <${verified.tag}>; value is now ${JSON.stringify(preview)}`;
+  } finally {
+    await releaseLocator(cdp, sessionId, resolved.objectId);
+  }
+}
+
+function keyDefinition(key: string) {
+  const named: Record<string, { key: string; code: string; vk: number; text?: string }> = {
+    Enter: { key: "Enter", code: "Enter", vk: 13, text: "\r" },
+    Escape: { key: "Escape", code: "Escape", vk: 27 },
+    Tab: { key: "Tab", code: "Tab", vk: 9 },
+    Backspace: { key: "Backspace", code: "Backspace", vk: 8 },
+    Delete: { key: "Delete", code: "Delete", vk: 46 },
+    ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", vk: 37 },
+    ArrowUp: { key: "ArrowUp", code: "ArrowUp", vk: 38 },
+    ArrowRight: { key: "ArrowRight", code: "ArrowRight", vk: 39 },
+    ArrowDown: { key: "ArrowDown", code: "ArrowDown", vk: 40 },
+    Home: { key: "Home", code: "Home", vk: 36 },
+    End: { key: "End", code: "End", vk: 35 },
+    PageUp: { key: "PageUp", code: "PageUp", vk: 33 },
+    PageDown: { key: "PageDown", code: "PageDown", vk: 34 },
+    Space: { key: " ", code: "Space", vk: 32, text: " " },
+  };
+  if (named[key]) return named[key];
+  if (key.length === 1) {
+    const upper = key.toUpperCase();
+    return { key, code: /[a-z]/i.test(key) ? `Key${upper}` : key, vk: upper.charCodeAt(0), text: key };
+  }
+  throw new Error(`Unsupported key ${JSON.stringify(key)}; use a printable character or a standard key such as Enter, Escape, Tab, or ArrowDown`);
+}
+
+async function pressStr(cdp: CDP, sessionId: string, locator: Locator, options: {
+  key?: string; modifiers?: ChromeCdpParams["modifiers"]; timeoutMs?: number; signal?: AbortSignal;
+}) {
+  if (!options.key) throw new Error("key is required for press");
+  const timeout = normalizeTimeout(options.timeoutMs);
+  let resolved: Awaited<ReturnType<typeof acquireInputTarget>> | undefined;
+  if (hasLocator(locator)) {
+    resolved = await acquireInputTarget(cdp, sessionId, locator, timeout, options.signal);
+  }
+  try {
+    if (resolved) {
+      const focus = await callOnObject<any>(cdp, sessionId, resolved.objectId, `function(){
+        if (!this.isConnected) return {ok:false,error:'Element is detached'};
+        if (this.disabled || this.getAttribute?.('aria-disabled') === 'true') return {ok:false,error:'Element is disabled'};
+        this.scrollIntoView?.({block:'center',inline:'nearest',behavior:'instant'});
+        this.focus?.();
+        const focused = document.activeElement === this || !!this.contains?.(document.activeElement);
+        return focused ? {ok:true} : {ok:false,error:'Element could not be focused'};
+      }`, { timeoutMs: timeout, signal: options.signal });
+      if (!focus.ok) throw new Error(`${focus.error}: ${describeLocator(locator)}`);
+    }
+    const definition = keyDefinition(options.key);
+    const emitsText = !!definition.text && !options.modifiers?.some((modifier) => ["Alt", "Control", "Meta"].includes(modifier));
+    const params = {
+      key: definition.key, code: definition.code,
+      windowsVirtualKeyCode: definition.vk, nativeVirtualKeyCode: definition.vk,
+      modifiers: modifierMask(options.modifiers),
+      ...(emitsText ? { text: definition.text, unmodifiedText: definition.text } : {}),
+    };
+    await cdp.send("Input.dispatchKeyEvent", { ...params, type: "keyDown" }, sessionId, timeout, options.signal);
+    await cdp.send("Input.dispatchKeyEvent", { ...params, type: "keyUp", text: undefined, unmodifiedText: undefined }, sessionId, timeout, options.signal);
+    return `Pressed ${options.modifiers?.length ? `${options.modifiers.join("+")}+` : ""}${options.key}`;
+  } finally {
+    if (resolved) await releaseLocator(cdp, sessionId, resolved.objectId);
+  }
+}
+
+async function waitStr(cdp: CDP, sessionId: string, options: {
+  locator?: Locator; expression?: string; timeoutMs?: number; settleMs?: number; signal?: AbortSignal;
+}) {
   const timeout = normalizeTimeout(options.timeoutMs, 15000);
   const settleMs = options.settleMs == null ? 0 : Math.max(0, Math.round(options.settleMs));
   const deadline = Date.now() + timeout;
-  const selector = options.selector;
+  const locator = options.locator;
   const expression = options.expression;
-  if (!selector && !expression) {
-    await waitForReady(cdp, sessionId, timeout);
-    if (settleMs) await sleep(settleMs);
+  if (!hasLocator(locator) && !expression) {
+    await waitForReady(cdp, sessionId, timeout, options.signal);
+    if (settleMs) await sleep(settleMs, options.signal);
     return `Waited for document.readyState === "complete"${settleMs ? ` and settled ${settleMs}ms` : ""}`;
   }
 
   let last = "";
   while (Date.now() < deadline) {
+    throwIfAborted(options.signal);
     try {
-      if (selector) {
-        const found = await evalStr(cdp, sessionId, `!!document.querySelector(${JSON.stringify(selector)})`, Math.min(5000, timeout));
-        last = found;
-        if (found === "true") {
-          if (settleMs) await sleep(settleMs);
-          return `Found selector ${selector}${settleMs ? ` and settled ${settleMs}ms` : ""}`;
-        }
+      if (hasLocator(locator)) {
+        const resolved = await resolveLocator(cdp, sessionId, locator!, Math.min(5000, Math.max(100, deadline - Date.now())), options.signal);
+        await releaseLocator(cdp, sessionId, resolved.objectId);
+        if (settleMs) await sleep(settleMs, options.signal);
+        return `Found ${describeLocator(locator!)}${settleMs ? ` and settled ${settleMs}ms` : ""}`;
       }
       if (expression) {
-        const ok = await evalStr(cdp, sessionId, `(async () => Boolean(await (${expression})))()`, Math.min(5000, timeout));
+        const ok = await evalStr(cdp, sessionId, `(async () => Boolean(await (${expression})))()`, Math.min(5000, Math.max(100, deadline - Date.now())), options.signal);
         last = ok;
         if (ok === "true") {
-          if (settleMs) await sleep(settleMs);
+          if (settleMs) await sleep(settleMs, options.signal);
           return `Wait expression became truthy${settleMs ? ` and settled ${settleMs}ms` : ""}`;
         }
       }
     } catch (e: any) {
+      if (e?.name === "AbortError") throw e;
       last = e?.message || String(e);
     }
-    await sleep(200);
+    await sleep(200, options.signal);
   }
-  const target = selector ? `selector ${selector}` : "expression";
+  const target = hasLocator(locator) ? describeLocator(locator!) : "expression";
   throw new Error(`Timed out waiting for ${target}${last ? ` (last: ${last})` : ""}`);
 }
 
-async function waitForReady(cdp: CDP, sessionId: string, timeoutMs = 30000) {
+type PostActionOptions = { waitFor?: Locator; waitForSelector?: string; waitExpression?: string; timeoutMs?: number; settleMs?: number; signal?: AbortSignal };
+
+async function postActionWait(cdp: CDP, sessionId: string, options: PostActionOptions) {
+  const locator = hasLocator(options.waitFor) ? options.waitFor : options.waitForSelector ? { selector: options.waitForSelector } : undefined;
+  if (!hasLocator(locator) && !options.waitExpression && !options.settleMs) return "";
+  return waitStr(cdp, sessionId, {
+    locator,
+    expression: options.waitExpression,
+    timeoutMs: options.timeoutMs,
+    settleMs: options.settleMs,
+    signal: options.signal,
+  });
+}
+
+function withWaitSuffix(text: string, waited: string) {
+  return waited ? `${text}; ${waited}` : text;
+}
+
+async function waitForReady(cdp: CDP, sessionId: string, timeoutMs = 30000, signal?: AbortSignal) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const state = await evalStr(cdp, sessionId, "document.readyState").catch(() => "");
+    throwIfAborted(signal);
+    const state = await evalStr(cdp, sessionId, "document.readyState", Math.min(5000, Math.max(100, deadline - Date.now())), signal).catch((error) => {
+      if (error?.name === "AbortError") throw error;
+      return "";
+    });
     if (state === "complete") return;
-    await sleep(200);
+    await sleep(200, signal);
   }
   throw new Error("Timed out waiting for page to finish loading");
 }
 
-async function navStr(cdp: CDP, sessionId: string, options: { url?: string; timeoutMs?: number; waitForSelector?: string; waitExpression?: string; settleMs?: number }) {
-  const { url } = options;
-  if (!url) throw new Error("url is required for nav");
-  const timeout = normalizeTimeout(options.timeoutMs, 30000);
-  await cdp.send("Page.enable", {}, sessionId, timeout);
-  const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout);
-  try {
-    const result = await cdp.send("Page.navigate", { url }, sessionId, timeout);
-    if (result.errorText) throw new Error(result.errorText);
-    if (result.loaderId) await loadEvent.promise;
-    await waitForReady(cdp, sessionId, Math.min(5000, timeout));
-    let suffix = "";
-    if (options.waitForSelector || options.waitExpression || options.settleMs) {
-      const waited = await waitStr(cdp, sessionId, {
-        selector: options.waitForSelector,
-        expression: options.waitExpression,
+async function navStr(cdp: CDP, sessionId: string, options: PostActionOptions & { url?: string }) {
+  return withNavigationLock(sessionId, options.signal, async () => {
+    const { url } = options;
+    if (!url) throw new Error("url is required for nav");
+    const timeout = normalizeTimeout(options.timeoutMs, 30000);
+    await cdp.send("Page.enable", {}, sessionId, timeout, options.signal);
+    const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout, sessionId, options.signal);
+    try {
+      const result = await cdp.send("Page.navigate", { url }, sessionId, timeout, options.signal);
+      if (result.errorText) throw new Error(result.errorText);
+      if (result.loaderId) await loadEvent.promise;
+      await waitForReady(cdp, sessionId, Math.min(5000, timeout), options.signal);
+      const waited = await postActionWait(cdp, sessionId, {
+        waitFor: options.waitFor,
+        waitForSelector: options.waitForSelector,
+        waitExpression: options.waitExpression,
         timeoutMs: Math.max(100, timeout - 1000),
         settleMs: options.settleMs,
+        signal: options.signal,
       });
-      suffix = `; ${waited}`;
+      return withWaitSuffix(`Navigated to ${url}`, waited);
+    } finally {
+      // If Page.navigate times out or fails before we await loadEvent.promise,
+      // cancel the pending timer/listener to avoid an unhandled rejection.
+      loadEvent.cancel();
     }
-    return `Navigated to ${url}${suffix}`;
-  } finally {
-    // If Page.navigate times out or fails before we await loadEvent.promise, cancel
-    // the pending timer/listener. Otherwise its later rejection can become an
-    // uncaught exception and take down pi.
-    loadEvent.cancel();
-  }
+  });
 }
 
-async function reloadStr(cdp: CDP, sessionId: string, timeoutMs?: number) {
-  const timeout = normalizeTimeout(timeoutMs, 30000);
-  await cdp.send("Page.enable", {}, sessionId, timeout);
-  const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout);
-  try {
-    await cdp.send("Page.reload", {}, sessionId, timeout);
-    await loadEvent.promise;
-    await waitForReady(cdp, sessionId, Math.min(5000, timeout));
-    return "Reloaded page";
-  } finally {
-    // Same cleanup as navStr: avoid orphaned load-event timers if reload fails.
-    loadEvent.cancel();
-  }
+async function reloadStr(cdp: CDP, sessionId: string, options: PostActionOptions) {
+  return withNavigationLock(sessionId, options.signal, async () => {
+    const timeout = normalizeTimeout(options.timeoutMs, 30000);
+    await cdp.send("Page.enable", {}, sessionId, timeout, options.signal);
+    const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout, sessionId, options.signal);
+    try {
+      await cdp.send("Page.reload", {}, sessionId, timeout, options.signal);
+      await loadEvent.promise;
+      await waitForReady(cdp, sessionId, Math.min(5000, timeout), options.signal);
+      const waited = await postActionWait(cdp, sessionId, {
+        ...options,
+        timeoutMs: Math.max(100, timeout - 1000),
+      });
+      return withWaitSuffix("Reloaded page", waited);
+    } finally {
+      loadEvent.cancel();
+    }
+  });
 }
 
-async function shotStr(cdp: CDP, sessionId: string, targetId: string, outputPath?: string, timeoutMs?: number) {
-  const timeout = normalizeTimeout(timeoutMs);
-  const { data } = await cdp.send("Page.captureScreenshot", { format: "png" }, sessionId, timeout);
-  const out = outputPath ? resolve(outputPath) : resolve(RUNTIME_DIR, `screenshot-${targetId.slice(0, 8)}.png`);
+async function shotStr(cdp: CDP, sessionId: string, targetId: string, locator: Locator, options: {
+  outputPath?: string; timeoutMs?: number; fullPage?: boolean;
+  clip?: ChromeCdpParams["clip"]; imageFormat?: ChromeCdpParams["imageFormat"];
+  quality?: number; captureBeyondViewport?: boolean; signal?: AbortSignal;
+}) {
+  const timeout = normalizeTimeout(options.timeoutMs, 30_000);
+  const locatorRequested = hasLocator(locator);
+  const modes = Number(locatorRequested) + Number(!!options.fullPage) + Number(!!options.clip);
+  if (modes > 1) throw new Error("For shot, choose only one of an element locator, fullPage, or clip");
+  const format = options.imageFormat || "png";
+  const quality = options.quality == null ? undefined : Math.max(0, Math.min(100, Math.round(options.quality)));
+  let clip: any = options.clip ? {
+    x: options.clip.x, y: options.clip.y, width: options.clip.width, height: options.clip.height,
+    scale: options.clip.scale ?? 1,
+  } : undefined;
+
+  if (locatorRequested) {
+    clip = await withResolvedLocator(cdp, sessionId, locator, timeout, options.signal, async (resolved) => {
+      await callOnObject(cdp, sessionId, resolved.objectId, "async function(){ this.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); await new Promise(r=>requestAnimationFrame(r)); return true; }", { timeoutMs: timeout, signal: options.signal });
+      const metadata = await readLocatorMetadata(cdp, sessionId, resolved.objectId, timeout, options.signal);
+      if (!metadata.visible) throw new Error(`Cannot screenshot hidden element ${describeLocator(locator)}`);
+      return { ...metadata.pageRect, scale: 1 };
+    });
+  } else if (options.fullPage) {
+    const metrics = await cdp.send("Page.getLayoutMetrics", {}, sessionId, timeout, options.signal);
+    const size = metrics.cssContentSize || metrics.contentSize;
+    if (!size?.width || !size?.height) throw new Error("Chrome did not return full-page layout dimensions");
+    clip = { x: size.x || 0, y: size.y || 0, width: size.width, height: size.height, scale: 1 };
+  }
+
+  if (clip && (!(clip.width > 0) || !(clip.height > 0))) throw new Error("Screenshot clip width and height must be positive");
+  const captureParams: any = {
+    format,
+    fromSurface: true,
+    captureBeyondViewport: options.captureBeyondViewport ?? !!clip,
+  };
+  if (clip) captureParams.clip = clip;
+  if (format !== "png" && quality != null) captureParams.quality = quality;
+  const { data } = await cdp.send("Page.captureScreenshot", captureParams, sessionId, timeout, options.signal);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const out = options.outputPath ? resolve(options.outputPath) : resolve(RUNTIME_DIR, `screenshot-${targetId.slice(0, 8)}-${stamp}.${format === "jpeg" ? "jpg" : format}`);
   mkdirSync(dirname(out), { recursive: true });
-  writeFileSync(out, Buffer.from(data, "base64"));
-  const dpr = parseFloat(await evalStr(cdp, sessionId, "window.devicePixelRatio", timeout).catch(() => "1")) || 1;
-  return `${out}\nScreenshot saved. DPR: ${dpr}`;
+  writeFileSync(out, Buffer.from(data, "base64"), { mode: 0o600 });
+  makeFilePrivate(out);
+  const dpr = parseFloat(await evalStr(cdp, sessionId, "window.devicePixelRatio", timeout, options.signal).catch((error) => {
+    if (error?.name === "AbortError") throw error;
+    return "1";
+  })) || 1;
+  const mode = locatorRequested ? `element ${describeLocator(locator)}` : options.fullPage ? "full page" : clip ? "clip" : "viewport";
+  return `${out}\nScreenshot saved (${mode}, ${format}). DPR: ${dpr}${clip ? `; CSS clip ${Math.round(clip.width)}×${Math.round(clip.height)}` : ""}`;
 }
 
-async function rawStr(cdp: CDP, sessionId: string, method?: string, cdpParams?: any, outputPath?: string, timeoutMs?: number) {
+async function rawStr(cdp: CDP, sessionId: string, method?: string, cdpParams?: any, outputPath?: string, timeoutMs?: number, signal?: AbortSignal) {
   if (!method) throw new Error("method is required for raw");
-  const result = await cdp.send(method, cdpParams || {}, sessionId, normalizeTimeout(timeoutMs));
+  const rootScoped = /^(?:Browser|Target|SystemInfo|Memory)\./.test(method);
+  const result = await cdp.send(method, cdpParams || {}, rootScoped ? undefined : sessionId, normalizeTimeout(timeoutMs), signal);
   const text = JSON.stringify(result, null, 2);
   return outputPath ? saveTextResult(outputPath, text) : text;
 }
 
-async function openStr(url?: string) {
-  const cdp = await getSharedCdp();
+async function openStr(url: string | undefined, options: PostActionOptions) {
+  throwIfAborted(options.signal);
+  const cdp = await getSharedCdp(options.signal);
   const openUrl = url || "about:blank";
-  const { targetId } = await cdp.send("Target.createTarget", { url: openUrl });
-  return `Opened new tab: ${String(targetId).slice(0, 8)}  ${openUrl}`;
+  const timeout = normalizeTimeout(options.timeoutMs);
+  const { targetId } = await cdp.send("Target.createTarget", { url: openUrl }, undefined, timeout, options.signal);
+  let waited = "";
+  if (hasLocator(options.waitFor) || options.waitForSelector || options.waitExpression || options.settleMs) {
+    const sessionId = await getOrAttachSession(cdp, targetId, timeout, options.signal);
+    waited = await postActionWait(cdp, sessionId, options);
+  }
+  return {
+    targetId,
+    text: withWaitSuffix(`Opened new tab: ${String(targetId).slice(0, 8)}  ${openUrl}`, waited),
+  };
 }
 
 function inferDownloadPath(url: string) {
@@ -571,79 +887,137 @@ function inferDownloadPath(url: string) {
   return resolve(RUNTIME_DIR, name);
 }
 
-async function downloadStr(options: { url?: string; outputPath?: string; headers?: Record<string, string>; cookies?: string; timeoutMs?: number }) {
+async function downloadStr(options: { url?: string; outputPath?: string; headers?: Record<string, string>; cookies?: string; timeoutMs?: number; signal?: AbortSignal }) {
   if (!options.url) throw new Error("url is required for download");
+  throwIfAborted(options.signal);
   const headers: Record<string, string> = { ...(options.headers || {}) };
   if (options.cookies && !headers.cookie && !headers.Cookie) headers.cookie = options.cookies;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), normalizeTimeout(options.timeoutMs, 30000));
+  const onAbort = () => controller.abort();
+  options.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const response = await fetch(options.url, { headers, signal: controller.signal });
     if (!response.ok) throw new Error(`Download failed: HTTP ${response.status} ${response.statusText}`);
     const out = options.outputPath ? resolve(options.outputPath) : inferDownloadPath(options.url);
     mkdirSync(dirname(out), { recursive: true });
     const bytes = Buffer.from(await response.arrayBuffer());
-    writeFileSync(out, bytes);
+    writeFileSync(out, bytes, { mode: 0o600 });
+    makeFilePrivate(out);
     const type = response.headers.get("content-type") || "unknown type";
     return `${out}\nDownloaded ${formatBytes(bytes.length)} (${type}) from ${options.url}`;
   } catch (e: any) {
+    throwIfAborted(options.signal);
     if (e?.name === "AbortError") throw new Error(`Download timed out after ${normalizeTimeout(options.timeoutMs, 30000)}ms`);
     throw e;
   } finally {
     clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function withTarget<T>(targetQuery: string | undefined, fn: (cdp: CDP, sessionId: string, page: any) => Promise<T>) {
-  const cdp = await getSharedCdp();
-  const pages = await getPages(cdp);
-  const page = resolveTarget(pages, targetQuery);
+const DEVICE_PRESETS: Record<NonNullable<ChromeCdpParams["devicePreset"]>, NonNullable<ChromeCdpParams["viewport"]>> = {
+  desktop: { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
+  laptop: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false },
+  tablet: { width: 820, height: 1180, deviceScaleFactor: 2, mobile: true },
+  mobile: { width: 390, height: 844, deviceScaleFactor: 1, mobile: true },
+  "iphone-14": { width: 390, height: 844, deviceScaleFactor: 3, mobile: true },
+  "pixel-7": { width: 412, height: 915, deviceScaleFactor: 2.625, mobile: true },
+};
 
-  let sessionId = sessionCache.get(page.targetId);
-  if (!sessionId) {
-    const attached = await cdp.send("Target.attachToTarget", { targetId: page.targetId, flatten: true });
-    sessionId = attached.sessionId;
-    sessionCache.set(page.targetId, sessionId);
+async function viewportStr(cdp: CDP, sessionId: string, options: {
+  viewport?: ChromeCdpParams["viewport"]; devicePreset?: ChromeCdpParams["devicePreset"];
+  clearViewport?: boolean; timeoutMs?: number; signal?: AbortSignal;
+}) {
+  const timeout = normalizeTimeout(options.timeoutMs);
+  if (options.clearViewport) {
+    await cdp.send("Emulation.clearDeviceMetricsOverride", {}, sessionId, timeout, options.signal);
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false }, sessionId, timeout, options.signal).catch(() => {});
+    const actual = await evalStr(cdp, sessionId, "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,mobile:navigator.userAgentData?.mobile??null})", timeout, options.signal);
+    return `Cleared viewport override\n${actual}`;
   }
+  if (options.viewport && options.devicePreset) throw new Error("Provide viewport or devicePreset, not both");
+  const viewport = options.viewport || (options.devicePreset ? DEVICE_PRESETS[options.devicePreset] : undefined);
+  if (!viewport) throw new Error("viewport action requires viewport, devicePreset, or clearViewport=true");
+  if (!(viewport.width > 0) || !(viewport.height > 0)) throw new Error("Viewport width and height must be positive");
+  const params = {
+    width: Math.round(viewport.width), height: Math.round(viewport.height),
+    deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
+    mobile: viewport.mobile ?? false,
+    scale: viewport.scale ?? 1,
+    screenWidth: Math.round(viewport.screenWidth ?? viewport.width),
+    screenHeight: Math.round(viewport.screenHeight ?? viewport.height),
+  };
+  await cdp.send("Emulation.setDeviceMetricsOverride", params, sessionId, timeout, options.signal);
+  await cdp.send("Emulation.setTouchEmulationEnabled", {
+    enabled: params.mobile,
+    maxTouchPoints: params.mobile ? 5 : 1,
+  }, sessionId, timeout, options.signal).catch((error) => {
+    if (error?.name === "AbortError") throw error;
+  });
+  const actual = await evalStr(cdp, sessionId, "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,mobile:navigator.userAgentData?.mobile??null})", timeout, options.signal);
+  return `Applied ${options.devicePreset ? `${options.devicePreset} preset` : "viewport override"}\n${actual}`;
+}
+
+async function getOrAttachSession(cdp: CDP, targetId: string, timeoutMs = 15_000, signal?: AbortSignal) {
+  const sessionId = await sessionPool.get(cdp, targetId, signal);
+  await diagnosticsStore.ensure(cdp, sessionId, targetId, timeoutMs, signal);
+  return sessionId;
+}
+
+async function withTarget<T>(targetQuery: string | undefined, signal: AbortSignal | undefined, fn: (cdp: CDP, sessionId: string, page: any) => Promise<T>) {
+  throwIfAborted(signal);
+  const cdp = await getSharedCdp(signal);
+  const pages = await getPages(cdp, signal);
+  const page = resolveTarget(pages, targetQuery);
+  const sessionId = await getOrAttachSession(cdp, page.targetId, 15_000, signal);
 
   try {
     return await fn(cdp, sessionId, page);
   } catch (e: any) {
     // If Chrome invalidated a cached session, forget it so the next call re-attaches.
     if (String(e?.message || "").toLowerCase().includes("session")) {
-      sessionCache.delete(page.targetId);
+      sessionPool.invalidateTarget(page.targetId);
+      diagnosticsStore.disposeSession(sessionId);
     }
     throw e;
   }
 }
 
+// Named only for deterministic mock-CDP tests. The Pi extension surface remains
+// the default export below.
+export const __testing = {
+  clickStr, typeStr, pressStr, waitStr, navStr, reloadStr, rawStr,
+};
+
 export default function chromeCdpExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
-    sharedCdp?.close();
-    sharedCdp = undefined;
-    sharedCdpPromise = undefined;
-    sessionCache.clear();
+    invalidateSharedConnection(true);
   });
 
   pi.registerTool({
     name: "chrome_cdp",
     label: "Chrome CDP",
-    description: "Inspect and control your already-open local Chrome via Chrome DevTools Protocol. Use it to list/open tabs, inspect DOM, evaluate JS or JS files, wait for page state, inspect network resources, download URLs, reload, navigate, click, type, and take screenshots.",
+    description: "Inspect and control tabs in already-open local Chrome via Chrome DevTools Protocol. Supports accessible locators, trusted clicks and keyboard input, compact style inspection, diagnostics, screenshots, viewport emulation, arbitrary JavaScript, and raw CDP commands.",
     promptSnippet: "Inspect and control the user's live Chrome tabs via Chrome DevTools Protocol (CDP)",
     promptGuidelines: [
       "Use chrome_cdp when the user wants to inspect or control their already-open Chrome instance.",
       "Use chrome_cdp action=list before other chrome_cdp actions when you need a tab id.",
       "Use chrome_cdp action=net to inspect resource URLs loaded by the current page.",
+      "Prefer chrome_cdp role/name/text/CSS locators over custom eval scripts for click, type, press, wait, html, inspect, and element screenshots.",
+      "Use chrome_cdp action=inspect for compact bounds, computed styles, matched CSS rules, fonts, variables, and pseudo-elements before writing bespoke style-extraction scripts.",
+      "Use chrome_cdp action=diagnostics after exercising a page to check captured exceptions, console errors, browser logs, and failed requests.",
       "Use outputPath for large html/eval/net/snap/raw results when you want a stable file path instead of a temp dump.",
-      "Use expressionPath for reusable JavaScript files and waitForSelector/settleMs after nav when pages lazy-load content.",
+      "Use expressionPath for reusable JavaScript files and waitForSelector/settleMs after actions when pages update asynchronously.",
       "chrome_cdp dumps large outputs (>2KB) to temp files to protect context. When you see [Dumped … to C:\\...], use read with offset/limit to inspect the file instead of re-running chrome_cdp.",
     ],
     parameters: chromeCdpParams,
-    async execute(_toolCallId, params: ChromeCdpParams) {
+    async execute(_toolCallId, params: ChromeCdpParams, signal, _onUpdate, _ctx) {
+      throwIfAborted(signal);
       if (params.action === "list") {
         const started = Date.now();
-        const cdp = await getSharedCdp();
-        const pages = await getPages(cdp);
+        const cdp = await getSharedCdp(signal);
+        const pages = await getPages(cdp, signal);
         return {
           content: [{ type: "text", text: formatPages(pages) || "No pages found." }],
           details: { action: "list", count: pages.length, elapsedMs: Date.now() - started },
@@ -653,15 +1027,22 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       const started = Date.now();
 
       if (params.action === "open") {
-        const text = await openStr(params.url);
+        const opened = await openStr(params.url, {
+          waitFor: params.waitFor,
+          waitForSelector: params.waitForSelector,
+          waitExpression: params.waitExpression,
+          timeoutMs: params.timeoutMs,
+          settleMs: params.settleMs,
+          signal,
+        });
         return {
-          content: [{ type: "text", text }],
-          details: { action: "open", elapsedMs: Date.now() - started, url: params.url || "about:blank" },
+          content: [{ type: "text", text: opened.text }],
+          details: { action: "open", target: String(opened.targetId).slice(0, 8), elapsedMs: Date.now() - started, url: params.url || "about:blank" },
         };
       }
 
       if (params.action === "download" && !params.useBrowserCookies) {
-        const text = await downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, timeoutMs: params.timeoutMs });
+        const text = await downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, timeoutMs: params.timeoutMs, signal });
         return {
           content: [{ type: "text", text }],
           details: { action: "download", elapsedMs: Date.now() - started, url: params.url, outputPath: params.outputPath },
@@ -670,34 +1051,107 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
 
       let pageMeta: { url: string; title: string } = { url: "", title: "" };
 
-      const text = await withTarget(params.target, async (cdp, sessionId, page) => {
+      const text = await withTarget(params.target, signal, async (cdp, sessionId, page) => {
         pageMeta = { url: (page as any).url as string ?? "", title: (page as any).title as string ?? "" };
+        const locator = elementLocator(params);
+        const postOptions: PostActionOptions = {
+          waitFor: params.waitFor,
+          waitForSelector: params.waitForSelector,
+          waitExpression: params.waitExpression,
+          timeoutMs: params.timeoutMs,
+          settleMs: params.settleMs,
+          signal,
+        };
         switch (params.action) {
-          case "snap": return snapshotStr(cdp, sessionId, params.outputPath, params.timeoutMs);
-          case "html": return htmlStr(cdp, sessionId, params.selector, params.outputPath, params.timeoutMs);
+          case "snap": return snapshotStr(cdp, sessionId, params.outputPath, params.timeoutMs, signal);
+          case "html": return htmlStr(cdp, sessionId, locator, params.outputPath, params.timeoutMs, signal);
+          case "inspect": {
+            if (!hasLocator(locator)) throw new Error("inspect requires selector, role, name, or text");
+            const inspected = await inspectLocator(cdp, sessionId, locator, {
+              styleProperties: params.styleProperties,
+              includeAllStyles: params.includeAllStyles,
+              includeCssVariables: params.includeCssVariables,
+              includeMatchedRules: params.includeMatchedRules,
+              includeInherited: params.includeInherited,
+            }, normalizeTimeout(params.timeoutMs), signal);
+            const result = JSON.stringify(inspected, null, 2);
+            return params.outputPath ? saveTextResult(params.outputPath, result) : result;
+          }
+          case "diagnostics": {
+            const result = formatDiagnostics(diagnosticsStore.read(page.targetId, {
+              includeConsoleLogs: params.includeConsoleLogs,
+              sinceMs: params.diagnosticsSinceMs,
+              levels: params.diagnosticLevels,
+              clear: params.clearDiagnostics,
+            }));
+            return params.outputPath ? saveTextResult(params.outputPath, result) : result;
+          }
           case "eval": {
-            const result = await evalStr(cdp, sessionId, evalExpressionFromParams(params), params.timeoutMs);
+            const result = await evalStr(cdp, sessionId, evalExpressionFromParams(params), params.timeoutMs, signal);
+            await postActionWait(cdp, sessionId, postOptions);
             return params.outputPath ? saveTextResult(params.outputPath, result) : result;
           }
           case "script": {
             if (!params.expressionPath) throw new Error("expressionPath is required for script");
-            const result = await evalStr(cdp, sessionId, readExpressionFile(params.expressionPath), params.timeoutMs);
+            const result = await evalStr(cdp, sessionId, readExpressionFile(params.expressionPath), params.timeoutMs, signal);
+            await postActionWait(cdp, sessionId, postOptions);
             return params.outputPath ? saveTextResult(params.outputPath, result) : result;
           }
-          case "wait": return waitStr(cdp, sessionId, { selector: params.waitForSelector || params.selector, expression: params.waitExpression || params.expression, timeoutMs: params.timeoutMs, settleMs: params.settleMs });
-          case "net": return netStr(cdp, sessionId, params.outputPath, params.timeoutMs);
-          case "nav": return navStr(cdp, sessionId, { url: params.url, timeoutMs: params.timeoutMs, waitForSelector: params.waitForSelector, waitExpression: params.waitExpression, settleMs: params.settleMs });
-          case "reload": return reloadStr(cdp, sessionId, params.timeoutMs);
-          case "download": {
-            const { cookies } = await cdp.send("Network.getCookies", { urls: params.url ? [params.url] : [] }, sessionId, normalizeTimeout(params.timeoutMs));
-            const cookieHeader = Array.isArray(cookies) ? cookies.map((c: any) => `${c.name}=${c.value}`).join("; ") : undefined;
-            return downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, cookies: cookieHeader, timeoutMs: params.timeoutMs });
+          case "wait": return waitStr(cdp, sessionId, {
+            locator: hasLocator(locator) ? locator : hasLocator(params.waitFor) ? params.waitFor : params.waitForSelector ? { selector: params.waitForSelector } : undefined,
+            expression: params.waitExpression || params.expression,
+            timeoutMs: params.timeoutMs,
+            settleMs: params.settleMs,
+            signal,
+          });
+          case "net": return netStr(cdp, sessionId, params.outputPath, params.timeoutMs, signal);
+          case "nav": {
+            if (!params.url) throw new Error("url is required for nav");
+            return navStr(cdp, sessionId, { ...postOptions, url: params.url });
           }
-          case "raw": return rawStr(cdp, sessionId, params.method, params.cdpParams, params.outputPath, params.timeoutMs);
-          case "click": return clickStr(cdp, sessionId, params.selector);
-          case "clickxy": return clickXyStr(cdp, sessionId, params.x, params.y);
-          case "type": return typeStr(cdp, sessionId, params.text);
-          case "shot": return shotStr(cdp, sessionId, page.targetId, params.outputPath, params.timeoutMs);
+          case "reload": return reloadStr(cdp, sessionId, postOptions);
+          case "download": {
+            if (!params.url) throw new Error("url is required for download");
+            const { cookies } = await cdp.send("Network.getCookies", { urls: params.url ? [params.url] : [] }, sessionId, normalizeTimeout(params.timeoutMs), signal);
+            const cookieHeader = Array.isArray(cookies) ? cookies.map((c: any) => `${c.name}=${c.value}`).join("; ") : undefined;
+            return downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, cookies: cookieHeader, timeoutMs: params.timeoutMs, signal });
+          }
+          case "raw": return rawStr(cdp, sessionId, params.method, params.cdpParams, params.outputPath, params.timeoutMs, signal);
+          case "click": {
+            const clicked = await clickStr(cdp, sessionId, locator, {
+              button: params.button, clickCount: params.clickCount, modifiers: params.modifiers,
+              offsetX: params.offsetX, offsetY: params.offsetY, timeoutMs: params.timeoutMs, signal,
+            });
+            const waited = await postActionWait(cdp, sessionId, postOptions);
+            return withWaitSuffix(clicked, waited);
+          }
+          case "clickxy": {
+            const clicked = await clickXyStr(cdp, sessionId, params.x, params.y, {
+              button: params.button, clickCount: params.clickCount, modifiers: params.modifiers,
+              timeoutMs: params.timeoutMs, signal,
+            });
+            const waited = await postActionWait(cdp, sessionId, postOptions);
+            return withWaitSuffix(clicked, waited);
+          }
+          case "type": {
+            const typed = await typeStr(cdp, sessionId, locator, { text: params.text, clearFirst: params.clearFirst, timeoutMs: params.timeoutMs, signal });
+            const waited = await postActionWait(cdp, sessionId, postOptions);
+            return withWaitSuffix(typed, waited);
+          }
+          case "press": {
+            const pressed = await pressStr(cdp, sessionId, locator, { key: params.key, modifiers: params.modifiers, timeoutMs: params.timeoutMs, signal });
+            const waited = await postActionWait(cdp, sessionId, postOptions);
+            return withWaitSuffix(pressed, waited);
+          }
+          case "shot": return shotStr(cdp, sessionId, page.targetId, locator, {
+            outputPath: params.outputPath, timeoutMs: params.timeoutMs, fullPage: params.fullPage,
+            clip: params.clip, imageFormat: params.imageFormat, quality: params.quality,
+            captureBeyondViewport: params.captureBeyondViewport, signal,
+          });
+          case "viewport": return viewportStr(cdp, sessionId, {
+            viewport: params.viewport, devicePreset: params.devicePreset, clearViewport: params.clearViewport,
+            timeoutMs: params.timeoutMs, signal,
+          });
           default: throw new Error(`Unsupported action: ${params.action}`);
         }
       });
@@ -722,6 +1176,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
           outputBytes: rawText.length,
           outputPath: params.outputPath,
           selector: params.selector,
+          locator: hasLocator(elementLocator(params)) ? describeLocator(elementLocator(params)) : undefined,
           dumped: rawText.length > MAX_INLINE_BYTES || rawText.includes("[Dumped ") || rawText.includes("[Saved "),
         },
       };
@@ -753,6 +1208,10 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       }
       if (args.selector) {
         parts.push(theme.fg("dim", args.selector.length > 30 ? args.selector.slice(0, 30) + "…" : args.selector));
+      }
+      if (!args.selector && (args.locator || args.role || args.name || args.locatorText || (args.action !== "type" && args.text))) {
+        const locator = describeLocator(elementLocator(args));
+        parts.push(theme.fg("dim", locator.length > 50 ? locator.slice(0, 50) + "…" : locator));
       }
       if (args.waitForSelector) {
         parts.push(theme.fg("dim", args.waitForSelector.length > 30 ? args.waitForSelector.slice(0, 30) + "…" : args.waitForSelector));
@@ -803,7 +1262,9 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
             0, 0
           );
         }
-        case "net": {
+        case "net":
+        case "inspect":
+        case "diagnostics": {
           const raw = String(result.content?.[0]?.text ?? "");
           const firstLine = raw.split("\n")[0] || "";
           const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
@@ -823,7 +1284,9 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
           return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
         }
         case "click":
-        case "clickxy": {
+        case "clickxy":
+        case "press":
+        case "viewport": {
           return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
         }
         case "type": {
