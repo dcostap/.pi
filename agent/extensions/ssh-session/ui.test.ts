@@ -7,14 +7,24 @@ const theme = {
 } as any;
 
 describe("SSH tool chat rendering", () => {
-	test("summarizes commands when collapsed and shows them when expanded", () => {
+	test("shows ordinary multiline commands without requiring expansion", () => {
 		const command = "echo one\necho two\necho three";
 		const collapsed = renderSshCall({ action: "exec", command, cwd: "/tmp" }, theme, false);
-		const expanded = renderSshCall({ action: "exec", command, cwd: "/tmp" }, theme, true);
 
-		expect(collapsed.render(200).join("\n")).toContain("# … 2 more lines");
-		expect(collapsed.render(200).join("\n")).not.toContain("echo three");
-		expect(expanded.render(200).join("\n")).toContain("echo three");
+		expect(collapsed.render(200).join("\n")).toContain("echo three");
+		expect(collapsed.render(200).join("\n")).not.toContain("more lines");
+	});
+
+	test("summarizes only unusually long commands and shows them when expanded", () => {
+		const command = Array.from({ length: 15 }, (_, index) => `echo ${index + 1}`).join("\n");
+		const collapsed = renderSshCall({ action: "exec", command }, theme, false);
+		const expanded = renderSshCall({ action: "exec", command }, theme, true);
+		const collapsedText = collapsed.render(200).join("\n");
+
+		expect(collapsedText).toContain("echo 12");
+		expect(collapsedText).toContain("# … 3 more lines");
+		expect(collapsedText).not.toContain("echo 13");
+		expect(expanded.render(200).join("\n")).toContain("echo 15");
 	});
 
 	test("uses Ctrl+O expansion for long tool results while preserving the dump path", () => {

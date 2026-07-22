@@ -73,9 +73,13 @@ export function renderSshResult(
 
 function collapseCommand(command: string): string {
 	const lines = command.split("\n");
-	const first = lines[0] ?? "";
-	const clipped = first.length > 240 ? `${first.slice(0, 240)}…` : first;
-	return lines.length > 1 ? `${clipped}\n# … ${lines.length - 1} more line${lines.length === 2 ? "" : "s"}` : clipped;
+	const limit = 12;
+	const shown = lines.slice(0, limit).map((line) => line.length > 240 ? `${line.slice(0, 240)}…` : line);
+	if (lines.length <= limit) return shown.join("\n");
+
+	const hidden = lines.length - limit;
+	shown.push(`# … ${hidden} more line${hidden === 1 ? "" : "s"}`);
+	return shown.join("\n");
 }
 
 function collapseLines(lines: string[], isPartial: boolean): string[] {
