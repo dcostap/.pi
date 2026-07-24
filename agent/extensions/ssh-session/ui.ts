@@ -7,6 +7,10 @@ interface SshToolArgs {
 	action?: unknown;
 	command?: unknown;
 	cwd?: unknown;
+	local_path?: unknown;
+	remote_path?: unknown;
+	overwrite?: unknown;
+	mode?: unknown;
 	title?: unknown;
 	job_ids?: unknown;
 	timeout_seconds?: unknown;
@@ -35,7 +39,14 @@ export function renderSshCall(
 	if (typeof args.cwd === "string" && args.cwd) qualifiers.push(`in ${cleanInline(args.cwd)}`);
 	if (Array.isArray(args.job_ids) && args.job_ids.length > 0) qualifiers.push(args.job_ids.map(String).join(", "));
 	if (typeof args.timeout_seconds === "number") qualifiers.push(`timeout ${args.timeout_seconds}s`);
+	if (args.overwrite === true) qualifiers.push("overwrite");
+	if (typeof args.mode === "number") qualifiers.push(`mode 0${args.mode.toString(8)}`);
 	const suffix = qualifiers.length > 0 ? theme.fg("muted", ` (${qualifiers.join(" • ")})`) : "";
+	const transferPaths = formatTransferPaths(args);
+	if (transferPaths) {
+		component.setText(`${title}${suffix}\n${theme.fg("toolOutput", transferPaths)}`);
+		return component;
+	}
 
 	if (typeof args.command !== "string" || !args.command) {
 		component.setText(`${title}${suffix}`);
@@ -102,6 +113,8 @@ function styleLine(line: string, isPartial: boolean, isError: boolean, theme: Th
 	if (/^Full output/u.test(line)) return theme.fg("dim", line);
 	if (/^Exit code: 0/u.test(line)) return theme.fg("success", line);
 	if (/^Exit code:/u.test(line)) return theme.fg("error", line);
+	if (/^(?:Uploaded|Downloaded) /u.test(line)) return theme.fg("success", line);
+	if (/^(?:Local:|Remote:|SHA-256:|Remote mode:)/u.test(line)) return theme.fg("muted", line);
 	if (/^(?:Started bg-|Closed SSH session|Target:|CWD:|Root access:|Jobs:)/u.test(line)) {
 		return theme.fg("muted", line);
 	}
@@ -110,4 +123,12 @@ function styleLine(line: string, isPartial: boolean, isError: boolean, theme: Th
 
 function cleanInline(value: string): string {
 	return sanitizeTerminalText(value).replace(/[\r\n]+/gu, " ").replace(/\s+/gu, " ").trim();
+}
+
+function formatTransferPaths(args: SshToolArgs): string | undefined {
+	if (typeof args.local_path !== "string" || typeof args.remote_path !== "string") return undefined;
+	const local = cleanInline(args.local_path);
+	const remote = cleanInline(args.remote_path);
+	if (!local || !remote) return undefined;
+	return args.action === "download" ? `${remote} → ${local}` : `${local} → ${remote}`;
 }

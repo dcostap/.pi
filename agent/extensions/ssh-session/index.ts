@@ -19,6 +19,13 @@ import {
 	formatTailPreview,
 	type CapturedOutput,
 } from "./output-capture.ts";
+import {
+	downloadFile,
+	resolveLocalTransferPath,
+	resolveRemoteTransferPath,
+	type TransferResult,
+	uploadFile,
+} from "./file-transfer.ts";
 import { buildRemoteCommand, parseSshConfig, type ResolvedSshTarget } from "./protocol.ts";
 import { RootShell } from "./root-shell.ts";
 import { renderSshCall, renderSshResult } from "./ui.ts";
@@ -27,11 +34,15 @@ const SSH_PATH = "ssh";
 
 const ToolParameters = Type.Object({
 	action: StringEnum(
-		["exec", "sudo_exec", "bg_start", "bg_status", "bg_wait", "bg_kill", "list", "close"] as const,
+		["exec", "sudo_exec", "upload", "download", "bg_start", "bg_status", "bg_wait", "bg_kill", "list", "close"] as const,
 		{ description: "SSH session operation" },
 	),
 	command: Type.Optional(Type.String({ description: "Non-interactive remote shell command for exec, sudo_exec, or bg_start" })),
 	cwd: Type.Optional(Type.String({ description: "Absolute remote working directory; defaults to the connected session directory" })),
+	local_path: Type.Optional(Type.String({ description: "Local file path for upload or download; relative paths use Pi's current working directory" })),
+	remote_path: Type.Optional(Type.String({ description: "Remote file path for upload or download; relative paths use cwd" })),
+	overwrite: Type.Optional(Type.Boolean({ description: "Allow an existing destination file to be atomically replaced; defaults to false" })),
+	mode: Type.Optional(Type.Integer({ minimum: 0, maximum: 0o777, description: "Optional remote permission mode for upload, as an integer (for example 493 for 0755)" })),
 	title: Type.Optional(Type.String({ description: "Short title for bg_start" })),
 	job_ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32 })),
 	timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400 })),
@@ -202,7 +213,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 		name: "ssh_session",
 		label: "SSH session",
 		description:
-			"Operate on an existing user-authorized persistent SSH session. This tool cannot establish connections; the user must invoke /ssh-connect. Actions: exec and sudo_exec run foreground commands; bg_start, bg_status, bg_wait, and bg_kill manage non-privileged background jobs; list reports state; close disconnects. sudo_exec is available only when the user granted unrestricted root access for the session. Command output is limited to 2000 lines or 50KB; complete output is saved to a local temp file when truncated.",
+			"Operate on an existing user-authorized persistent SSH session. This tool cannot establish connections; the user must invoke /ssh-connect. Actions: exec and sudo_exec run foreground commands; upload and download atomically transfer individual regular files over the authenticated SFTP channel; bg_start, bg_status, bg_wait, and bg_kill manage non-privileged background jobs; list reports state; close disconnects. sudo_exec is available only when the user granted unrestricted root access for the session. Command output is limited to 2000 lines or 50KB; complete output is saved to a local temp file when truncated.",
 		parameters: ToolParameters,
 		renderCall(args, theme, context) {
 			return renderSshCall(args, theme, context.expanded, context.lastComponent as Text | undefined);
@@ -255,6 +266,37 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 					} catch (error) {
 						throw enrichCaptureError(error, capture.finish());
 					}
+				}
+				case "upload": {
+					const localPath = resolveLocalTransferPath(requirePath(params.local_path, "local_path"), ctx.cwd);
+					const remotePath = resolveRemoteTransferPath(requirePath(params.remote_path, "remote_path"), cwd);
+					const result = await uploadFile({
+						client: active.client,
+						localPath,
+						remotePath,
+						overwrite: params.overwrite ?? false,
+						mode: params.mode,
+						signal,
+						timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
+						onProgress: (text, transferredBytes, totalBytes) =>
+							onUpdate?.({ content: [{ type: "text", text }], details: { running: true, transferredBytes, totalBytes } }),
+					});
+					return transferResult("upload", result);
+				}
+				case "download": {
+					const localPath = resolveLocalTransferPath(requirePath(params.local_path, "local_path"), ctx.cwd);
+					const remotePath = resolveRemoteTransferPath(requirePath(params.remote_path, "remote_path"), cwd);
+					const result = await downloadFile({
+						client: active.client,
+						localPath,
+						remotePath,
+						overwrite: params.overwrite ?? false,
+						signal,
+						timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
+						onProgress: (text, transferredBytes, totalBytes) =>
+							onUpdate?.({ content: [{ type: "text", text }], details: { running: true, transferredBytes, totalBytes } }),
+					});
+					return transferResult("download", result);
 				}
 				case "bg_start": {
 					if (signal?.aborted) throw new Error("Background start aborted before launch");
@@ -685,6 +727,11 @@ function requireCommand(command: string | undefined): string {
 	return value;
 }
 
+function requirePath(path: string | undefined, name: "local_path" | "remote_path"): string {
+	if (path === undefined) throw new Error(`This action requires ${name}`);
+	return path;
+}
+
 function requireJobIds(ids: string[] | undefined): string[] {
 	if (!ids?.length) throw new Error("This action requires job_ids");
 	return ids;
@@ -710,6 +757,34 @@ function commandResult(action: "exec" | "sudo_exec", exitCode: number, output: C
 			fullOutputPath: output.fullOutputPath,
 		},
 	};
+}
+
+function transferResult(action: "upload" | "download", result: TransferResult) {
+	const verb = action === "upload" ? "Uploaded" : "Downloaded";
+	return {
+		content: [{
+			type: "text" as const,
+			text: [
+				`${verb} ${formatTransferBytes(result.bytes)} in ${formatTransferDuration(result.elapsedMs)}`,
+				`Local: ${result.localPath}`,
+				`Remote: ${result.remotePath}`,
+				`SHA-256: ${result.sha256}`,
+				`Remote mode: ${result.remoteMode.toString(8).padStart(4, "0")}`,
+			].join("\n"),
+		}],
+		details: { action, ...result },
+	};
+}
+
+function formatTransferBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+}
+
+function formatTransferDuration(milliseconds: number): string {
+	return milliseconds < 1000 ? `${milliseconds}ms` : `${(milliseconds / 1000).toFixed(1)}s`;
 }
 
 function textResult(text: string, details: Record<string, unknown> = {}) {

@@ -17,6 +17,9 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 	keyHint(_keybinding: string, description: string) {
 		return `ctrl+o ${description}`;
 	},
+	withFileMutationQueue(_path: string, operation: () => unknown) {
+		return operation();
+	},
 	truncateTail(content: string, options: { maxBytes?: number; maxLines?: number } = {}) {
 		const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 		const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;

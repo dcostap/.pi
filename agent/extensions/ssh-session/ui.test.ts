@@ -27,6 +27,25 @@ describe("SSH tool chat rendering", () => {
 		expect(expanded.render(200).join("\n")).toContain("echo 15");
 	});
 
+	test("shows upload and download paths without shell decoration", () => {
+		const upload = renderSshCall({
+			action: "upload",
+			local_path: "build/app.jar",
+			remote_path: "/srv/stage/app.jar",
+			overwrite: true,
+		}, theme, false).render(200).join("\n");
+		const download = renderSshCall({
+			action: "download",
+			local_path: "logs/server.log",
+			remote_path: "/var/log/server.log",
+		}, theme, false).render(200).join("\n");
+
+		expect(upload).toContain("build/app.jar → /srv/stage/app.jar");
+		expect(upload).toContain("overwrite");
+		expect(upload).not.toContain("$ ");
+		expect(download).toContain("/var/log/server.log → logs/server.log");
+	});
+
 	test("uses Ctrl+O expansion for long tool results while preserving the dump path", () => {
 		const lines = Array.from({ length: 40 }, (_, index) => `line ${index}`);
 		lines.push("[Output truncated: showing the latest output. Full output saved to: C:/temp/full.log]");
