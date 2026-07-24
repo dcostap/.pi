@@ -68,6 +68,7 @@ type EditorInternals = {
 	insertCharacter(char: string, skipUndoCoalescing?: boolean): void;
 	insertTextAtCursorInternal(text: string): void;
 	cancelAutocomplete(): void;
+	tryTriggerAutocomplete(explicitTab?: boolean): void;
 	handlePaste(pastedText: string): void;
 	undo(): void;
 	history: string[];
@@ -87,6 +88,7 @@ const KEY_DEBUG_LOG = join(tmpdir(), "pi-selection-editor-keys.log");
 const ENABLE_KEY_DEBUG_LOG = process.env.PI_SELECTION_EDITOR_KEY_DEBUG === "1";
 const KEY_DEBUG_PREVIEW_CHARS = 160;
 const PASTE_MARKER_REGEX = /\[paste #(\d+)( \+\d+ lines| \d+ chars)?\]/g;
+const PROMPT_PLACEHOLDER_REGEX = /\{\{[^{}\r\n]+\}\}/g;
 
 class SelectionEditor extends CustomEditor {
 	private selectionAnchor: Pos | null = null;
@@ -542,6 +544,96 @@ class SelectionEditor extends CustomEditor {
 		this.selectionAnchor = null;
 	}
 
+	private positionToOffset(pos: Pos): number {
+		let offset = 0;
+		for (let line = 0; line < pos.line; line++) {
+			offset += (this.state.lines[line] ?? "").length + 1;
+		}
+		return offset + pos.col;
+	}
+
+	private offsetToPosition(offset: number): Pos {
+		let remaining = Math.max(0, offset);
+		for (let line = 0; line < this.state.lines.length; line++) {
+			const length = (this.state.lines[line] ?? "").length;
+			if (remaining <= length) return { line, col: remaining };
+			remaining -= length + 1;
+		}
+
+		const line = Math.max(0, this.state.lines.length - 1);
+		return { line, col: (this.state.lines[line] ?? "").length };
+	}
+
+	private placeholderOffsets(text: string): Array<{ start: number; end: number }> {
+		return [...text.matchAll(PROMPT_PLACEHOLDER_REGEX)].map((match) => ({
+			start: match.index ?? 0,
+			end: (match.index ?? 0) + match[0].length,
+		}));
+	}
+
+	private selectOffsets(start: number, end: number): void {
+		this.selectionAnchor = this.offsetToPosition(start);
+		this.setCursor(this.offsetToPosition(end));
+		this.tui.requestRender();
+	}
+
+	private selectFirstPlaceholderFromInsertion(textBefore: string, textAfter: string): void {
+		if (textBefore === textAfter) return;
+
+		let changedStart = 0;
+		const sharedPrefixLimit = Math.min(textBefore.length, textAfter.length);
+		while (changedStart < sharedPrefixLimit && textBefore[changedStart] === textAfter[changedStart]) {
+			changedStart++;
+		}
+
+		let sharedSuffix = 0;
+		while (
+			sharedSuffix < textBefore.length - changedStart &&
+			sharedSuffix < textAfter.length - changedStart &&
+			textBefore[textBefore.length - 1 - sharedSuffix] === textAfter[textAfter.length - 1 - sharedSuffix]
+		) {
+			sharedSuffix++;
+		}
+
+		const changedEnd = textAfter.length - sharedSuffix;
+		const firstInsertedPlaceholder = this.placeholderOffsets(textAfter).find(
+			(placeholder) => placeholder.start >= changedStart && placeholder.end <= changedEnd,
+		);
+		if (!firstInsertedPlaceholder) return;
+
+		this.selectOffsets(firstInsertedPlaceholder.start, firstInsertedPlaceholder.end);
+	}
+
+	private selectNextPromptPlaceholder(): boolean {
+		const placeholders = this.placeholderOffsets(this.getCurrentRawText());
+		if (placeholders.length === 0) return false;
+
+		const selection = this.getSelectionRange();
+		const searchOffset = selection
+			? this.positionToOffset(selection.end)
+			: this.positionToOffset(this.currentPos());
+		const next = placeholders.find((placeholder) => placeholder.start >= searchOffset);
+
+		if (next) {
+			this.selectOffsets(next.start, next.end);
+			return true;
+		}
+
+		const first = placeholders[0];
+		if (first) {
+			this.selectOffsets(first.start, first.end);
+			return true;
+		}
+
+		return false;
+	}
+
+	private isInSlashAutocompleteContext(): boolean {
+		const cursor = this.currentPos();
+		const beforeCursor = (this.state.lines[cursor.line] ?? "").slice(0, cursor.col);
+		return /(?:^|[ \t])\/[a-zA-Z0-9._:-]*$/.test(beforeCursor);
+	}
+
 	private beginSelectionIfNeeded(): void {
 		if (!this.selectionAnchor) this.selectionAnchor = this.currentPos();
 	}
@@ -662,6 +754,72 @@ class SelectionEditor extends CustomEditor {
 		// is the legacy encoding for Alt+char. This is never useful text input
 		// for the prompt, and if it falls through it clears the selection.
 		return data === "\x1bñ" || data === "\x1bÑ";
+	}
+
+	private maybeTriggerInlineSlashAutocomplete(): void {
+		if (this.isShowingAutocomplete()) return;
+		const cursor = this.getCursor();
+		const beforeCursor = (this.getLines()[cursor.line] ?? "").slice(0, cursor.col);
+		const match = beforeCursor.match(/(?:^|[ \t])(\/[a-zA-Z0-9._:-]*)$/);
+		if (!match) return;
+
+		const prefix = match[1] ?? "";
+		const tokenStart = cursor.col - prefix.length;
+		if (cursor.line === 0 && beforeCursor.slice(0, tokenStart).trim() === "") return;
+		this.i.tryTriggerAutocomplete();
+	}
+
+	private handleAutocompleteSelectionAction(data: string): boolean {
+		if (!this.isShowingAutocomplete()) return false;
+
+		if (matchesKey(data, "ctrl+a")) {
+			this.i.cancelAutocomplete();
+			this.selectAll();
+			return true;
+		}
+		if (matchesKey(data, "ctrl+c") && this.hasSelection()) {
+			const selectedText = this.getSelectedText();
+			this.i.cancelAutocomplete();
+			this.clearSelection();
+			this.tui.requestRender();
+			if (selectedText != null) this.copyTextToClipboard(selectedText);
+			return true;
+		}
+		if (matchesKey(data, "ctrl+x")) {
+			this.i.cancelAutocomplete();
+			if (this.hasSelection()) {
+				const selectedText = this.getSelectedText();
+				this.deleteSelection(true);
+				if (selectedText != null) this.copyTextToClipboard(selectedText);
+			} else {
+				this.cutCurrentLine();
+			}
+			return true;
+		}
+
+		const select = (mover: () => void): true => {
+			this.i.cancelAutocomplete();
+			this.moveWithSelection(mover);
+			return true;
+		};
+		if (matchesKey(data, "shift+left")) return select(() => this.i.moveCursor(0, -1));
+		if (matchesKey(data, "shift+right")) return select(() => this.i.moveCursor(0, 1));
+		if (matchesKey(data, "shift+up")) return select(() => this.i.moveCursor(-1, 0));
+		if (matchesKey(data, "shift+down")) return select(() => this.i.moveCursor(1, 0));
+		if (matchesKey(data, "shift+home")) return select(() => this.i.moveToLineStart());
+		if (matchesKey(data, "shift+end")) return select(() => this.i.moveToLineEnd());
+		if (matchesKey(data, "shift+pageUp")) return select(() => this.i.pageScroll(-1));
+		if (matchesKey(data, "shift+pageDown")) return select(() => this.i.pageScroll(1));
+		if (matchesKey(data, "ctrl+shift+left") || matchesKey(data, "alt+shift+left")) {
+			return select(() => this.i.moveWordBackwards());
+		}
+		if (matchesKey(data, "ctrl+shift+right") || matchesKey(data, "alt+shift+right")) {
+			return select(() => this.i.moveWordForwards());
+		}
+		if (matchesKey(data, "ctrl+shift+home")) return select(() => this.moveToDocumentStart());
+		if (matchesKey(data, "ctrl+shift+end")) return select(() => this.moveToDocumentEnd());
+
+		return false;
 	}
 
 	private collapseSelection(to: "start" | "end"): boolean {
@@ -944,6 +1102,9 @@ class SelectionEditor extends CustomEditor {
 		// double-paste gesture, even if it later leaves the cursor where it was.
 		this.pendingInlinePaste = null;
 		if (this.shouldDropAhkLeakedAltEnye(data)) return;
+		if (this.handleAutocompleteSelectionAction(data)) return;
+		const isTab = matchesKey(data, "tab");
+		const acceptingAutocompleteWithTab = isTab && this.isShowingAutocomplete();
 
 		// 0) Undo/redo. Handle these before `super.handleInput()` so Ctrl+Z
 		// wins over pi's app.suspend binding on Unix-like terminals, and Ctrl+Y
@@ -951,6 +1112,15 @@ class SelectionEditor extends CustomEditor {
 		if (matchesKey(data, "ctrl+y") || matchesKey(data, "ctrl+shift+z")) {
 			this.redo();
 			return;
+		}
+
+		// Tab accepts an already-visible autocomplete menu. Otherwise it always
+		// navigates any prompt placeholders in the editor, or is consumed so Pi
+		// does not open native path completion. Slash contexts remain allowed to
+		// explicitly open their menu.
+		if (isTab && !acceptingAutocompleteWithTab) {
+			if (this.selectNextPromptPlaceholder()) return;
+			if (!this.isInSlashAutocompleteContext()) return;
 		}
 		if (matchesKey(data, "ctrl+z") || matchesKey(data, "ctrl+-")) {
 			this.undoWithRedo();
@@ -992,7 +1162,7 @@ class SelectionEditor extends CustomEditor {
 		}
 
 		// 2) Escape clears selection first.
-		if (matchesKey(data, "escape") && this.hasSelection()) {
+		if (matchesKey(data, "escape") && this.hasSelection() && !this.isShowingAutocomplete()) {
 			this.clearSelection();
 			this.tui.requestRender();
 			return;
@@ -1116,7 +1286,13 @@ class SelectionEditor extends CustomEditor {
 		const textBeforeInput = this.getText();
 		this.clearSelection();
 		super.handleInput(data);
-		if (this.getText() !== textBeforeInput) this.pruneUnusedPasteMarkers();
+		if (this.getText() !== textBeforeInput) {
+			this.pruneUnusedPasteMarkers();
+			if (acceptingAutocompleteWithTab) {
+				this.selectFirstPlaceholderFromInsertion(textBeforeInput, this.getText());
+			}
+			this.maybeTriggerInlineSlashAutocomplete();
+		}
 	}
 }
 
