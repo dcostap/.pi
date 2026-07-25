@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -45,12 +45,29 @@ describe("draft storage", () => {
 		expect(await readDraft(dir, "session-1")).toBeUndefined();
 	});
 
+	test("replaces a draft without leaving shared or transaction backups", async () => {
+		const dir = await temporaryDirectory();
+		await writeDraft(dir, record("first"));
+		await writeDraft(dir, record("second"));
+		expect((await readDraft(dir, "session-1"))?.text).toBe("second");
+		expect((await readdir(dir)).filter((name) => name.endsWith(".bak"))).toEqual([]);
+	});
+
 	test("falls back to the backup after a torn replacement window", async () => {
 		const dir = await temporaryDirectory();
 		const original = record("safe copy");
 		await mkdir(dir, { recursive: true });
 		await writeFile(`${draftPath(dir, original.sessionId)}.bak`, JSON.stringify(original), "utf8");
 		expect((await readDraft(dir, original.sessionId))?.text).toBe("safe copy");
+	});
+
+	test("falls back to a unique transaction backup", async () => {
+		const dir = await temporaryDirectory();
+		const original = record("transaction-safe copy");
+		await mkdir(dir, { recursive: true });
+		await writeFile(`${draftPath(dir, original.sessionId)}.1234.test-id.bak`, JSON.stringify(original), "utf8");
+		expect((await readDraft(dir, original.sessionId))?.text).toBe("transaction-safe copy");
+		expect((await listDrafts(dir)).map((draft) => draft.text)).toEqual(["transaction-safe copy"]);
 	});
 
 	test("ignores malformed records when listing", async () => {

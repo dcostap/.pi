@@ -14,7 +14,6 @@ import {
 const DRAFT_DIR = join(getAgentDir(), "drafts");
 const POLL_INTERVAL_MS = 250;
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
-const RECENT_OTHER_DRAFT_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface Runtime {
 	sessionId: string;
@@ -27,7 +26,6 @@ interface Runtime {
 	lastQueuedText: string;
 	paused: boolean;
 	active: boolean;
-	lastErrorNotificationAt: number;
 }
 
 function describeError(error: unknown): string {
@@ -91,22 +89,21 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await pruneDrafts(DRAFT_DIR, Date.now() - RETENTION_MS);
 			persisted = await readDraft(DRAFT_DIR, sessionId);
-		} catch (error) {
-			ctx.ui.notify(`Draft recovery could not read its storage: ${describeError(error)}`, "error");
+		} catch {
+			// Draft recovery is intentionally invisible. A storage problem must not
+			// interrupt the user's session or produce recurring notifications.
 		}
 
 		let initialText = ctx.ui.getEditorText();
 		if (persisted?.text && initialText.length === 0) {
 			ctx.ui.setEditorText(persisted.text);
 			initialText = persisted.text;
-			ctx.ui.notify(`Recovered unsent draft from ${ageLabel(persisted.updatedAt)}.`, "info");
 		} else if (persisted?.text && persisted.text !== initialText) {
 			// Preserve both texts rather than silently overwriting either one.
 			try {
 				await archiveDraft(DRAFT_DIR, persisted);
-				ctx.ui.notify("An older conflicting draft was archived; use /drafts to recover it.", "warning");
-			} catch (error) {
-				ctx.ui.notify(`Could not archive a conflicting draft: ${describeError(error)}`, "error");
+			} catch {
+				// Best effort only; never surface automatic housekeeping to the user.
 			}
 		}
 
@@ -120,7 +117,6 @@ export default function (pi: ExtensionAPI) {
 			lastQueuedText: persisted?.text ?? "",
 			paused: false,
 			active: true,
-			lastErrorNotificationAt: 0,
 		});
 
 		newRuntime.pump = new DraftWritePump(
@@ -129,13 +125,8 @@ export default function (pi: ExtensionAPI) {
 				else await deleteDraft(DRAFT_DIR, sessionId);
 			},
 			() => undefined,
-			(write, error) => {
+			(write) => {
 				if (write.generation === newRuntime.generation) newRuntime.lastQueuedText = "\u0000retry";
-				const now = Date.now();
-				if (newRuntime.active && now - newRuntime.lastErrorNotificationAt > 30_000) {
-					newRuntime.lastErrorNotificationAt = now;
-					ctx.ui.notify(`Could not save draft: ${describeError(error)}`, "error");
-				}
 			},
 		);
 		newRuntime.timer = setInterval(() => observeEditor(newRuntime), POLL_INTERVAL_MS);
@@ -146,19 +137,6 @@ export default function (pi: ExtensionAPI) {
 		// matches the draft we just restored.
 		queueText(newRuntime, initialText);
 
-		if (!persisted && initialText.length === 0) {
-			try {
-				const other = (await listDrafts(DRAFT_DIR)).find(
-					(record) =>
-						record.sessionId !== sessionId &&
-						record.cwd === ctx.cwd &&
-						Date.now() - record.updatedAt <= RECENT_OTHER_DRAFT_MS,
-				);
-				if (other) ctx.ui.notify("An unsent draft exists in another session; use /drafts to recover it.", "warning");
-			} catch {
-				// The primary read already reports storage errors; this hint is best effort.
-			}
-		}
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

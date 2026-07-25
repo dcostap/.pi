@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, stat, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export const DRAFT_VERSION = 1;
 
@@ -25,10 +25,37 @@ function errorCode(error: unknown): string | undefined {
 }
 
 async function unlinkIfPresent(path: string): Promise<void> {
-	try {
-		await unlink(path);
-	} catch (error) {
-		if (errorCode(error) !== "ENOENT") throw error;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await unlink(path);
+			return;
+		} catch (error) {
+			if (errorCode(error) === "ENOENT") return;
+			if (!isTransientWindowsFileError(error) || attempt >= 6) throw error;
+			await delay(10 * 2 ** attempt);
+		}
+	}
+}
+
+const TRANSIENT_WINDOWS_FILE_ERRORS = new Set(["EACCES", "EBUSY", "EPERM"]);
+
+function isTransientWindowsFileError(error: unknown): boolean {
+	return process.platform === "win32" && TRANSIENT_WINDOWS_FILE_ERRORS.has(errorCode(error) ?? "");
+}
+
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function renameWithRetry(oldPath: string, newPath: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await rename(oldPath, newPath);
+			return;
+		} catch (error) {
+			if (!isTransientWindowsFileError(error) || attempt >= 6) throw error;
+			await delay(10 * 2 ** attempt);
+		}
 	}
 }
 
@@ -72,22 +99,57 @@ async function parseDraft(path: string): Promise<DraftRecord | undefined> {
 	}
 }
 
+function transactionBackupPrefix(path: string): string {
+	return `${basename(path)}.`;
+}
+
+async function backupPaths(path: string): Promise<string[]> {
+	let names: string[];
+	try {
+		names = await readdir(dirname(path));
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return [];
+		throw error;
+	}
+
+	const fileName = basename(path);
+	const prefix = transactionBackupPrefix(path);
+	return names
+		.filter((name) => name === `${fileName}.bak` || (name.startsWith(prefix) && name.endsWith(".bak")))
+		.map((name) => join(dirname(path), name));
+}
+
+async function parseDraftWithBackups(path: string): Promise<DraftRecord | undefined> {
+	const primary = await parseDraft(path);
+	if (primary) return primary;
+
+	const backups = await backupPaths(path);
+	const records = await Promise.all(backups.map((backup) => parseDraft(backup)));
+	return records
+		.filter((record): record is DraftRecord => record !== undefined)
+		.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+}
+
 /** Read the current draft, falling back to the last atomic-write backup. */
 export async function readDraft(draftDir: string, sessionId: string): Promise<DraftRecord | undefined> {
 	const path = draftPath(draftDir, sessionId);
-	return (await parseDraft(path)) ?? (await parseDraft(`${path}.bak`));
+	return parseDraftWithBackups(path);
 }
 
 /**
  * Replace a file without exposing a partially-written JSON document. The old
- * file is retained as .bak across the rename window, which also makes the
- * Windows fallback safe if replacement rename semantics differ.
+ * file is retained as a unique backup across the rename window. Unique backup
+ * names avoid contention with stale/locked .bak files on Windows. Cleanup
+ * after a successful commit is best effort because failure to remove a backup
+ * must never turn a successful draft save into an error.
  */
 async function atomicWrite(path: string, contents: string): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
-	const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	const backupPath = `${path}.bak`;
+	const transactionId = `${process.pid}.${randomUUID()}`;
+	const temporaryPath = `${path}.${transactionId}.tmp`;
+	const backupPath = `${path}.${transactionId}.bak`;
 	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	let movedPreviousFile = false;
 
 	try {
 		handle = await open(temporaryPath, "wx", 0o600);
@@ -96,26 +158,28 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
 		await handle.close();
 		handle = undefined;
 
-		await unlinkIfPresent(backupPath);
 		try {
-			await rename(path, backupPath);
+			await renameWithRetry(path, backupPath);
+			movedPreviousFile = true;
 		} catch (error) {
 			if (errorCode(error) !== "ENOENT") throw error;
 		}
 
 		try {
-			await rename(temporaryPath, path);
+			await renameWithRetry(temporaryPath, path);
 		} catch (error) {
 			// Best effort rollback if the second rename fails.
-			try {
-				await rename(backupPath, path);
-			} catch {
-				// The .bak remains readable if rollback is not possible.
+			if (movedPreviousFile) {
+				try {
+					await renameWithRetry(backupPath, path);
+				} catch {
+					// The transaction backup remains readable if rollback is not possible.
+				}
 			}
 			throw error;
 		}
 
-		await unlinkIfPresent(backupPath);
+		if (movedPreviousFile) await unlinkIfPresent(backupPath).catch(() => undefined);
 	} finally {
 		if (handle) await handle.close().catch(() => undefined);
 		await unlinkIfPresent(temporaryPath).catch(() => undefined);
@@ -128,7 +192,7 @@ export async function writeDraft(draftDir: string, record: DraftRecord): Promise
 
 export async function deleteDraft(draftDir: string, sessionId: string): Promise<void> {
 	const path = draftPath(draftDir, sessionId);
-	await Promise.all([unlinkIfPresent(path), unlinkIfPresent(`${path}.bak`)]);
+	await Promise.all([unlinkIfPresent(path), ...(await backupPaths(path)).map((backup) => unlinkIfPresent(backup))]);
 }
 
 /** Keep a conflicting recovered draft before replacing the current slot. */
@@ -153,11 +217,13 @@ export async function listDrafts(draftDir: string): Promise<DraftRecord[]> {
 	for (const name of names) {
 		if (name.endsWith(".json")) candidates.add(join(draftDir, name));
 		else if (name.endsWith(".json.bak")) candidates.add(join(draftDir, name.slice(0, -4)));
+		else {
+			const marker = name.indexOf(".json.");
+			if (marker >= 0 && name.endsWith(".bak")) candidates.add(join(draftDir, name.slice(0, marker + 5)));
+		}
 	}
 
-	const records = await Promise.all(
-		[...candidates].map(async (path) => (await parseDraft(path)) ?? (await parseDraft(`${path}.bak`))),
-	);
+	const records = await Promise.all([...candidates].map((path) => parseDraftWithBackups(path)));
 	return records.filter((record): record is DraftRecord => record !== undefined && record.text.length > 0)
 		.sort((a, b) => b.updatedAt - a.updatedAt);
 }
@@ -189,13 +255,17 @@ export async function pruneDrafts(draftDir: string, olderThan: number): Promise<
 	for (const name of names) {
 		if (name.endsWith(".json")) candidates.add(join(draftDir, name));
 		else if (name.endsWith(".json.bak")) candidates.add(join(draftDir, name.slice(0, -4)));
+		else {
+			const marker = name.indexOf(".json.");
+			if (marker >= 0 && name.endsWith(".bak")) candidates.add(join(draftDir, name.slice(0, marker + 5)));
+		}
 	}
 
 	await Promise.all(
 		[...candidates].map(async (path) => {
-			const record = (await parseDraft(path)) ?? (await parseDraft(`${path}.bak`));
+			const record = await parseDraftWithBackups(path);
 			if (record && record.updatedAt < olderThan) {
-				await Promise.all([unlinkIfPresent(path), unlinkIfPresent(`${path}.bak`)]);
+				await Promise.all([unlinkIfPresent(path), ...(await backupPaths(path)).map((backup) => unlinkIfPresent(backup))]);
 			}
 		}),
 	);
