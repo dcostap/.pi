@@ -21,6 +21,7 @@ const MAX_SUBAGENT_ATTEMPTS = 1 + MAX_SUBAGENT_RETRIES;
 const SUBAGENT_INITIAL_RETRY_DELAY_MS = 1_000;
 const SUBAGENT_RETRY_DELAY_INCREMENT_MS = 2_000;
 const MAX_LAUNCH_MANIFEST_BYTES = 10 * 1024 * 1024;
+const MAX_SYSTEM_PROMPT_BYTES = 1024 * 1024;
 const MAX_REPORTED_VALIDATION_ERRORS = 50;
 const LIVE_STATUS_WIDTH = "◐ preparing".length;
 const LIVE_CACHE_WIDTH = "CH100.0%".length;
@@ -44,6 +45,8 @@ type ReviewerParams = CommonSubagentParams & {
 type ReviewLaunchParams = {
 	what_to_review: string;
 	context?: ContextMode;
+	system_prompt?: string;
+	system_prompt_file?: string;
 	reviewers: ReviewerParams[];
 };
 
@@ -58,6 +61,8 @@ type GenericSubagentParams = CommonSubagentParams & {
 type GenericLaunchParams = {
 	task: string;
 	context?: ContextMode;
+	system_prompt?: string;
+	system_prompt_file?: string;
 	subagents: GenericSubagentParams[];
 };
 
@@ -83,7 +88,9 @@ type ResolvedTask = CommonSubagentParams & {
 	index: number;
 	sessionName: string;
 	sandboxDir: string;
-	systemPromptPath: string;
+	systemPromptPath?: string;
+	systemPromptBytes?: Buffer;
+	systemPromptDisplay?: string;
 	userPrompt: string;
 	mainTask: string;
 	contextMode: ContextMode;
@@ -118,6 +125,7 @@ type RuntimeState = {
 	sandboxDir: string;
 	mainTask: string;
 	contextMode: ContextMode;
+	systemPromptDisplay?: string;
 	whatToReview?: string;
 	focus?: string;
 	assignment?: string;
@@ -200,6 +208,18 @@ function validateOptionalContext(value: Record<string, unknown>, location: strin
 	}
 }
 
+function validateSystemPromptInput(value: Record<string, unknown>, location: string, errors: string[]): void {
+	validateOptionalString(value, "system_prompt", location, errors);
+	validateOptionalString(value, "system_prompt_file", location, errors);
+	if (hasOwn(value, "system_prompt") && hasOwn(value, "system_prompt_file")) {
+		errors.push(`${location}: system_prompt and system_prompt_file are mutually exclusive`);
+	}
+	const hasSystemPrompt = hasOwn(value, "system_prompt") || hasOwn(value, "system_prompt_file");
+	if (hasSystemPrompt && value.context !== undefined && value.context !== "fresh") {
+		errors.push(`${location}: custom system prompts require context to be fresh`);
+	}
+}
+
 function validateCommonSubagentEntry(value: unknown, location: string, extraKey: "focus" | "assignment", errors: string[]): void {
 	if (!isRecord(value)) {
 		errors.push(`${location}: expected object`);
@@ -218,9 +238,10 @@ function validateReviewLaunchRequest(value: unknown, location: string): { params
 	const errors: string[] = [];
 	if (!isRecord(value)) return { errors: [`${location}: expected JSON object`] };
 
-	validateKnownKeys(value, ["what_to_review", "context", "reviewers"], location, errors);
+	validateKnownKeys(value, ["what_to_review", "context", "system_prompt", "system_prompt_file", "reviewers"], location, errors);
 	validateRequiredString(value, "what_to_review", location, errors);
 	validateOptionalContext(value, location, errors);
+	validateSystemPromptInput(value, location, errors);
 	if (!Array.isArray(value.reviewers) || value.reviewers.length === 0) {
 		errors.push(`${location}.reviewers: required non-empty array`);
 	} else {
@@ -234,9 +255,10 @@ function validateGenericLaunchRequest(value: unknown, location: string): { param
 	const errors: string[] = [];
 	if (!isRecord(value)) return { errors: [`${location}: expected JSON object`] };
 
-	validateKnownKeys(value, ["task", "context", "subagents"], location, errors);
+	validateKnownKeys(value, ["task", "context", "system_prompt", "system_prompt_file", "subagents"], location, errors);
 	validateRequiredString(value, "task", location, errors);
 	validateOptionalContext(value, location, errors);
+	validateSystemPromptInput(value, location, errors);
 	if (!Array.isArray(value.subagents) || value.subagents.length === 0) {
 		errors.push(`${location}.subagents: required non-empty array`);
 	} else {
@@ -306,6 +328,53 @@ async function readLaunchManifest(inputFile: unknown, cwd: string): Promise<{ va
 	};
 }
 
+async function resolveSystemPromptBytes(
+	params: { system_prompt?: string; system_prompt_file?: string },
+	cwd: string,
+): Promise<{ bytes?: Buffer; errors?: string[] }> {
+	if (params.system_prompt !== undefined) {
+		const bytes = Buffer.from(params.system_prompt, "utf8");
+		if (bytes.byteLength > MAX_SYSTEM_PROMPT_BYTES) {
+			return { errors: [`system_prompt is ${bytes.byteLength} bytes; maximum is ${MAX_SYSTEM_PROMPT_BYTES} bytes`] };
+		}
+		if (params.system_prompt.includes("\u0000")) return { errors: ["system_prompt must not contain NUL characters"] };
+		return { bytes };
+	}
+
+	if (params.system_prompt_file === undefined) return {};
+	const resolvedPath = path.resolve(cwd, params.system_prompt_file);
+	let fileStat: Awaited<ReturnType<typeof stat>>;
+	try {
+		fileStat = await stat(resolvedPath);
+	} catch (error) {
+		return { errors: [`system_prompt_file: cannot read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	if (!fileStat.isFile()) return { errors: [`system_prompt_file: expected a regular file: ${resolvedPath}`] };
+	if (fileStat.size > MAX_SYSTEM_PROMPT_BYTES) {
+		return { errors: [`system_prompt_file is ${fileStat.size} bytes; maximum is ${MAX_SYSTEM_PROMPT_BYTES} bytes`] };
+	}
+
+	let bytes: Buffer;
+	try {
+		bytes = await readFile(resolvedPath);
+	} catch (error) {
+		return { errors: [`system_prompt_file: failed to read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	if (bytes.byteLength > MAX_SYSTEM_PROMPT_BYTES) {
+		return { errors: [`system_prompt_file grew to ${bytes.byteLength} bytes while reading; maximum is ${MAX_SYSTEM_PROMPT_BYTES} bytes`] };
+	}
+
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch (error) {
+		return { errors: [`system_prompt_file: expected valid UTF-8: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	if (!text.trim()) return { errors: ["system_prompt_file is empty"] };
+	if (text.includes("\u0000")) return { errors: ["system_prompt_file must not contain NUL characters"] };
+	return { bytes };
+}
+
 async function resolveReviewLaunchInput(params: ReviewToolParams, cwd: string): Promise<ResolvedLaunchInput<ReviewLaunchParams>> {
 	if (!isRecord(params)) return { errors: ["tool input: expected object"] };
 	if (hasOwn(params, "input_file")) {
@@ -343,6 +412,27 @@ async function resolveGenericLaunchInput(params: GenericToolParams, cwd: string)
 function oneLine(value: string, max = 120): string {
 	const text = cleanText(value).replace(/\s+/g, " ");
 	return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+function describeSystemPrompt(
+	params: { system_prompt?: string; system_prompt_file?: string },
+	cwd: string,
+	bytes: Buffer | undefined,
+): string | undefined {
+	if (!bytes) return undefined;
+	if (params.system_prompt !== undefined) {
+		return `inline (${bytes.byteLength.toLocaleString("en-US")} bytes)`;
+	}
+	if (params.system_prompt_file !== undefined) {
+		return `file: ${path.resolve(cwd, params.system_prompt_file)} (${bytes.byteLength.toLocaleString("en-US")} bytes)`;
+	}
+	return undefined;
+}
+
+function systemPromptCallSuffix(args: any): string {
+	if (typeof args?.system_prompt === "string") return ` · system prompt: inline (${Buffer.byteLength(args.system_prompt, "utf8").toLocaleString("en-US")} bytes)`;
+	if (typeof args?.system_prompt_file === "string") return ` · system prompt: ${oneLine(args.system_prompt_file, 80)}`;
+	return "";
 }
 
 function sanitizeDescription(value: string): string {
@@ -694,10 +784,6 @@ function buildGenericSubagentInstructions(task: ResolvedTask, cwd: string): stri
 	].join("\n");
 }
 
-function buildSubagentInstructionsFile(task: ResolvedTask, cwd: string): string {
-	return task.kind === "review" ? buildReviewSubagentInstructions(task, cwd) : buildGenericSubagentInstructions(task, cwd);
-}
-
 function subagentRetryDelayMs(completedAttempt: number): number {
 	return SUBAGENT_INITIAL_RETRY_DELAY_MS + (completedAttempt - 1) * SUBAGENT_RETRY_DELAY_INCREMENT_MS;
 }
@@ -786,6 +872,8 @@ function buildMainSystemPromptAddition(): string {
 		"- Both launch tools default to fresh context. Unless the user explicitly requests a context mode, omit `context` so the fresh default is used.",
 		"- Set `context` to `transcript` only when explicitly requested. This pastes the completed main-session user/assistant transcript and summaries into each subagent prompt, ending before the current user request and in-progress assistant turn.",
 		"- Set `context` to `clone` only when explicitly requested. This starts each subagent from a native clone of the main session ending immediately before the current user request, then appends the subagent instructions and assignment.",
+		"- `system_prompt` and `system_prompt_file` add system-level instructions shared by every subagent in one launch. They are mutually exclusive and may be used only with fresh context, because changing the system prompt invalidates reusable provider prompt-cache prefixes.",
+		"- `system_prompt_file` is a local UTF-8 text file path, relative to the main cwd or absolute. Its contents, not its path, become the additional system instructions.",
 		"",
 		"Programmatic subagent manifests:",
 		"- Either launch tool may be called with `input_file` by itself instead of inline launch fields. The UTF-8 JSON file must contain the complete normal request object for that tool and is strictly validated before any subagent starts.",
@@ -867,6 +955,7 @@ function buildSubagentPromptHeader(states: RuntimeState[], includePerSubagentDet
 	const mainTask = states.find((state) => state.mainTask)?.mainTask;
 	const lines: string[] = [];
 	if (first) lines.push(`Context: ${first.contextMode}`);
+	if (first?.systemPromptDisplay) lines.push(`System prompt: ${first.systemPromptDisplay}`);
 	if (mainTask) {
 		lines.push("", first?.kind === "generic" ? "Generic task prompt sent to subagents:" : "Code review target prompt sent to subagents:", "<<<", mainTask, ">>>");
 	}
@@ -961,6 +1050,7 @@ class RpcClient {
 		if (sessionFile) args.push("--session", sessionFile);
 		if (this.task.modelRef) args.push("--model", this.task.modelRef);
 		if (this.task.thinking) args.push("--thinking", this.task.thinking);
+		if (this.task.systemPromptPath) args.push("--append-system-prompt", this.task.systemPromptPath);
 
 		const invocation = getPiInvocation(args);
 		this.child = spawn(invocation.command, invocation.args, {
@@ -1216,7 +1306,9 @@ async function finalizeTasks(
 		const unique = `${slugify(task.description)}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 		const sandboxDir = path.join(sandboxRoot, unique);
 		await mkdir(sandboxDir, { recursive: true });
-		const systemPromptPath = path.join(sandboxDir, systemPromptFileName);
+		const systemPromptPath = task.systemPromptBytes
+			? path.join(sandboxDir, systemPromptFileName)
+			: undefined;
 		const initialSessionFile = task.contextMode === "clone"
 			? createClonedSessionBeforeLatestUser(ctx)
 			: undefined;
@@ -1233,7 +1325,7 @@ async function finalizeTasks(
 			promptCacheKey: task.contextMode === "clone" ? ctx.sessionManager.getSessionId() : undefined,
 		};
 		finalTask.userPrompt = buildUserPrompt(finalTask, ctx.cwd);
-		await writeFile(systemPromptPath, buildSubagentInstructionsFile(finalTask, ctx.cwd), "utf8");
+		if (systemPromptPath && finalTask.systemPromptBytes) await writeFile(systemPromptPath, finalTask.systemPromptBytes);
 		withSandboxes.push(finalTask);
 	}
 	return withSandboxes;
@@ -1247,6 +1339,9 @@ async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionCont
 	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one code review subagent");
 	if (errors.length > 0) return { errors };
+	const customSystemPrompt = await resolveSystemPromptBytes(params, ctx.cwd);
+	if (customSystemPrompt.errors) return { errors: customSystemPrompt.errors };
+	const systemPromptDisplay = describeSystemPrompt(params, ctx.cwd, customSystemPrompt.bytes);
 	const conversationTranscript = contextMode === "transcript"
 		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
 		: undefined;
@@ -1267,6 +1362,8 @@ async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionCont
 			sessionName: `${REVIEW_SESSION_PREFIX} ${common.description}`,
 			mainTask: whatToReview,
 			contextMode,
+			systemPromptBytes: customSystemPrompt.bytes,
+			systemPromptDisplay,
 			conversationTranscript,
 			whatToReview,
 			focus: focus || undefined,
@@ -1285,6 +1382,9 @@ async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionCo
 	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
 	if (!Array.isArray(params.subagents) || params.subagents.length === 0) errors.push("subagents must contain at least one generic subagent");
 	if (errors.length > 0) return { errors };
+	const customSystemPrompt = await resolveSystemPromptBytes(params, ctx.cwd);
+	if (customSystemPrompt.errors) return { errors: customSystemPrompt.errors };
+	const systemPromptDisplay = describeSystemPrompt(params, ctx.cwd, customSystemPrompt.bytes);
 	const conversationTranscript = contextMode === "transcript"
 		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
 		: undefined;
@@ -1305,6 +1405,8 @@ async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionCo
 			sessionName: `${GENERIC_SESSION_PREFIX} ${common.description}`,
 			mainTask: task,
 			contextMode,
+			systemPromptBytes: customSystemPrompt.bytes,
+			systemPromptDisplay,
 			conversationTranscript,
 			assignment: assignment || undefined,
 		});
@@ -1558,6 +1660,7 @@ function buildFinalToolResult(results: ChildResult[], manifest?: LaunchManifestM
 				sandboxDir: result.state.sandboxDir,
 				mainTask: result.state.mainTask,
 				contextMode: result.state.contextMode,
+				systemPromptDisplay: result.state.systemPromptDisplay,
 				whatToReview: result.state.whatToReview,
 				focus: result.state.focus,
 				assignment: result.state.assignment,
@@ -1648,11 +1751,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: REVIEW_TOOL_NAME,
 		label: "Launch Code Review Subagents",
-		description: "Launch one or more same-cwd Pi code review subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. The extension injects the code review rubric and output format.",
+		description: "Launch one or more same-cwd Pi code review subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. A mutually exclusive system_prompt or system_prompt_file may add shared system-level instructions only with fresh context. The extension injects the code review rubric and output format.",
 		parameters: Type.Object({
-			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: what_to_review, optional context, and reviewers. Must be supplied by itself." })),
+			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: what_to_review, optional context/system prompt, and reviewers. Must be supplied by itself." })),
 			what_to_review: Type.Optional(Type.String({ description: "Required in inline mode. Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." })),
 			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
+			system_prompt: Type.Optional(Type.String({ description: "Optional additional system instructions shared by all reviewers. Mutually exclusive with system_prompt_file and allowed only with fresh context." })),
+			system_prompt_file: Type.Optional(Type.String({ description: "Optional local UTF-8 text file whose contents become additional system instructions shared by all reviewers. Relative paths resolve from cwd. Mutually exclusive with system_prompt and allowed only with fresh context." })),
 			reviewers: Type.Optional(Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
@@ -1687,6 +1792,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				modelRef: task.modelRef,
 				thinking: task.thinking,
 				contextMode: task.contextMode,
+				systemPromptDisplay: task.systemPromptDisplay,
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
@@ -1721,7 +1827,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const inputFile = typeof (args as any)?.input_file === "string" ? oneLine((args as any).input_file, 80) : "";
 			if (inputFile) return new Text(`${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `manifest ${inputFile}`)}`, 0, 0);
 			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
-			const label = `${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}`;
+			const label = `${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}${theme.fg("muted", systemPromptCallSuffix(args))}`;
 			return new Text(label, 0, 0);
 		},
 		renderResult(result, { isPartial }, theme) {
@@ -1742,11 +1848,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: GENERIC_TOOL_NAME,
 		label: "Launch Generic Subagents",
-		description: "Launch one or more same-cwd Pi generic subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. No task-specific output format is injected.",
+		description: "Launch one or more same-cwd Pi generic subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. A mutually exclusive system_prompt or system_prompt_file may add shared system-level instructions only with fresh context. No task-specific output format is injected.",
 		parameters: Type.Object({
-			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: task, optional context, and subagents. Must be supplied by itself." })),
+			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: task, optional context/system prompt, and subagents. Must be supplied by itself." })),
 			task: Type.Optional(Type.String({ description: "Required in inline mode. Complete generic task to give every subagent. Include all relevant context and desired output shape." })),
 			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
+			system_prompt: Type.Optional(Type.String({ description: "Optional additional system instructions shared by all subagents. Mutually exclusive with system_prompt_file and allowed only with fresh context." })),
+			system_prompt_file: Type.Optional(Type.String({ description: "Optional local UTF-8 text file whose contents become additional system instructions shared by all subagents. Relative paths resolve from cwd. Mutually exclusive with system_prompt and allowed only with fresh context." })),
 			subagents: Type.Optional(Type.Array(
 				Type.Object({
 					description: Type.String({ description: "Short session description used as `[Generic Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated subagents." }),
@@ -1781,6 +1889,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				modelRef: task.modelRef,
 				thinking: task.thinking,
 				contextMode: task.contextMode,
+				systemPromptDisplay: task.systemPromptDisplay,
 				status: "preparing",
 				lastActivity: "prepared",
 				finalAnswer: "",
@@ -1815,7 +1924,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const inputFile = typeof (args as any)?.input_file === "string" ? oneLine((args as any).input_file, 80) : "";
 			if (inputFile) return new Text(`${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `manifest ${inputFile}`)}`, 0, 0);
 			const count = Array.isArray((args as any)?.subagents) ? (args as any).subagents.length : 0;
-			const label = `${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `${count} subagent${count === 1 ? "" : "s"}`)}`;
+			const label = `${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `${count} subagent${count === 1 ? "" : "s"}`)}${theme.fg("muted", systemPromptCallSuffix(args))}`;
 			return new Text(label, 0, 0);
 		},
 		renderResult(result, { isPartial }, theme) {
