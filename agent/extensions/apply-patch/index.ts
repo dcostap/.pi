@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import { parsePatchActions } from "./patch/parser.ts";
 import type { ExecutePatchResult } from "./patch/types.ts";
 import { classifyActions, formatPartialProgress, type AppliedPatchChange } from "./tool/classification.ts";
+import { conciseApplyPatchFailureReason } from "./tool/error-display.ts";
 import {
   clearApplyPatchRenderState,
   markApplyPatchFailure,
@@ -156,7 +157,7 @@ function dedupeRepeatedError(message: string): string {
   return message;
 }
 
-function partialFailureText(details: PatchDetails, rawText: string, expanded: boolean, theme: any): string {
+function partialFailureText(details: PatchDetails, rawText: string, theme: any): string {
   const attempted = details.attemptedFiles?.length ?? 0;
   const applied = details.appliedFiles?.length ?? details.result.changedFiles.length;
   const countText = attempted > 0
@@ -164,18 +165,19 @@ function partialFailureText(details: PatchDetails, rawText: string, expanded: bo
     : `${details.result.changedFiles.length} ${details.result.changedFiles.length === 1 ? "file was" : "files were"} changed`;
   const failedFile = details.failedFiles?.[0];
   const error = dedupeRepeatedError(details.error?.trim() || rawText.replace(/^Patch partially applied:\s*/, "").trim());
-  const expectedLinesMissing = /Failed to find (?:expected lines|context)\b/i.test(error);
-  const reason = expectedLinesMissing
-    ? `Expected lines no longer matched${failedFile ? ` in ${failedFile}` : " the file"}.`
-    : error.split(/\r?\n/, 1)[0] || "One or more edits could not be applied.";
+  const reason = conciseApplyPatchFailureReason(error, failedFile);
   const lines = [
     `${theme.fg("warning", "⚠ Partially applied")}${theme.fg("muted", ` — ${countText}`)}`,
     theme.fg("dim", `  ${reason}`),
   ];
-  if (expanded && error) {
-    lines.push("", ...error.split(/\r?\n/).map((line) => theme.fg("dim", line)));
-  }
   return lines.join("\n");
+}
+
+function failureText(rawText: string, theme: any): string {
+  return [
+    theme.fg("error", "⚠ apply_patch failed"),
+    theme.fg("dim", `  ${conciseApplyPatchFailureReason(rawText)}`),
+  ].join("\n");
 }
 
 function textContent(result: { content?: Array<{ type: string; text?: string }> }): string {
@@ -279,7 +281,7 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
       // into wrapped diff lines and breaking the background fill.
       return renderCallComponent(component, args, theme, context, state.settledStatus);
     },
-    renderResult(result, options, theme, context) {
+    renderResult(result, _options, theme, context) {
       let details = result.details as PatchDetails | undefined;
       const state = context.state as ApplyPatchRendererState;
       if (
@@ -314,9 +316,10 @@ export default function applyPatchExtension(pi: ExtensionAPI) {
       const text = textContent(result);
       if (!text) return new Container();
       if (details?.status === "partial_failure") {
-        return new Text(partialFailureText(details, text, options.expanded, theme), 0, 0);
+        return new Text(partialFailureText(details, text, theme), 0, 0);
       }
-      return new Text(theme.fg(context.isError ? "error" : "warning", text), 0, 0);
+      if (context.isError) return new Text(failureText(text, theme), 0, 0);
+      return new Text(theme.fg("warning", conciseApplyPatchFailureReason(text)), 0, 0);
     },
   });
 
