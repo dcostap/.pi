@@ -89,6 +89,7 @@ type ResolvedTask = CommonSubagentParams & {
 	contextMode: ContextMode;
 	conversationTranscript?: string;
 	initialSessionFile?: string;
+	parentSessionFile?: string;
 	promptCacheKey?: string;
 	whatToReview?: string;
 	focus?: string;
@@ -1219,12 +1220,16 @@ async function finalizeTasks(
 		const initialSessionFile = task.contextMode === "clone"
 			? createClonedSessionBeforeLatestUser(ctx)
 			: undefined;
+		const parentSessionFile = ctx.sessionManager.isPersisted()
+			? ctx.sessionManager.getSessionFile()
+			: undefined;
 		const finalTask: ResolvedTask = {
 			...task,
 			sandboxDir,
 			systemPromptPath,
 			userPrompt: "",
 			initialSessionFile,
+			parentSessionFile,
 			promptCacheKey: task.contextMode === "clone" ? ctx.sessionManager.getSessionId() : undefined,
 		};
 		finalTask.userPrompt = buildUserPrompt(finalTask, ctx.cwd);
@@ -1346,6 +1351,13 @@ async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: Run
 
 		client.start(signal);
 		const exitPromise = client.waitForExit();
+		if (state.attempt === 1 && !task.initialSessionFile && task.parentSessionFile) {
+			const response = await client.send("new_session", { parentSession: task.parentSessionFile }, 30_000);
+			if (response?.data?.cancelled) throw new Error("subagent session creation was cancelled");
+			// --name applies to the startup session; new_session replaces it, so name the
+			// linked replacement explicitly.
+			await client.send("set_session_name", { name: task.sessionName }, 5_000);
+		}
 		const prompt = state.attempt > 1 && state.sessionFile ? buildSubagentRetryPrompt(task, state) : task.userPrompt;
 		await client.send("prompt", { message: prompt }, 30_000);
 		try {
