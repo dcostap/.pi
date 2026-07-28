@@ -54,14 +54,30 @@ async function copyToClipboard(text: string) {
   await runClipboardProcess("pbcopy", [], text);
 }
 
+export function parseMessageLimit(args: string): number | undefined | null {
+  const trimmed = args.trim();
+  if (!trimmed) return undefined;
+  if (!/^[1-9]\d*$/.test(trimmed)) return null;
+
+  const limit = Number(trimmed);
+  return Number.isSafeInteger(limit) ? limit : null;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("copy-all", {
     description:
-      "Copy all previous user/assistant messages and summaries in this thread to the clipboard",
-    handler: async (_args, ctx) => {
+      "Copy all previous user/assistant messages and summaries, or pass N to copy the last N messages",
+    handler: async (args, ctx) => {
+      const maxMessages = parseMessageLimit(args);
+      if (maxMessages === null) {
+        ctx.ui.notify("Usage: /copy-all [positive integer]", "warning");
+        return;
+      }
+
       const transcript = buildConversationTranscript(
         ctx.sessionManager.getBranch(),
         !ctx.isIdle(),
+        maxMessages,
       );
 
       if (!transcript.text) {

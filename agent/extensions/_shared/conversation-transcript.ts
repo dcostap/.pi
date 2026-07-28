@@ -30,10 +30,13 @@ function textFromContent(content: unknown): string {
  * Build the same plain-text conversation transcript used by /copy-all.
  * When excludeActiveTurn is true, the latest user message and everything
  * after it are omitted so an in-progress turn is never included.
+ * When maxMessages is provided, only the latest user/assistant messages are
+ * returned; summaries are retained only for the unlimited transcript.
  */
 export function buildConversationTranscript(
   entries: readonly any[],
   excludeActiveTurn: boolean,
+  maxMessages?: number,
 ): ConversationTranscript {
   let branchEntries = [...entries];
 
@@ -47,7 +50,7 @@ export function buildConversationTranscript(
     }
   }
 
-  const sections = branchEntries
+  let sections = branchEntries
     .map((entry) => {
       if (entry.type === "message") {
         const message = entry.message;
@@ -55,27 +58,34 @@ export function buildConversationTranscript(
 
         const content = textFromContent(message.content).trim();
         if (!content) return undefined;
-        return `${message.role.toUpperCase()}:\n${content}`;
+        return {
+          text: `${message.role.toUpperCase()}:\n${content}`,
+          isMessage: true,
+        };
       }
 
       if (entry.type === "compaction") {
         const summary = entry.summary?.trim();
         if (!summary) return undefined;
-        return `COMPACTION SUMMARY:\n${summary}`;
+        return { text: `COMPACTION SUMMARY:\n${summary}`, isMessage: false };
       }
 
       if (entry.type === "branch_summary") {
         const summary = entry.summary?.trim();
         if (!summary) return undefined;
-        return `BRANCH SUMMARY:\n${summary}`;
+        return { text: `BRANCH SUMMARY:\n${summary}`, isMessage: false };
       }
 
       return undefined;
     })
-    .filter((section): section is string => Boolean(section));
+    .filter((section): section is { text: string; isMessage: boolean } => Boolean(section));
+
+  if (maxMessages !== undefined && maxMessages > 0) {
+    sections = sections.filter((section) => section.isMessage).slice(-maxMessages);
+  }
 
   return {
-    text: sections.join("\n\n---\n\n"),
+    text: sections.map((section) => section.text).join("\n\n---\n\n"),
     sectionCount: sections.length,
   };
 }
