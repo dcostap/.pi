@@ -161,6 +161,7 @@ type ParsedGitHubUrl =
 	| { owner: string; repo: string; mode: "tree"; rest: string[] }
 	| { owner: string; repo: string; mode: "blob"; rest: string[] }
 	| { owner: string; repo: string; mode: "raw"; rest: string[] }
+	| { owner: string; repo: string; mode: "commit"; ref: string }
 	| { owner: string; repo: string; mode: "pull" | "issue"; number: number };
 
 export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
@@ -195,6 +196,9 @@ export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
 		// get incorrectly collapsed to the repository root.
 		if (!mode) return { owner, repo, mode: "root", rest: [] };
 		if (mode === "tree" || mode === "blob") return { owner, repo, mode, rest };
+		if (mode === "commit" && rest.length === 1 && /^[a-f\d]{7,64}$/i.test(rest[0])) {
+			return { owner, repo, mode: "commit", ref: rest[0] };
+		}
 		if ((mode === "pull" || mode === "issues") && rest[0] && /^\d+$/.test(rest[0])) {
 			return { owner, repo, mode: mode === "pull" ? "pull" : "issue", number: Number(rest[0]) };
 		}
@@ -423,6 +427,77 @@ function formatUser(user: any): string {
 	return user?.login ? `@${user.login}` : "unknown";
 }
 
+const GITHUB_PATCH_PREVIEW_CHARS = 80_000;
+
+function formatChangedFiles(files: any[]): string[] {
+	const fileList = files.map((file) =>
+		`- ${file.status || "modified"} ${file.filename || "(unnamed)"} (+${file.additions ?? "?"}/-${file.deletions ?? "?"})`,
+	);
+	const patches = files
+		.filter((file) => typeof file?.patch === "string" && file.patch)
+		.map((file) => `### ${file.filename}\n\n\`\`\`diff\n${file.patch}\n\`\`\``)
+		.join("\n\n");
+	const truncated = patches.length > GITHUB_PATCH_PREVIEW_CHARS;
+	const patchPreview = truncated ? patches.slice(0, GITHUB_PATCH_PREVIEW_CHARS) : patches;
+
+	return [
+		"Files:",
+		...fileList,
+		patchPreview ? "\nDiff:" : "",
+		patchPreview,
+		truncated
+			? `\n[Diff preview truncated at ${GITHUB_PATCH_PREVIEW_CHARS.toLocaleString()} characters; fetch the commit or pull request .patch URL for the complete patch.]`
+			: "",
+	].filter(Boolean);
+}
+
+export function formatGitHubCommitPreview(owner: string, repo: string, commit: any, url: string): string {
+	const files = Array.isArray(commit?.files) ? commit.files : [];
+	const message = String(commit?.commit?.message || "(no commit message)");
+	const author = formatUser(commit?.author);
+	const authorName = commit?.commit?.author?.name;
+	const authorLabel = author === "unknown" ? authorName || author : authorName ? `${author} (${authorName})` : author;
+	return [
+		`Commit: ${owner}/${repo}@${commit?.sha || "unknown"}`,
+		`Title: ${message.split(/\r?\n/, 1)[0]}`,
+		`Author: ${authorLabel}`,
+		commit?.commit?.author?.date ? `Date: ${commit.commit.author.date}` : "",
+		`URL: ${commit?.html_url || url}`,
+		Array.isArray(commit?.parents) && commit.parents.length
+			? `Parent${commit.parents.length === 1 ? "" : "s"}: ${commit.parents.map((parent: any) => parent?.sha).filter(Boolean).join(", ")}`
+			: "",
+		commit?.stats ? `Changes: +${commit.stats.additions ?? "?"}/-${commit.stats.deletions ?? "?"} across ${files.length} file${files.length === 1 ? "" : "s"}` : `Changed files: ${files.length}`,
+		"",
+		"Message:",
+		message,
+		"",
+		...formatChangedFiles(files),
+	].filter((line) => line !== "").join("\n");
+}
+
+async function handleGitHubCommit(
+	config: ExtensionConfig,
+	parsed: Extract<ParsedGitHubUrl, { mode: "commit" }>,
+	url: string,
+	signal?: AbortSignal,
+): Promise<GitHubResolution> {
+	const commit: any = await fetchGitHubJson(
+		`/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}/commits/${encodeURIComponent(parsed.ref)}?per_page=100`,
+		config.maxTextResponseBytes,
+		signal,
+	);
+	return {
+		kind: "github",
+		url,
+		owner: parsed.owner,
+		repo: parsed.repo,
+		strategy: "github-api",
+		cache: "none",
+		ref: commit?.sha || parsed.ref,
+		preview: formatGitHubCommitPreview(parsed.owner, parsed.repo, commit, url),
+	};
+}
+
 async function handleGitHubPullOrIssue(
 	config: ExtensionConfig,
 	parsed: Extract<ParsedGitHubUrl, { mode: "pull" | "issue" }>,
@@ -453,8 +528,7 @@ async function handleGitHubPullOrIssue(
 			"Body:",
 			pr.body || "(empty)",
 			"",
-			"Files:",
-			...files.map((file) => `- ${file.status} ${file.filename} (+${file.additions}/-${file.deletions})`),
+			...formatChangedFiles(files),
 		].join("\n");
 		return {
 			kind: "github",
@@ -503,6 +577,7 @@ async function handleGitHubPullOrIssue(
 export async function handleGitHubUrl(config: ExtensionConfig, url: string, onProgress?: ProgressReporter, signal?: AbortSignal): Promise<GitHubResolution> {
 	const parsed = parseGitHubUrl(url);
 	if (!parsed) throw new Error("Not a GitHub URL");
+	if (parsed.mode === "commit") return handleGitHubCommit(config, parsed, url, signal);
 	if (parsed.mode === "pull" || parsed.mode === "issue") return handleGitHubPullOrIssue(config, parsed, url, signal);
 	if (parsed.mode === "raw" || parsed.mode === "blob") {
 		throw new Error("Raw and blob GitHub URLs must be routed through the direct HTTP fetcher");

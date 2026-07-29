@@ -18,6 +18,7 @@ Pi extension for:
   - `raw.githubusercontent.com` files are fetched directly and never wait on a repository cache lock
   - GitHub `/blob/` pages are rewritten to direct raw-file requests
   - GitHub `/tree/` paths use the Contents API first, with a sparse checkout fallback
+  - GitHub commit and pull-request URLs use the API and include the actual patch (with a bounded preview for unusually large diffs)
   - repository roots use an atomic `--depth=1 --filter=blob:none --sparse` cache
   - Git/API operations and repository-lock waits time out after five minutes
 - weak local extraction escalates automatically

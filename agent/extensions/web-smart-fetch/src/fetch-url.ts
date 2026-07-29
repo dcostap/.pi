@@ -74,6 +74,13 @@ async function extractHtmlContent(html: string, url: string, signal?: AbortSigna
 		// Keep the heavier article extractor off Pi's extension startup path.
 		const [{ Defuddle }, { parseHTML }] = await Promise.all([import("defuddle/node"), import("linkedom")]);
 		const { document } = parseHTML(html);
+		// Linkedom does not attach the fetched URL to documents created from HTML.
+		// Defuddle consults document.location for metadata before using its explicit
+		// URL option, so provide the real page URL instead of letting relative og:url
+		// values produce noisy URL-parsing warnings.
+		const documentLike = document as any;
+		if (!documentLike.URL) documentLike.URL = url;
+		if (!documentLike.location?.href) documentLike.location = { href: url };
 		const windowLike = (document.defaultView || document) as any;
 		if (typeof windowLike.getComputedStyle !== "function") {
 			windowLike.getComputedStyle = () => new Proxy({}, { get: () => "" });

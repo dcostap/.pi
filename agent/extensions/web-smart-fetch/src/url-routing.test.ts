@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildPartialCloneArgs, formatGitHubContentsPreview, GITHUB_GIT_TIMEOUT_MS, parseGitHubUrl } from "./github.ts";
+import { buildPartialCloneArgs, formatGitHubCommitPreview, formatGitHubContentsPreview, GITHUB_GIT_TIMEOUT_MS, parseGitHubUrl } from "./github.ts";
 import { normalizeUrl, resolveUrl, sanitizeUrlCandidate, thirdPartyFallbackBlockReason, urlDedupeKey } from "./url-routing.ts";
 
 test("sanitizes Markdown wrappers and unbalanced punctuation", () => {
@@ -46,6 +46,13 @@ test("rewrites supported Apple documentation to Sosumi without forwarding query 
 test("classifies existing GitHub and YouTube special handling", () => {
 	assert.equal(resolveUrl("github.com/owner/repo").handler, "github");
 	assert.ok(parseGitHubUrl("https://www.github.com/owner/repo"));
+	assert.deepEqual(parseGitHubUrl("https://github.com/owner/repo/commit/94e2812449eb6c3503fded952b3749f958b76af4"), {
+		owner: "owner",
+		repo: "repo",
+		mode: "commit",
+		ref: "94e2812449eb6c3503fded952b3749f958b76af4",
+	});
+	assert.equal(parseGitHubUrl("https://github.com/owner/repo/commit/not-a-sha"), undefined);
 	assert.equal(parseGitHubUrl("https://github.com/owner/repo/tree/main/safe%2F..%2Fescape"), undefined);
 	assert.equal(resolveUrl("https://youtu.be/example").handler, "youtube");
 });
@@ -79,6 +86,25 @@ test("formats GitHub directory listings without claiming a local checkout", () =
 	assert.match(preview, /GitHub Contents API \(no repository clone\)/);
 	assert.match(preview, /Silkscreen-Regular\.ttf/);
 	assert.doesNotMatch(preview, /Local path:/);
+});
+
+test("formats GitHub commits with metadata and the actual patch", () => {
+	const preview = formatGitHubCommitPreview("owner", "repo", {
+		sha: "abcdef1234567",
+		html_url: "https://github.com/owner/repo/commit/abcdef1234567",
+		author: { login: "alice" },
+		commit: {
+			message: "Fix the race\n\nTake the snapshot after the swap.",
+			author: { name: "Alice", date: "2026-07-29T12:00:00Z" },
+		},
+		parents: [{ sha: "1234567890abc" }],
+		stats: { additions: 2, deletions: 1 },
+		files: [{ filename: "src/write.rs", status: "modified", additions: 2, deletions: 1, patch: "@@ -1 +1 @@\n-old\n+new" }],
+	}, "https://github.com/owner/repo/commit/abcdef1234567");
+	assert.match(preview, /Fix the race/);
+	assert.match(preview, /Parent: 1234567890abc/);
+	assert.match(preview, /src\/write\.rs/);
+	assert.match(preview, /@@ -1 \+1 @@\n-old\n\+new/);
 });
 
 test("labels truncated or unavailable GitHub API file content", () => {
