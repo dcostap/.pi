@@ -258,7 +258,7 @@ async function loadSessionFamily(ctx: ExtensionContext): Promise<{
 }
 
 function sessionDisplayName(node: SessionFamilyNode): string {
-	return node.name || node.firstMessage || "(no messages)";
+	return node.name || node.firstMessage || "";
 }
 
 function formatSessionAge(timestamp: number): string {
