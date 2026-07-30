@@ -302,7 +302,7 @@ function styledHierarchyLines(
 		const styledLabel = current
 			? theme.bold(theme.fg("accent", label))
 			: node.name ? theme.fg("warning", label) : label;
-		const guid = theme.fg("toolDiffAdded", node.id.slice(0, 6));
+		const guid = theme.fg("toolDiffAdded", node.id.slice(-6));
 		const createdAt = Date.parse(node.timestamp);
 		const age = formatSessionAge(node.modifiedAt ?? (Number.isFinite(createdAt) ? createdAt : Date.now()));
 		return {
