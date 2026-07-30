@@ -1308,7 +1308,6 @@ export default function (pi: ExtensionAPI) {
 			return activeEditor;
 		});
 		activeEditor?.restoreTransferredText(expandedTextBeforeSwap);
-		ctx.ui.notify("Selection editor loaded", "info");
 	});
 
 	pi.on("before_agent_start", () => {
