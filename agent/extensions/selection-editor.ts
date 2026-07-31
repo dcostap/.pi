@@ -10,6 +10,7 @@
  * - Shift+PageUp / Shift+PageDown
  * - Ctrl+Z undo and Ctrl+Y redo
  * - Paste the same collapsed paste twice within two seconds to force it inline
+ * - Chrome-style inline completion from one-line prompt templates
  * - Typing replaces selection
  * - Backspace/Delete/word-delete remove selection
  * - Escape clears selection first
@@ -23,7 +24,7 @@
  * - Ctrl+D duplicates the current line below and moves the cursor to it.
  */
 
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -46,6 +47,25 @@ type PendingInlinePaste = {
 	markerRange: Range;
 	cursorAfter: Pos;
 	rawTextAfter: string;
+};
+type InlinePromptCandidate = {
+	text: string;
+	firstWord: string;
+};
+type InlinePromptCompletion = {
+	line: number;
+	startCol: number;
+	counterStartCol: number;
+	endCol: number;
+	typedText: string;
+	candidates: InlinePromptCandidate[];
+	selectedIndex: number;
+	appendedText: string;
+};
+type InlinePromptContinuation = {
+	line: number;
+	startCol: number;
+	selectedText?: string;
 };
 
 type EditorInternals = {
@@ -90,8 +110,43 @@ const KEY_DEBUG_PREVIEW_CHARS = 160;
 const PASTE_MARKER_REGEX = /\[paste #(\d+)( \+\d+ lines| \d+ chars)?\]/g;
 const PROMPT_PLACEHOLDER_REGEX = /\{\{[^{}\r\n]+\}\}/g;
 
+function parsePromptContent(filePath: string): string | null {
+	try {
+		const raw = readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
+		const lines = raw.split(/\r?\n/);
+		if (lines[0]?.trim() !== "---") return raw.trim();
+
+		const frontmatterEnd = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
+		return (frontmatterEnd === -1 ? raw : lines.slice(frontmatterEnd + 1).join("\n")).trim();
+	} catch {
+		return null;
+	}
+}
+
+function loadInlinePromptCandidates(pi: ExtensionAPI): InlinePromptCandidate[] {
+	const candidates: InlinePromptCandidate[] = [];
+	const seenText = new Set<string>();
+
+	for (const command of pi.getCommands()) {
+		if (command.source !== "prompt") continue;
+		const text = parsePromptContent(command.sourceInfo.path);
+		if (!text || /[\r\n]/.test(text) || seenText.has(text)) continue;
+		const firstToken = text.match(/^\S+/)?.[0];
+		const firstWord = firstToken?.replace(/[.,!?;:)\]}]+$/u, "");
+		if (!firstWord) continue;
+
+		seenText.add(text);
+		candidates.push({ text, firstWord });
+	}
+
+	return candidates;
+}
+
 class SelectionEditor extends CustomEditor {
 	private selectionAnchor: Pos | null = null;
+	private inlinePromptCompletion: InlinePromptCompletion | null = null;
+	private inlinePromptContinuation: InlinePromptContinuation | null = null;
+	private readonly inlinePromptCounterColor: (text: string) => string;
 	private customPasteChunks: string[] = [];
 	private customPasteInProgress = false;
 	private pendingInlinePaste: PendingInlinePaste | null = null;
@@ -102,8 +157,19 @@ class SelectionEditor extends CustomEditor {
 	private basePushUndoSnapshot: (() => void) | null = null;
 	private baseUndo: (() => void) | null = null;
 
-	constructor(...args: ConstructorParameters<typeof CustomEditor>) {
+	constructor(
+		private readonly inlinePromptCandidates: InlinePromptCandidate[],
+		...args: ConstructorParameters<typeof CustomEditor>
+	) {
 		super(...args);
+		const promptTheme = args[1] as unknown as {
+			fg?: (color: "accent", text: string) => string;
+			italic?: (text: string) => string;
+		};
+		this.inlinePromptCounterColor = (text: string) => {
+			const emphasized = promptTheme.italic?.(text) ?? text;
+			return promptTheme.fg?.("accent", emphasized) ?? emphasized;
+		};
 
 		// The base Editor already owns undo snapshots. Patch the runtime TS-private
 		// method so every normal edit invalidates redo, while redo itself can still
@@ -128,6 +194,8 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	setText(text: string): void {
+		this.cancelInlinePromptCompletion();
+		this.inlinePromptContinuation = null;
 		this.pendingInlinePaste = null;
 		const previousText = this.getText();
 		const previousPasteState = this.snapshotPasteState();
@@ -518,6 +586,9 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	resetAfterSubmit(): void {
+		this.inlinePromptCompletion = null;
+		this.inlinePromptContinuation = null;
+		this.clearSelection();
 		this.pendingInlinePaste = null;
 		this.promptBufferIndex = -1;
 		this.promptBufferStates.clear();
@@ -542,6 +613,305 @@ class SelectionEditor extends CustomEditor {
 
 	private clearSelection(): void {
 		this.selectionAnchor = null;
+	}
+
+	private inlinePromptMatches(typedText: string): InlinePromptCandidate[] {
+		if (!typedText || /[\r\n]/.test(typedText)) return [];
+		const foldedTyped = typedText.toLocaleLowerCase();
+
+		return this.inlinePromptCandidates.filter((candidate) => {
+			const minimumPrefixLength = Math.min(4, candidate.firstWord.length);
+			return (
+				typedText.length >= minimumPrefixLength &&
+				candidate.text.length > typedText.length &&
+				candidate.text.toLocaleLowerCase().startsWith(foldedTyped)
+			);
+		});
+	}
+
+	private findInlinePromptContext(
+		currentLine: string,
+		cursorCol: number,
+	): { startCol: number; typedText: string; candidates: InlinePromptCandidate[] } | null {
+		const beforeCursor = currentLine.slice(0, cursorCol);
+		const possibleStarts = [0];
+		for (let index = 1; index < beforeCursor.length; index++) {
+			if (/\s/u.test(beforeCursor[index - 1] ?? "") && !/\s/u.test(beforeCursor[index] ?? "")) {
+				possibleStarts.push(index);
+			}
+		}
+
+		let best: { startCol: number; typedText: string; candidates: InlinePromptCandidate[] } | null = null;
+		for (const startCol of possibleStarts) {
+			const typedText = beforeCursor.slice(startCol);
+			const candidates = this.inlinePromptMatches(typedText);
+			if (candidates.length === 0 || (best && best.typedText.length >= typedText.length)) continue;
+			best = { startCol, typedText, candidates };
+		}
+		return best;
+	}
+
+	private installInlinePromptCompletion(
+		line: number,
+		startCol: number,
+		typedText: string,
+		candidates: InlinePromptCandidate[],
+		selectedText?: string,
+	): boolean {
+		if (candidates.length === 0 || this.isShowingAutocomplete() || this.hasSelection()) return false;
+		const currentLine = this.state.lines[line] ?? "";
+		const cursor = this.currentPos();
+		if (
+			cursor.line !== line ||
+			cursor.col !== startCol + typedText.length ||
+			currentLine.slice(startCol, cursor.col) !== typedText ||
+			currentLine.slice(cursor.col).trim() !== ""
+		) {
+			return false;
+		}
+
+		let selectedIndex = selectedText
+			? candidates.findIndex((candidate) => candidate.text === selectedText)
+			: 0;
+		if (selectedIndex < 0) selectedIndex = 0;
+		const selected = candidates[selectedIndex]!;
+		const suffix = selected.text.slice(typedText.length);
+		const counter = ` (${selectedIndex + 1}/${candidates.length})`;
+		const appendedText = suffix + counter;
+
+		this.i.cancelAutocomplete();
+		this.state.lines[line] = currentLine.slice(0, cursor.col) + appendedText + currentLine.slice(cursor.col);
+		this.inlinePromptCompletion = {
+			line,
+			startCol,
+			counterStartCol: cursor.col + suffix.length,
+			endCol: cursor.col + appendedText.length,
+			typedText,
+			candidates,
+			selectedIndex,
+			appendedText,
+		};
+		this.inlinePromptContinuation = null;
+		// Use a backwards selection so the visible caret remains exactly where
+		// the user was typing while the generated suffix is highlighted.
+		this.selectionAnchor = { line, col: cursor.col + suffix.length };
+		this.setCursor({ line, col: cursor.col });
+		this.tui.requestRender();
+		return true;
+	}
+
+	private maybeActivateInlinePromptCompletion(continuation?: InlinePromptContinuation): void {
+		if (this.inlinePromptCompletion || this.isShowingAutocomplete() || this.hasSelection()) return;
+		const cursor = this.currentPos();
+		const currentLine = this.state.lines[cursor.line] ?? "";
+		if (currentLine.slice(cursor.col).trim() !== "") {
+			this.inlinePromptContinuation = null;
+			return;
+		}
+
+		const preferred = continuation ?? this.inlinePromptContinuation;
+		if (preferred && preferred.line === cursor.line && cursor.col >= preferred.startCol) {
+			const typedText = currentLine.slice(preferred.startCol, cursor.col);
+			const candidates = this.inlinePromptMatches(typedText);
+			if (
+				this.installInlinePromptCompletion(
+					cursor.line,
+					preferred.startCol,
+					typedText,
+					candidates,
+					preferred.selectedText,
+				)
+			) {
+				return;
+			}
+
+			// Keep the original word start while the user corrects a mismatch. This
+			// lets deleting the bad character restore a completion even after the
+			// manually typed prefix has advanced into later words of the candidate.
+			this.inlinePromptContinuation = preferred;
+		} else if (preferred) {
+			this.inlinePromptContinuation = null;
+		}
+
+		const fresh = this.findInlinePromptContext(currentLine, cursor.col);
+		if (!fresh) return;
+		this.installInlinePromptCompletion(
+			cursor.line,
+			fresh.startCol,
+			fresh.typedText,
+			fresh.candidates,
+		);
+	}
+
+	private detachInlinePromptCompletion(requestRender: boolean = true): InlinePromptContinuation | null {
+		const completion = this.inlinePromptCompletion;
+		if (!completion) return null;
+		this.inlinePromptCompletion = null;
+
+		const line = this.state.lines[completion.line] ?? "";
+		if (line.slice(completion.endCol - completion.appendedText.length, completion.endCol) === completion.appendedText) {
+			const suggestionStart = completion.endCol - completion.appendedText.length;
+			this.state.lines[completion.line] = line.slice(0, suggestionStart) + line.slice(completion.endCol);
+			this.setCursor({ line: completion.line, col: suggestionStart });
+		}
+
+		this.clearSelection();
+		if (requestRender) this.tui.requestRender();
+		return {
+			line: completion.line,
+			startCol: completion.startCol,
+			selectedText: completion.candidates[completion.selectedIndex]?.text,
+		};
+	}
+
+	private cancelInlinePromptCompletion(): boolean {
+		this.inlinePromptContinuation = null;
+		if (!this.inlinePromptCompletion) return false;
+		this.detachInlinePromptCompletion();
+		return true;
+	}
+
+	private cycleInlinePromptCompletion(): void {
+		const completion = this.inlinePromptCompletion;
+		if (!completion) return;
+		const nextIndex = (completion.selectedIndex + 1) % completion.candidates.length;
+		const selectedText = completion.candidates[nextIndex]?.text;
+		const continuation = this.detachInlinePromptCompletion(false);
+		if (!continuation) return;
+		this.installInlinePromptCompletion(
+			completion.line,
+			completion.startCol,
+			completion.typedText,
+			completion.candidates,
+			selectedText,
+		);
+	}
+
+	private acceptInlinePromptCompletion(promoteSelection: boolean = false): boolean {
+		const completion = this.inlinePromptCompletion;
+		if (!completion) return false;
+		const selected = completion.candidates[completion.selectedIndex];
+		this.detachInlinePromptCompletion(false);
+		if (!selected) return false;
+
+		const suffix = selected.text.slice(completion.typedText.length);
+		this.i.pushUndoSnapshot();
+		this.i.insertTextAtCursorInternal(suffix);
+		if (promoteSelection) {
+			// Turn the generated suffix into an ordinary backwards selection. The
+			// existing selection editor can then extend, shrink, copy, replace, or
+			// delete it without needing autocomplete-specific versions of those keys.
+			this.selectionAnchor = { line: completion.line, col: completion.startCol + selected.text.length };
+			this.setCursor({ line: completion.line, col: completion.startCol + completion.typedText.length });
+		} else {
+			this.clearSelection();
+		}
+		this.tui.requestRender();
+		return true;
+	}
+
+	private isSelectionAddingInput(data: string): boolean {
+		return (
+			matchesKey(data, "ctrl+a") ||
+			matchesKey(data, "shift+left") ||
+			matchesKey(data, "shift+right") ||
+			matchesKey(data, "shift+up") ||
+			matchesKey(data, "shift+down") ||
+			matchesKey(data, "shift+home") ||
+			matchesKey(data, "shift+end") ||
+			matchesKey(data, "shift+pageUp") ||
+			matchesKey(data, "shift+pageDown") ||
+			matchesKey(data, "ctrl+shift+left") ||
+			matchesKey(data, "alt+shift+left") ||
+			matchesKey(data, "ctrl+shift+right") ||
+			matchesKey(data, "alt+shift+right") ||
+			matchesKey(data, "ctrl+shift+home") ||
+			matchesKey(data, "ctrl+shift+end")
+		);
+	}
+
+	private getInlinePromptInputKind(data: string): "deletion" | "printable" | null {
+		if (
+			matchesKey(data, "backspace") ||
+			matchesKey(data, "shift+backspace") ||
+			matchesKey(data, "delete") ||
+			matchesKey(data, "shift+delete") ||
+			matchesKey(data, "ctrl+w") ||
+			matchesKey(data, "alt+backspace") ||
+			matchesKey(data, "alt+d") ||
+			matchesKey(data, "alt+delete") ||
+			matchesKey(data, "ctrl+u") ||
+			matchesKey(data, "ctrl+k")
+		) {
+			return "deletion";
+		}
+
+		const kittyPrintable = decodeKittyPrintable(data);
+		if (
+			matchesKey(data, "shift+space") ||
+			kittyPrintable !== undefined ||
+			(data.length > 0 && data.charCodeAt(0) >= 32)
+		) {
+			return "printable";
+		}
+
+		return null;
+	}
+
+	private handleInlinePromptCompletionInput(data: string): boolean {
+		if (!this.inlinePromptCompletion) return false;
+
+		if (this.isSelectionAddingInput(data)) {
+			this.acceptInlinePromptCompletion(true);
+			return false;
+		}
+		if (matchesKey(data, "tab")) {
+			this.cycleInlinePromptCompletion();
+			return true;
+		}
+		if (
+			matchesKey(data, "right") ||
+			matchesKey(data, "ctrl+right") ||
+			matchesKey(data, "ctrl+f") ||
+			matchesKey(data, "end")
+		) {
+			this.acceptInlinePromptCompletion();
+			return true;
+		}
+		if (matchesKey(data, "enter")) {
+			this.acceptInlinePromptCompletion();
+			super.handleInput(data);
+			return true;
+		}
+		if (matchesKey(data, "escape")) {
+			this.cancelInlinePromptCompletion();
+			return true;
+		}
+
+		const inputKind = this.getInlinePromptInputKind(data);
+		if (inputKind === "deletion") {
+			// The generated suffix is the active selection. Backspace/delete removes
+			// that transient selection only; a second press edits the user's text.
+			this.cancelInlinePromptCompletion();
+			return true;
+		}
+		const continuation = this.detachInlinePromptCompletion(false);
+
+		if (inputKind !== "printable") {
+			this.inlinePromptContinuation = null;
+			return false;
+		}
+
+		const textBeforeInput = this.getText();
+		super.handleInput(data);
+		if (this.getText() !== textBeforeInput) {
+			this.pruneUnusedPasteMarkers();
+			this.maybeTriggerInlineSlashAutocomplete();
+			if (!this.isShowingAutocomplete() && continuation) {
+				this.maybeActivateInlinePromptCompletion(continuation);
+			}
+		}
+		return true;
 	}
 
 	private positionToOffset(pos: Pos): number {
@@ -951,20 +1321,49 @@ class SelectionEditor extends CustomEditor {
 	}
 
 	private pieceWithSelection(text: string, pieceStartCol: number, lineNumber: number, range: Range | null): string {
-		if (!range || text.length === 0) return text;
-		if (lineNumber < range.start.line || lineNumber > range.end.line) return text;
-
+		if (text.length === 0) return text;
 		const pieceEndCol = pieceStartCol + text.length;
-		let selStart = pieceStartCol;
-		let selEnd = pieceEndCol;
+		const boundaries = new Set([0, text.length]);
+		const addBoundary = (absoluteCol: number): void => {
+			const localCol = absoluteCol - pieceStartCol;
+			if (localCol > 0 && localCol < text.length) boundaries.add(localCol);
+		};
 
-		if (lineNumber === range.start.line) selStart = Math.max(selStart, range.start.col);
-		if (lineNumber === range.end.line) selEnd = Math.min(selEnd, range.end.col);
-		if (selStart >= selEnd) return text;
+		let selectionStart = Number.POSITIVE_INFINITY;
+		let selectionEnd = Number.NEGATIVE_INFINITY;
+		if (range && lineNumber >= range.start.line && lineNumber <= range.end.line) {
+			selectionStart = lineNumber === range.start.line ? range.start.col : 0;
+			selectionEnd = lineNumber === range.end.line ? range.end.col : Number.POSITIVE_INFINITY;
+			addBoundary(Math.max(pieceStartCol, selectionStart));
+			addBoundary(Math.min(pieceEndCol, selectionEnd));
+		}
 
-		const a = selStart - pieceStartCol;
-		const b = selEnd - pieceStartCol;
-		return text.slice(0, a) + REVERSE + text.slice(a, b) + RESET + text.slice(b);
+		const completion = this.inlinePromptCompletion;
+		if (completion?.line === lineNumber) {
+			addBoundary(completion.counterStartCol);
+			addBoundary(completion.endCol);
+		}
+
+		const points = [...boundaries].sort((a, b) => a - b);
+		let result = "";
+		for (let index = 0; index < points.length - 1; index++) {
+			const localStart = points[index]!;
+			const localEnd = points[index + 1]!;
+			const absoluteStart = pieceStartCol + localStart;
+			const part = text.slice(localStart, localEnd);
+			if (absoluteStart >= selectionStart && absoluteStart < selectionEnd) {
+				result += REVERSE + part + RESET;
+			} else if (
+				completion?.line === lineNumber &&
+				absoluteStart >= completion.counterStartCol &&
+				absoluteStart < completion.endCol
+			) {
+				result += this.inlinePromptCounterColor(part);
+			} else {
+				result += part;
+			}
+		}
+		return result;
 	}
 
 	private renderVisualLine(rawText: string, lineNumber: number, startCol: number, cursorPos: number | null, range: Range | null, emitCursorMarker: boolean): { text: string; width: number; cursorInPadding: boolean } {
@@ -1097,6 +1496,10 @@ class SelectionEditor extends CustomEditor {
 	handleInput(data: string): void {
 		this.debugKeyInput(data);
 		if (isKeyRelease(data)) return;
+		if (this.handleInlinePromptCompletionInput(data)) return;
+		if (this.inlinePromptContinuation && this.getInlinePromptInputKind(data) === null) {
+			this.inlinePromptContinuation = null;
+		}
 		if (this.handleCustomPasteInput(data)) return;
 		// Any non-paste input (movement, editing, commands, etc.) cancels the
 		// double-paste gesture, even if it later leaves the cursor where it was.
@@ -1292,6 +1695,12 @@ class SelectionEditor extends CustomEditor {
 				this.selectFirstPlaceholderFromInsertion(textBeforeInput, this.getText());
 			}
 			this.maybeTriggerInlineSlashAutocomplete();
+			// Deletion may restore a matching prefix, but it must not summon inline
+			// completion by itself. Preserve any dormant continuation and wait until
+			// the user types another printable character.
+			if (this.getInlinePromptInputKind(data) === "printable") {
+				this.maybeActivateInlinePromptCompletion();
+			}
 		}
 	}
 }
@@ -1303,8 +1712,9 @@ export default function (pi: ExtensionAPI) {
 		// The TUI accepts input before extension session_start handlers finish. Capture
 		// the expanded value before Pi copies only the collapsed text into our editor.
 		const expandedTextBeforeSwap = ctx.ui.getEditorText();
+		const inlinePromptCandidates = loadInlinePromptCandidates(pi);
 		ctx.ui.setEditorComponent((tui, theme, kb) => {
-			activeEditor = new SelectionEditor(tui, theme, kb);
+			activeEditor = new SelectionEditor(inlinePromptCandidates, tui, theme, kb);
 			return activeEditor;
 		});
 		activeEditor?.restoreTransferredText(expandedTextBeforeSwap);
