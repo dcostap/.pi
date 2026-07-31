@@ -11,6 +11,7 @@ import {
   appendMessage,
   buildThreads,
   cleanupInbox,
+  countPendingInboxMessages,
   consumeInbox,
   ensureInbox,
   ensureProjectDirs,
@@ -28,12 +29,20 @@ import {
   writeRegistry,
   writeResetContextBeforeMessageResult,
 } from "./storage.js";
+import {
+  buildInjectedMessengerBatchText,
+  buildInjectedMessengerText,
+  messageDelivery,
+  selectAutomaticChatEntries,
+  selectCheckInboxEntries,
+} from "./messages.js";
 import type {
   AgentRegistration,
   ChatMessage,
   IdleWatchRule,
   IdleWatchStore,
   IdleWatchTarget,
+  MessageDelivery,
   PresenceState,
   ResetContextBeforeMessageRequest,
   ResetContextBeforeMessageResult,
@@ -44,8 +53,8 @@ import type {
 const ToolParams = Type.Object({
   action: Type.Optional(Type.Unsafe<ToolParamsType["action"]>({
     type: "string",
-    enum: ["join", "leave", "status", "send", "broadcast", "rename", "warn_me_when_idle", "warn_me_when_idle.list", "warn_me_when_idle.remove", "warn_me_when_idle.clear", "warn_me_when_working", "warn_me_when_working.list", "warn_me_when_working.remove", "warn_me_when_working.clear"],
-    description: "Messenger action. Use status to inspect the current messenger roster, send for direct agent messages, broadcast for project-wide notes, and warn_me_when_idle / warn_me_when_working to configure private presence alerts.",
+    enum: ["join", "leave", "status", "check_inbox", "send", "broadcast", "rename", "warn_me_when_idle", "warn_me_when_idle.list", "warn_me_when_idle.remove", "warn_me_when_idle.clear", "warn_me_when_working", "warn_me_when_working.list", "warn_me_when_working.remove", "warn_me_when_working.clear"],
+    description: "Messenger action. Use status to inspect the current roster, check_inbox to receive queued messages in the current turn, send for direct messages, broadcast for project-wide notes, and warn_me_when_idle / warn_me_when_working to configure private presence alerts.",
   })),
   to: Type.Optional(Type.Union([
     Type.String({ description: "Recipient agent name for action: 'send'." }),
@@ -53,6 +62,11 @@ const ToolParams = Type.Object({
   ])),
   message: Type.Optional(Type.String({
     description: "Message body for send or broadcast. This is the exact text delivered to other agents.",
+  })),
+  delivery: Type.Optional(Type.Unsafe<MessageDelivery>({
+    type: "string",
+    enum: ["inbox", "steer"],
+    description: "Delivery for send/broadcast. inbox waits for an explicit inbox check or idle delivery. steer reaches an active recipient at Pi's next safe turn boundary.",
   })),
   replyTo: Type.Optional(Type.String({
     description: "Optional message ID being replied to. Use when continuing a thread with another agent so recipients can see reply context.",
@@ -81,9 +95,10 @@ const ToolParams = Type.Object({
 });
 
 type ToolParamsType = {
-  action?: "join" | "leave" | "status" | "send" | "broadcast" | "rename" | "warn_me_when_idle" | "warn_me_when_idle.list" | "warn_me_when_idle.remove" | "warn_me_when_idle.clear" | "warn_me_when_working" | "warn_me_when_working.list" | "warn_me_when_working.remove" | "warn_me_when_working.clear";
+  action?: "join" | "leave" | "status" | "check_inbox" | "send" | "broadcast" | "rename" | "warn_me_when_idle" | "warn_me_when_idle.list" | "warn_me_when_idle.remove" | "warn_me_when_idle.clear" | "warn_me_when_working" | "warn_me_when_working.list" | "warn_me_when_working.remove" | "warn_me_when_working.clear";
   to?: string | string[];
   message?: string;
+  delivery?: MessageDelivery;
   replyTo?: string;
   completely_wipe_recipient_context_before_message?: boolean;
   name?: string;
@@ -303,6 +318,8 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     const presenceStart = Date.parse(state.presenceSince);
     const presence = `${state.presenceState} ${formatDuration(Math.max(0, Date.now() - (Number.isFinite(presenceStart) ? presenceStart : Date.now())))}`;
     const bits = [`messenger: ${state.agentName} (${state.agentRole})`, `${otherAgents} agent${otherAgents === 1 ? "" : "s"}`, presence];
+    const pending = countPendingInboxMessages(state.project, state.sessionId);
+    if (pending > 0) bits.push(`${pending} inbox`);
     resolved.ui.setStatus("messenger", resolved.ui.theme.fg("accent", bits.join(" • ")));
   }
 
@@ -364,24 +381,6 @@ export default function simpleMessenger(pi: ExtensionAPI) {
 
   function getThreads(): ThreadSummary[] {
     return buildThreads(state.project, state.sessionId, currentNamesMap(), currentRolesMap());
-  }
-
-  function buildInjectedMessengerText(message: Pick<ChatMessage, "kind" | "fromNameSnapshot" | "fromRoleSnapshot" | "replyTo" | "text">): string {
-    const isBroadcast = message.kind === "broadcast";
-    const tag = isBroadcast ? "global_messenger_broadcast" : "direct_messenger_message";
-    const replyTag = message.replyTo ? `\n  <reply_to>${message.replyTo}</reply_to>` : "";
-    return `<${tag}>\n  <sender>${message.fromNameSnapshot}</sender>\n  <role>${message.fromRoleSnapshot}</role>\n  <note>To reply, use the messenger tool.</note>${replyTag}\n  <contents>\n${message.text}\n  </contents>\n</${tag}>`;
-  }
-
-  function buildInjectedMessengerBatchText(messages: ChatMessage[]): string {
-    const sorted = [...messages].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-    const rendered = sorted.map((message, index) => {
-      const isBroadcast = message.kind === "broadcast";
-      const tag = isBroadcast ? "global_messenger_broadcast" : "direct_messenger_message";
-      const replyTag = message.replyTo ? `\n    <reply_to>${message.replyTo}</reply_to>` : "";
-      return `  <pending_message index="${index + 1}" of="${sorted.length}">\n    <type>${tag}</type>\n    <sender>${message.fromNameSnapshot}</sender>\n    <role>${message.fromRoleSnapshot}</role>\n    <created_at>${message.createdAt}</created_at>${replyTag}\n    <contents>\n${message.text}\n    </contents>\n  </pending_message>`;
-    }).join("\n\n");
-    return `<messenger_pending_messages>\n  <note>You had ${sorted.length} pending messenger messages. They are shown below from oldest to most recent. Handle each one separately. To reply, use the messenger tool.</note>\n${rendered}\n</messenger_pending_messages>`;
   }
 
   function finishResetRequest(request: ResetContextBeforeMessageRequest, payload: Omit<ResetContextBeforeMessageResult, "version" | "controlType" | "createdAt">) {
@@ -462,7 +461,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     }
   }
 
-  function renderIncomingMessage(message: ChatMessage): void {
+  function renderIncomingMessage(message: ChatMessage, deliverAs: "steer" | "followUp"): void {
     const isBroadcast = message.kind === "broadcast";
     const displayType = isBroadcast
       ? `Broadcast from agent ${message.fromNameSnapshot} (${message.fromRoleSnapshot})`
@@ -482,18 +481,19 @@ export default function simpleMessenger(pi: ExtensionAPI) {
           title: displayType,
           createdAt: message.createdAt,
           rawMessageText: message.text,
+          delivery: messageDelivery(message),
         },
       },
       {
-        deliverAs: "followUp",
+        deliverAs,
         triggerTurn: true,
       },
     );
   }
 
-  function renderIncomingMessageBatch(messages: ChatMessage[]): void {
+  function renderIncomingMessageBatch(messages: ChatMessage[], deliverAs: "steer" | "followUp"): void {
     if (messages.length === 1) {
-      renderIncomingMessage(messages[0]!);
+      renderIncomingMessage(messages[0]!, deliverAs);
       return;
     }
 
@@ -513,11 +513,12 @@ export default function simpleMessenger(pi: ExtensionAPI) {
             replyTo: message.replyTo,
             createdAt: message.createdAt,
             rawMessageText: message.text,
+            delivery: messageDelivery(message),
           })),
         },
       },
       {
-        deliverAs: "followUp",
+        deliverAs,
         triggerTurn: true,
       },
     );
@@ -615,14 +616,16 @@ export default function simpleMessenger(pi: ExtensionAPI) {
 
     refreshProject(ctx.cwd ?? process.cwd());
 
-    const canDeliverAgentMessage = canTriggerAgentFromPoll(ctx);
+    const deliveryPaused = isAgentTriggeredDeliveryPaused();
+    const canDeliverIdle = !deliveryPaused && ctx.isIdle() && !ctx.hasPendingMessages();
+    const canDeliverSteer = !deliveryPaused;
     let deliveredAgentMessage = false;
     const items = consumeInbox(state.project, state.sessionId);
     for (const entry of items) {
       const item = entry.item;
 
       if ("controlType" in item && item.controlType === "reset_context_before_message") {
-        if (!canDeliverAgentMessage) {
+        if (!canDeliverIdle) {
           writeResetContextBeforeMessageResult(state.project, item.senderSessionId, {
             version: 1,
             controlType: "reset_context_before_message_result",
@@ -644,19 +647,14 @@ export default function simpleMessenger(pi: ExtensionAPI) {
         break;
       }
 
-      if (!canDeliverAgentMessage) break;
+      if (!canDeliverIdle && !canDeliverSteer) break;
 
-      const batch: { message: ChatMessage; path: string }[] = [];
-      for (const candidate of items) {
-        if ("controlType" in candidate.item) {
-          if (batch.length === 0) continue;
-          break;
-        }
-        batch.push({ message: candidate.item as ChatMessage, path: candidate.path });
-        if (batch.length >= 5) break;
-      }
-
-      renderIncomingMessageBatch(batch.map((candidate) => candidate.message));
+      const batch = selectAutomaticChatEntries(items, canDeliverIdle);
+      if (batch.length === 0) break;
+      renderIncomingMessageBatch(
+        batch.map((candidate) => candidate.item),
+        canDeliverIdle ? "followUp" : "steer",
+      );
       for (const candidate of batch) removeInboxMessage(candidate.path);
       deliveredAgentMessage = true;
       break;
@@ -761,12 +759,13 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     if (notJoined) return notJoined;
 
     const agents = readActiveAgents(state.project);
+    const pendingInboxCount = countPendingInboxMessages(state.project, state.sessionId);
     const self = agents.find((agent) => agent.sessionId === state.sessionId);
     const otherAgents = agents.filter((agent) => agent.sessionId !== state.sessionId);
     let text = `# Messenger status (${agents.length} online — project: ${state.project.label})\n\n`;
     if (self) {
       const selfPresence = presenceLabel(self);
-      text += `• ${self.name} (you, ${self.role}) — ${selfPresence.label} — ${self.branch ?? "unknown"} — ${self.model ?? "unknown"}\n`;
+      text += `• ${self.name} (you, ${self.role}) — ${selfPresence.label} — inbox ${pendingInboxCount} — ${self.branch ?? "unknown"} — ${self.model ?? "unknown"}\n`;
     }
     if (otherAgents.length === 0) {
       text += `No other agents online.`;
@@ -781,6 +780,44 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     return result(text, {
       mode: "status",
       agents,
+      pendingInboxCount,
+    });
+  }
+
+  function checkInbox(ctx: ExtensionContext) {
+    const notJoined = ensureJoined(ctx);
+    if (notJoined) return notJoined;
+
+    const entries = selectCheckInboxEntries(consumeInbox(state.project, state.sessionId));
+    if (entries.length === 0) {
+      return result("Messenger inbox is empty.", {
+        mode: "check_inbox",
+        messages: [],
+        remainingPendingCount: 0,
+      });
+    }
+
+    const messages = entries.map((entry) => entry.item);
+    const rendered = messages.length === 1
+      ? buildInjectedMessengerText(messages[0]!)
+      : buildInjectedMessengerBatchText(messages);
+    for (const entry of entries) removeInboxMessage(entry.path);
+    const remainingPendingCount = countPendingInboxMessages(state.project, state.sessionId);
+    noteActivity(ctx, true);
+
+    return result(rendered, {
+      mode: "check_inbox",
+      messages: messages.map((message) => ({
+        id: message.id,
+        kind: message.kind,
+        from: message.fromNameSnapshot,
+        fromRole: message.fromRoleSnapshot,
+        replyTo: message.replyTo,
+        createdAt: message.createdAt,
+        delivery: messageDelivery(message),
+        rawMessageText: message.text,
+      })),
+      remainingPendingCount,
     });
   }
 
@@ -878,7 +915,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     return results;
   }
 
-  async function sendDirectMessage(ctx: ExtensionContext, to: string | string[] | undefined, text: string | undefined, replyTo?: string, resetContextBeforeMessage = false) {
+  async function sendDirectMessage(ctx: ExtensionContext, to: string | string[] | undefined, text: string | undefined, replyTo?: string, resetContextBeforeMessage = false, delivery: MessageDelivery = "inbox") {
     const notJoined = ensureJoined(ctx);
     if (notJoined) return notJoined;
     if (!text?.trim()) return result("Error: message is required.", { mode: "send", error: "missing_message" });
@@ -888,7 +925,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
 
     const rawText = text.trim();
     if (!resetContextBeforeMessage) {
-      const deliveredTo: string[] = [];
+      const queued: Array<{ recipient: string; messageId: string }> = [];
       for (const recipient of resolved.recipients) {
         const message: ChatMessage = {
           version: 1,
@@ -902,20 +939,24 @@ export default function simpleMessenger(pi: ExtensionAPI) {
           toNameSnapshots: [recipient.name],
           text: rawText,
           replyTo,
+          delivery,
           createdAt: new Date().toISOString(),
         };
         appendMessage(state.project, message, config.messageRetention);
         enqueueInboxMessage(state.project, recipient.sessionId, message);
-        deliveredTo.push(recipient.name);
+        queued.push({ recipient: recipient.name, messageId: message.id });
       }
 
       noteActivity(ctx, true);
 
       const failedText = resolved.failed.length > 0 ? ` Failed: ${resolved.failed.join(", ")}.` : "";
       const replyText = replyTo ? `\nReplyTo: ${replyTo}` : "";
-      return result(`Sent to ${deliveredTo.join(", ")}.${failedText}\n\nRaw message:${replyText}\n${rawText}`, {
+      const idText = queued.map((entry) => `${entry.recipient}=${entry.messageId}`).join(", ");
+      return result(`Queued ${delivery} message for ${queued.map((entry) => entry.recipient).join(", ")}.${failedText}\nMessage IDs: ${idText}\n\nRaw message:${replyText}\n${rawText}`, {
         mode: "send",
-        recipients: deliveredTo,
+        delivery,
+        recipients: queued.map((entry) => entry.recipient),
+        messages: queued,
         failed: resolved.failed,
         rawMessageText: rawText,
         replyTo,
@@ -997,7 +1038,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     });
   }
 
-  async function sendBroadcast(ctx: ExtensionContext, text: string | undefined, replyTo?: string, resetContextBeforeMessage = false) {
+  async function sendBroadcast(ctx: ExtensionContext, text: string | undefined, replyTo?: string, resetContextBeforeMessage = false, delivery: MessageDelivery = "inbox") {
     const notJoined = ensureJoined(ctx);
     if (notJoined) return notJoined;
     if (!text?.trim()) return result("Error: message is required.", { mode: "broadcast", error: "missing_message" });
@@ -1018,6 +1059,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
         toNameSnapshots: recipients.map((agent) => agent.name),
         text: rawText,
         replyTo,
+        delivery,
         createdAt: new Date().toISOString(),
       };
 
@@ -1027,8 +1069,8 @@ export default function simpleMessenger(pi: ExtensionAPI) {
       noteActivity(ctx, true);
       const replyText = replyTo ? `\nReplyTo: ${replyTo}` : "";
       return result(
-        `Broadcast sent to ${recipients.length} agent${recipients.length === 1 ? "" : "s"}.\n\nRaw message:${replyText}\n${rawText}`,
-        { mode: "broadcast", recipientCount: recipients.length, rawMessageText: rawText, replyTo },
+        `Queued ${delivery} broadcast for ${recipients.length} agent${recipients.length === 1 ? "" : "s"}.\nMessage ID: ${message.id}\n\nRaw message:${replyText}\n${rawText}`,
+        { mode: "broadcast", delivery, messageId: message.id, recipientCount: recipients.length, rawMessageText: rawText, replyTo },
       );
     }
 
@@ -1270,7 +1312,14 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     pi.registerTool({
       name: "messenger",
       label: "Messenger",
-      description: "Project-scoped messaging, agent presence, and private presence warnings.",
+      description: "Project-scoped messaging with explicit inbox checks, safe-point steering, agent presence, and private presence warnings.",
+      promptSnippet: "Exchange project-scoped messages, check queued inbox messages, and steer active collaborators at safe turn boundaries",
+      promptGuidelines: [
+        "Use messenger action check_inbox at natural checkpoints during coordinated work, before beginning a new phase, and before assuming earlier instructions are still current.",
+        "Messenger send and broadcast with delivery 'inbox' queue normal messages; delivery 'steer' is only for time-sensitive redirection and reaches an active recipient at Pi's next safe turn boundary, not during a running tool.",
+        "Do not send acknowledgement-only messenger messages unless the other sender explicitly requested acknowledgement; send substantive findings, questions, blockers, decisions, or requested results instead.",
+        "Do not assume a queued inbox message has been read merely because messenger accepted it.",
+      ],
       parameters: ToolParams,
       async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
         latestCtx = ctx;
@@ -1284,8 +1333,9 @@ export default function simpleMessenger(pi: ExtensionAPI) {
           case "join": return doJoin(ctx);
           case "leave": return doLeave(ctx);
           case "status": return executeStatus(ctx);
-          case "send": return sendDirectMessage(ctx, params.to, params.message, params.replyTo, params.completely_wipe_recipient_context_before_message === true);
-          case "broadcast": return sendBroadcast(ctx, params.message, params.replyTo, params.completely_wipe_recipient_context_before_message === true);
+          case "check_inbox": return checkInbox(ctx);
+          case "send": return sendDirectMessage(ctx, params.to, params.message, params.replyTo, params.completely_wipe_recipient_context_before_message === true, params.delivery ?? "inbox");
+          case "broadcast": return sendBroadcast(ctx, params.message, params.replyTo, params.completely_wipe_recipient_context_before_message === true, params.delivery ?? "inbox");
           case "rename": return executeRename(ctx, params.name);
           case "warn_me_when_idle": return configurePresenceWarning(ctx, params, "idle");
           case "warn_me_when_idle.list": return listPresenceWarnings(ctx, "idle");

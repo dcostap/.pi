@@ -19,6 +19,7 @@ export interface ProjectInfo {
 }
 
 export type PresenceState = "working" | "idle";
+export type MessageDelivery = "inbox" | "steer";
 
 export interface AgentRegistration {
   version: 1;
@@ -51,6 +52,8 @@ export interface ChatMessage {
   toNameSnapshots: string[];
   text: string;
   replyTo?: string;
+  /** Defaults to "inbox" for messages written by older extension versions. */
+  delivery?: MessageDelivery;
   createdAt: string;
 }
 

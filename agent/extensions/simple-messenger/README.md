@@ -7,8 +7,10 @@ A lightweight, project-scoped messenger extension for Pi.
 - join / leave a project-local mesh
 - pick a messenger name and role before joining from `/messenger`
 - show the current agent roster and presence
+- explicitly receive queued messages during an active turn
 - send direct messages
 - broadcast to all agents in the current project
+- steer active agents at Pi's next safe turn boundary
 - optionally configure private idle/working-time warnings for yourself
 - open a prompt-area UI with Agents / Chats tabs
 
@@ -32,6 +34,7 @@ A lightweight, project-scoped messenger extension for Pi.
 - `join`
 - `leave`
 - `status`
+- `check_inbox`
 - `send`
 - `broadcast`
 - `rename`
@@ -49,7 +52,9 @@ A lightweight, project-scoped messenger extension for Pi.
 ```ts
 messenger({ action: "join" })
 messenger({ action: "status" })
+messenger({ action: "check_inbox" })
 messenger({ action: "send", to: "AmberFox", message: "Need src/foo.ts next" })
+messenger({ action: "send", to: "AmberFox", message: "Stop after the active command.", delivery: "steer" })
 messenger({ action: "broadcast", message: "I finished the parser pass." })
 messenger({ action: "warn_me_when_idle", targetName: "AmberFox", minutes: 15 })
 messenger({ action: "warn_me_when_working", targetRole: "implementer", minutes: 45 })
@@ -60,6 +65,28 @@ messenger({
   completely_wipe_recipient_context_before_message: true,
 })
 ```
+
+## Inbox and steering delivery
+
+Normal `send` and `broadcast` calls use `delivery: "inbox"`. The message stays
+queued until the recipient calls `check_inbox` or becomes idle. `check_inbox`
+returns the complete currently queued chat chain directly in its tool result,
+so an active agent can receive updated instructions without ending its task.
+
+Use `delivery: "steer"` only for time-sensitive redirection. A steering message
+is injected after the recipient's current assistant/tool batch, at Pi's next
+safe turn boundary. It does not interrupt a tool that is already running.
+
+The tool result says **queued** and includes message IDs. Queue acceptance does
+not mean that the recipient has read the message.
+
+Agents should call `check_inbox` at natural checkpoints, before beginning a new
+phase, and before assuming earlier instructions are still current.
+
+Acknowledgement-only messages are discouraged by the tool guidance and incoming
+message instructions. Unless acknowledgement was explicitly requested, agents
+should send only substantive findings, questions, blockers, decisions, or
+requested results.
 
 ## Dangerous reset-before-delivery option
 
@@ -108,7 +135,7 @@ Normal incoming direct messages are wrapped like:
 <direct_messenger_message>
   <sender>EchoHill</sender>
   <role>orchestrator</role>
-  <note>To reply, use the messenger tool.</note>
+  <note>A reply is optional. Reply only with substantive information, questions, blockers, decisions, or requested results. Do not send an acknowledgement-only reply unless the sender explicitly requested one.</note>
   <contents>
 Please reply back with this exact dummy message: PING-ECHO-17
   </contents>
@@ -121,7 +148,7 @@ Normal incoming broadcasts are wrapped like:
 <global_messenger_broadcast>
   <sender>EchoHill</sender>
   <role>orchestrator</role>
-  <note>To reply, use the messenger tool.</note>
+  <note>A reply is optional. Reply only with substantive information, questions, blockers, decisions, or requested results. Do not send an acknowledgement-only reply unless the sender explicitly requested one.</note>
   <contents>
 Stop editing shared headers now.
   </contents>
@@ -164,3 +191,11 @@ Create `~/.pi/agent/messenger.json` or `.pi/messenger.json`:
 ## Recommended cleanup
 
 If you are replacing `pi-messenger`, remove it from `~/.pi/agent/settings.json` packages.
+
+## Tests
+
+From the `~/.pi` repository root:
+
+```sh
+bun test ./agent/extensions/simple-messenger/*.test.ts
+```

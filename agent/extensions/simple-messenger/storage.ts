@@ -328,6 +328,10 @@ export function consumeInbox(project: ProjectInfo, sessionId: string): { item: I
   return entries;
 }
 
+export function countPendingInboxMessages(project: ProjectInfo, sessionId: string): number {
+  return consumeInbox(project, sessionId).filter((entry) => !("controlType" in entry.item)).length;
+}
+
 export function removeInboxMessage(path: string): void {
   safeUnlink(path);
 }
