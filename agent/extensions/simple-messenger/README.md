@@ -82,6 +82,9 @@ not mean that the recipient has read the message.
 
 Agents should call `check_inbox` at natural checkpoints, before beginning a new
 phase, and before assuming earlier instructions are still current.
+They should not sleep, repeatedly poll messenger status, or wait on an unrelated
+background process solely to await coordination. Continue useful independent
+work and call `check_inbox` between phases instead.
 
 Acknowledgement-only messages are discouraged by the tool guidance and incoming
 message instructions. Unless acknowledgement was explicitly requested, agents
