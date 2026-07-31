@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { loadConfig, matchesPathPattern } from "./config.js";
@@ -110,6 +111,197 @@ type ToolParamsType = {
 };
 
 type LatestCtx = ExtensionContext | null;
+
+interface MessengerRenderDetails {
+  title?: string;
+  kind?: "direct" | "broadcast";
+  from?: string;
+  fromRole?: string;
+  replyTo?: string;
+  createdAt?: string;
+  rawMessageText?: string;
+  delivery?: MessageDelivery;
+}
+
+interface MessengerBatchItem extends MessengerRenderDetails {
+  id?: string;
+}
+
+interface MessengerBatchDetails {
+  title?: string;
+  count?: number;
+  ordered?: string;
+  messages?: MessengerBatchItem[];
+}
+
+interface MessageRenderOptions {
+  expanded?: boolean;
+  outputPad?: number;
+}
+
+interface RenderableMessage {
+  content: unknown;
+  details?: unknown;
+}
+
+function renderDetails(value: unknown): MessengerRenderDetails {
+  if (!value || typeof value !== "object") return {};
+  return value as MessengerRenderDetails;
+}
+
+function renderBatchDetails(value: unknown): MessengerBatchDetails {
+  if (!value || typeof value !== "object") return {};
+  const details = value as MessengerBatchDetails;
+  return {
+    ...details,
+    messages: Array.isArray(details.messages)
+      ? details.messages.filter((item): item is MessengerBatchItem => !!item && typeof item === "object")
+      : undefined,
+  };
+}
+
+function contentText(content: unknown): string {
+  return typeof content === "string" ? content : String(content ?? "");
+}
+
+function xmlTag(content: string, tag: string): string | undefined {
+  const match = content.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i"));
+  return match?.[1]?.trim() || undefined;
+}
+
+/**
+ * The XML in message.content is deliberately kept for the model. It is not a
+ * useful representation for a person reading the transcript, though. Prefer
+ * the exact text kept in details and retain this parser for older messages
+ * whose details did not include rawMessageText.
+ */
+function displayMessageText(message: RenderableMessage, details: MessengerRenderDetails): string {
+  const raw = details.rawMessageText?.trim();
+  if (raw) return raw;
+
+  const content = contentText(message.content);
+  const contents = xmlTag(content, "contents");
+  return contents ?? content.trim();
+}
+
+function displayMessageKind(details: MessengerRenderDetails, content: string): "direct" | "broadcast" {
+  if (details.kind === "broadcast") return "broadcast";
+  if (details.kind === "direct") return "direct";
+  if (details.title?.toLowerCase().includes("broadcast")) return "broadcast";
+  return content.includes("<global_messenger_broadcast>") ? "broadcast" : "direct";
+}
+
+function displaySender(details: MessengerRenderDetails, content: string): string {
+  return details.from?.trim() || xmlTag(content, "sender") || "Unknown agent";
+}
+
+function displayRole(details: MessengerRenderDetails, content: string): string {
+  return details.fromRole?.trim() || xmlTag(content, "role") || "agent";
+}
+
+function displayReplyTo(details: MessengerRenderDetails, content: string): string | undefined {
+  return details.replyTo?.trim() || xmlTag(content, "reply_to");
+}
+
+function displayTime(createdAt: string | undefined): string {
+  return createdAt && Number.isFinite(Date.parse(createdAt)) ? formatRelativeTime(createdAt) : "just now";
+}
+
+function messageLabel(kind: "direct" | "broadcast"): string {
+  return kind === "broadcast" ? "Broadcast" : "Direct message";
+}
+
+function messageIcon(kind: "direct" | "broadcast"): string {
+  return kind === "broadcast" ? "◇" : "✉";
+}
+
+function addMessageBody(box: Box, body: string, markdownTheme: ReturnType<typeof getMarkdownTheme>): void {
+  box.addChild(new Markdown(body || "(empty message)", 0, 1, markdownTheme));
+}
+
+function renderMessengerMessage(
+  message: RenderableMessage,
+  options: MessageRenderOptions,
+  theme: Theme,
+): Box {
+  const details = renderDetails(message.details);
+  const content = contentText(message.content);
+  const kind = displayMessageKind(details, content);
+  const sender = displaySender(details, content);
+  const role = displayRole(details, content);
+  const replyTo = displayReplyTo(details, content);
+  const delivery = details.delivery === "steer" ? theme.fg("warning", " priority") : "";
+  const box = new Box(options.outputPad ?? 1, 1, (text) => theme.bg("customMessageBg", text));
+
+  box.addChild(new Text(
+    `${theme.fg("accent", `${messageIcon(kind)} ${theme.bold(messageLabel(kind))}`)}  ${theme.fg("text", `${sender} (${role})`)}${delivery}`,
+    0,
+    0,
+  ));
+  box.addChild(new Text(theme.fg("dim", `${displayTime(details.createdAt)}${replyTo ? ` · reply to ${replyTo.slice(0, 8)}` : ""}`), 0, 0));
+  addMessageBody(box, displayMessageText(message, details), getMarkdownTheme());
+
+  return box;
+}
+
+function parsedBatchItems(content: string): MessengerBatchItem[] {
+  const matches = content.matchAll(/<pending_message[^>]*>([\s\S]*?)<\/pending_message>/gi);
+  return [...matches].map((match) => {
+    const block = match[1] ?? "";
+    const type = xmlTag(block, "type");
+    return {
+      kind: type?.includes("broadcast") ? "broadcast" : "direct",
+      from: xmlTag(block, "sender"),
+      fromRole: xmlTag(block, "role"),
+      createdAt: xmlTag(block, "created_at"),
+      replyTo: xmlTag(block, "reply_to"),
+      rawMessageText: xmlTag(block, "contents"),
+    };
+  });
+}
+
+function renderMessengerBatch(
+  message: RenderableMessage,
+  options: MessageRenderOptions,
+  theme: Theme,
+): Box {
+  const details = renderBatchDetails(message.details);
+  const content = contentText(message.content);
+  const items = details.messages?.length ? details.messages : parsedBatchItems(content);
+  const box = new Box(options.outputPad ?? 1, 1, (text) => theme.bg("customMessageBg", text));
+  const count = details.count ?? items.length;
+  const markdownTheme = getMarkdownTheme();
+
+  box.addChild(new Text(
+    theme.fg("accent", `${messageIcon("direct")} ${theme.bold(`${count} messenger messages`)}`),
+    0,
+    0,
+  ));
+  box.addChild(new Text(theme.fg("dim", details.ordered === "oldest_to_most_recent" ? "oldest first" : "pending messages"), 0, 0));
+
+  if (items.length === 0) {
+    addMessageBody(box, displayMessageText(message, {}), markdownTheme);
+    return box;
+  }
+
+  for (const [index, item] of items.entries()) {
+    const itemContent = item.rawMessageText ?? "";
+    const itemKind = item.kind ?? "direct";
+    const sender = item.from ?? "Unknown agent";
+    const role = item.fromRole ?? "agent";
+    const replyTo = item.replyTo;
+    const prefix = index === 0 ? "" : "\n";
+    box.addChild(new Text(
+      `${prefix}${theme.fg("muted", `${index + 1}.`)} ${theme.fg("accent", `${messageIcon(itemKind)} ${messageLabel(itemKind)}`)}  ${theme.fg("text", `${sender} (${role})`)}${item.delivery === "steer" ? theme.fg("warning", " priority") : ""}`,
+      0,
+      0,
+    ));
+    box.addChild(new Text(theme.fg("dim", `${displayTime(item.createdAt)}${replyTo ? ` · reply to ${replyTo.slice(0, 8)}` : ""}`), 2, 0));
+    addMessageBody(box, itemContent || content, markdownTheme);
+  }
+
+  return box;
+}
 
 function result(text: string, details: Record<string, unknown>) {
   return {
@@ -507,6 +699,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
           count: messages.length,
           ordered: "oldest_to_most_recent",
           messages: messages.map((message) => ({
+            id: message.id,
             kind: message.kind,
             from: message.fromNameSnapshot,
             fromRole: message.fromRoleSnapshot,
@@ -1274,34 +1467,32 @@ export default function simpleMessenger(pi: ExtensionAPI) {
     }
   }
 
-  pi.registerMessageRenderer("messenger_message", (message, _options, theme) => {
-    const details = (message.details ?? {}) as {
-      title?: string;
-      from?: string;
-      fromRole?: string;
-      replyTo?: string;
-      createdAt?: string;
-    };
-    const labelColor = "accent";
-    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-    const heading = details.title ?? `Message from agent ${details.from ?? "unknown"}${details.fromRole ? ` (${details.fromRole})` : ""}`;
-    const meta = [
-      theme.fg(labelColor, heading),
-      details.createdAt ? theme.fg("dim", ` (${formatRelativeTime(details.createdAt)})`) : "",
-      details.replyTo ? theme.fg("dim", `\n↳ reply to ${details.replyTo.slice(0, 8)}`) : "",
-    ].join("");
-    box.addChild(new Text(`${meta}\n${String(message.content)}`, 0, 0));
-    return box;
+  pi.registerMessageRenderer("messenger_message", (message, options, theme) => {
+    return renderMessengerMessage(message, options, theme);
   });
 
-  pi.registerMessageRenderer("messenger_idle_alert", (message, _options, theme) => {
+  pi.registerMessageRenderer("messenger_message_batch", (message, options, theme) => {
+    return renderMessengerBatch(message, options, theme);
+  });
+
+  pi.registerMessageRenderer("messenger_idle_alert", (message, options, theme) => {
     const details = (message.details ?? {}) as { targetName?: string; targetRole?: string; idleFor?: string; afterMinutes?: number; watchFor?: PresenceState };
-    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    const box = new Box(options.outputPad ?? 1, 1, (text) => theme.bg("customMessageBg", text));
     const watchFor = details.watchFor === "working" ? "working" : "idle";
-    const heading = `${watchFor === "working" ? "Working-time warning" : "Idle warning"}${details.targetName ? ` — ${details.targetName}` : ""}${details.targetRole ? ` (${details.targetRole})` : ""}`;
-    const meta = theme.fg("warning", heading);
-    const body = theme.fg("dim", details.idleFor ? `${watchFor} for ${details.idleFor} · threshold ${details.afterMinutes}m` : String(message.content));
-    box.addChild(new Text(`${meta}\n${body}\n${String(message.content)}`, 0, 0));
+    const icon = watchFor === "working" ? "◷" : "⚠";
+    const heading = `${icon} ${watchFor === "working" ? "Working-time warning" : "Idle warning"}`;
+    const target = details.targetName
+      ? `${details.targetName}${details.targetRole ? ` (${details.targetRole})` : ""}`
+      : details.targetRole
+        ? `role: ${details.targetRole}`
+        : "agent";
+    box.addChild(new Text(`${theme.fg("warning", theme.bold(heading))}  ${theme.fg("text", target)}`, 0, 0));
+    if (details.idleFor || details.afterMinutes) {
+      const elapsed = details.idleFor ? `${watchFor} for ${details.idleFor}` : watchFor;
+      const threshold = details.afterMinutes ? ` · threshold ${details.afterMinutes}m` : "";
+      box.addChild(new Text(theme.fg("dim", `${elapsed}${threshold}`), 0, 0));
+    }
+    addMessageBody(box, contentText(message.content), getMarkdownTheme());
     return box;
   });
 
