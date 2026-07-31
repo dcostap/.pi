@@ -1316,7 +1316,7 @@ export default function simpleMessenger(pi: ExtensionAPI) {
       promptSnippet: "Exchange project-scoped messages, check queued inbox messages, and steer active collaborators at safe turn boundaries",
       promptGuidelines: [
         "Use messenger action check_inbox at natural checkpoints during coordinated work, before beginning a new phase, and before assuming earlier instructions are still current.",
-        "Do not sleep, repeatedly poll messenger status, or wait on an unrelated background process solely to await coordination; continue useful independent work and call messenger check_inbox between phases.",
+        "Do not sleep, repeatedly poll messenger status, or wait on an unrelated background process solely to await coordination. Continue only already-assigned work that can proceed independently and call messenger check_inbox at natural checkpoints; if coordination blocks that work, check once and return control instead of inventing, broadening, or starting other work.",
         "Messenger send and broadcast with delivery 'inbox' queue normal messages; delivery 'steer' is only for time-sensitive redirection and reaches an active recipient at Pi's next safe turn boundary, not during a running tool.",
         "Do not send acknowledgement-only messenger messages unless the other sender explicitly requested acknowledgement; send substantive findings, questions, blockers, decisions, or requested results instead.",
         "Do not assume a queued inbox message has been read merely because messenger accepted it.",
