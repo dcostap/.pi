@@ -1,111 +1,49 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { DynamicBorder, getMarkdownTheme, SessionManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import {
+	SessionManager,
+	truncateHead,
+	type ExtensionAPI,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Container, Markdown, Text } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "./_shared/conversation-transcript.ts";
 
 const REVIEW_TOOL_NAME = "launch_review_subagents";
-const GENERIC_TOOL_NAME = "launch_generic_subagents";
-const REVIEW_SESSION_PREFIX = "[Review Subagent]";
-const GENERIC_SESSION_PREFIX = "[Generic Subagent]";
-const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the subagents' conclusions and statements; be discerning, analytical, and self-reliant. You make your own conclusions.";
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-const MAX_SUBAGENT_RETRIES = 4;
-const MAX_SUBAGENT_ATTEMPTS = 1 + MAX_SUBAGENT_RETRIES;
-const SUBAGENT_INITIAL_RETRY_DELAY_MS = 1_000;
-const SUBAGENT_RETRY_DELAY_INCREMENT_MS = 2_000;
-const MAX_LAUNCH_MANIFEST_BYTES = 10 * 1024 * 1024;
+const START_TOOL_NAME = "subagent_start";
+const LIST_TOOL_NAME = "subagent_list";
+const STATUS_TOOL_NAME = "subagent_status";
+const SEND_TOOL_NAME = "subagent_send";
+const WAIT_TOOL_NAME = "subagent_wait";
+const RESULT_TOOL_NAME = "subagent_result";
+const STOP_TOOL_NAME = "subagent_stop";
+
+const MANAGED_CHILD_ENV = "PI_MANAGED_SUBAGENT";
+const PROMPT_CACHE_ENV = "PI_SUBAGENT_PROMPT_CACHE_KEY";
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const CONTEXT_MODES = ["fresh", "transcript", "clone"] as const;
+const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES = 1024 * 1024;
-const MAX_REPORTED_VALIDATION_ERRORS = 50;
-const LIVE_STATUS_WIDTH = "◐ preparing".length;
-const LIVE_CACHE_WIDTH = "CH100.0%".length;
-const LIVE_COST_WIDTH = "$99.999".length;
-const LIVE_CONTEXT_WIDTH = "100.0%/1000k".length;
+const NORMAL_LAUNCH_DETAIL_LIMIT = 10;
+const MAX_CONCURRENT_SUBAGENTS = 8;
+const MAX_RECENT_ACTIVITIES = 5;
+const MAX_RETRIES = 4;
+const RETRY_DELAY_MS = 1_000;
+const MAX_RPC_STDERR_CHARS = 128 * 1024;
+
+const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the reviewers' conclusions. Synthesize their evidence and make your own judgment.";
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-type SubagentKind = "review" | "generic";
-type ContextMode = "fresh" | "transcript" | "clone";
-
-type CommonSubagentParams = {
-	description: string;
-	model?: string;
-	thinking?: ThinkingLevel;
-};
-
-type ReviewerParams = CommonSubagentParams & {
-	focus?: string;
-};
-
-type ReviewLaunchParams = {
-	what_to_review: string;
-	context?: ContextMode;
-	system_prompt?: string;
-	system_prompt_file?: string;
-	reviewers: ReviewerParams[];
-};
-
-type ReviewToolParams = Partial<ReviewLaunchParams> & {
-	input_file?: string;
-};
-
-type GenericSubagentParams = CommonSubagentParams & {
-	assignment?: string;
-};
-
-type GenericLaunchParams = {
-	task: string;
-	context?: ContextMode;
-	system_prompt?: string;
-	system_prompt_file?: string;
-	subagents: GenericSubagentParams[];
-};
-
-type GenericToolParams = Partial<GenericLaunchParams> & {
-	input_file?: string;
-};
-
-type LaunchManifestMetadata = {
-	path: string;
-	sha256: string;
-	bytes: number;
-	entries: number;
-};
-
-type ResolvedLaunchInput<T> = {
-	params?: T;
-	manifest?: LaunchManifestMetadata;
-	errors?: string[];
-};
-
-type ResolvedTask = CommonSubagentParams & {
-	kind: SubagentKind;
-	index: number;
-	sessionName: string;
-	sandboxDir: string;
-	systemPromptPath?: string;
-	systemPromptBytes?: Buffer;
-	systemPromptDisplay?: string;
-	userPrompt: string;
-	mainTask: string;
-	contextMode: ContextMode;
-	conversationTranscript?: string;
-	initialSessionFile?: string;
-	parentSessionFile?: string;
-	promptCacheKey?: string;
-	whatToReview?: string;
-	focus?: string;
-	assignment?: string;
-	modelRef?: string;
-	thinking?: ThinkingLevel;
-};
-
-type SubagentStatus = "preparing" | "starting" | "running" | "thinking" | "tool" | "done" | "error" | "aborted";
+type ContextMode = (typeof CONTEXT_MODES)[number];
+type AgentRuntimeState = "queued" | "starting" | "running" | "stopping" | "cold";
+type RunOutcome = "none" | "completed" | "failed" | "stopped" | "interrupted";
+type DeliveryMode = "steer" | "follow_up";
 
 type UsageStats = {
 	input: number;
@@ -114,518 +52,187 @@ type UsageStats = {
 	cacheWrite: number;
 	cost: number;
 	turns: number;
-	latestCacheHitRate?: number;
 };
 
-type RuntimeState = {
-	kind: SubagentKind;
-	index: number;
+type Activity = {
+	at: number;
+	text: string;
+};
+
+type ActiveTool = {
+	name: string;
 	description: string;
-	sessionName: string;
-	sandboxDir: string;
-	mainTask: string;
-	contextMode: ContextMode;
-	systemPromptDisplay?: string;
-	whatToReview?: string;
+	startedAt: number;
+};
+
+type StartSpec = {
+	title: string;
+	task: string;
+	model: string;
+	thinking: ThinkingLevel;
+	context?: ContextMode;
+	system_prompt?: string;
+	system_prompt_file?: string;
+};
+
+type StartToolParams = Partial<StartSpec> & {
+	input_file?: string;
+};
+
+type ReviewerSpec = {
+	description: string;
 	focus?: string;
-	assignment?: string;
-	modelRef?: string;
-	thinking?: ThinkingLevel;
-	status: SubagentStatus;
-	lastActivity: string;
-	finalAnswer: string;
-	error?: string;
-	sessionFile?: string;
+	model: string;
+	thinking: ThinkingLevel;
+};
+
+type ReviewParams = {
+	what_to_review: string;
+	context?: ContextMode;
+	system_prompt?: string;
+	system_prompt_file?: string;
+	reviewers: ReviewerSpec[];
+};
+
+type ReviewToolParams = Partial<ReviewParams> & {
+	input_file?: string;
+};
+
+type SerializedAgent = {
+	id: string;
+	title: string;
+	task: string;
+	modelRef: string;
+	thinking: ThinkingLevel;
+	contextMode: ContextMode;
+	sessionFile: string;
+	sandboxDir: string;
+	systemPromptPath?: string;
+	promptCacheKey?: string;
+	createdAt: number;
+	runNumber: number;
+};
+
+type AgentRecord = SerializedAgent & {
+	state: AgentRuntimeState;
+	lastOutcome: RunOutcome;
+	currentRunId?: string;
+	currentPrompt?: string;
+	currentTaskSummary?: string;
+	startedAt?: number;
+	updatedAt: number;
+	settledAt?: number;
+	lastObservedAt?: number;
+	activeTools: Map<string, ActiveTool>;
+	recent: Activity[];
+	usage: UsageStats;
 	contextWindow?: number;
 	contextTokens?: number;
-	contextPercent?: number;
-	usage: UsageStats;
+	finalAnswer: string;
+	error?: string;
 	attempt: number;
-	maxAttempts: number;
-	previousErrors: string[];
-	startedAt: number;
-	updatedAt: number;
+	stopRequested: boolean;
+	client?: RpcClient;
+	completion?: Promise<void>;
+	resolveCompletion?: () => void;
+	waiters: number;
+	deliveryPending: boolean;
+	deliveryConsumed: boolean;
 };
 
-type ChildResult = {
-	state: RuntimeState;
-	exitCode: number | null;
+type PreparedAgent = {
+	record: AgentRecord;
+	prompt: string;
 };
 
-type ThemeColor = Parameters<Theme["fg"]>[0];
-type LiveStatPart = { kind: "cache" | "cost" | "context"; text: string; known: boolean };
+type ManagerEvent =
+	| { kind: "changed"; id: string }
+	| { kind: "settled"; id: string };
 
-function cleanText(value: string): string {
-	return value.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
-}
+type LaunchManifestMetadata = {
+	path: string;
+	sha256: string;
+	bytes: number;
+	entries: number;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasOwn(value: Record<string, unknown>, key: string): boolean {
-	return Object.prototype.hasOwnProperty.call(value, key);
-}
-
-function reportValidationErrors(errors: string[]): string[] {
-	if (errors.length <= MAX_REPORTED_VALIDATION_ERRORS) return errors;
-	return [
-		...errors.slice(0, MAX_REPORTED_VALIDATION_ERRORS),
-		`...and ${errors.length - MAX_REPORTED_VALIDATION_ERRORS} more validation error(s)`,
-	];
-}
-
-function validateKnownKeys(value: Record<string, unknown>, allowed: readonly string[], location: string, errors: string[]): void {
-	const allowedSet = new Set(allowed);
-	for (const key of Object.keys(value)) {
-		if (!allowedSet.has(key)) errors.push(`${location}.${key}: unknown property`);
-	}
-}
-
-function validateRequiredString(value: Record<string, unknown>, key: string, location: string, errors: string[]): void {
-	const candidate = value[key];
-	if (typeof candidate !== "string") {
-		errors.push(`${location}.${key}: required non-empty string`);
-		return;
-	}
-	if (!cleanText(candidate)) errors.push(`${location}.${key}: must not be empty`);
-}
-
-function validateOptionalString(value: Record<string, unknown>, key: string, location: string, errors: string[]): void {
-	if (!hasOwn(value, key)) return;
-	const candidate = value[key];
-	if (typeof candidate !== "string") {
-		errors.push(`${location}.${key}: expected string`);
-		return;
-	}
-	if (!cleanText(candidate)) errors.push(`${location}.${key}: must not be empty when provided`);
-}
-
-function validateOptionalContext(value: Record<string, unknown>, location: string, errors: string[]): void {
-	if (!hasOwn(value, "context")) return;
-	if (value.context !== "fresh" && value.context !== "transcript" && value.context !== "clone") {
-		errors.push(`${location}.context: expected one of fresh, transcript, clone`);
-	}
-}
-
-function validateSystemPromptInput(value: Record<string, unknown>, location: string, errors: string[]): void {
-	validateOptionalString(value, "system_prompt", location, errors);
-	validateOptionalString(value, "system_prompt_file", location, errors);
-	if (hasOwn(value, "system_prompt") && hasOwn(value, "system_prompt_file")) {
-		errors.push(`${location}: system_prompt and system_prompt_file are mutually exclusive`);
-	}
-	const hasSystemPrompt = hasOwn(value, "system_prompt") || hasOwn(value, "system_prompt_file");
-	if (hasSystemPrompt && value.context !== undefined && value.context !== "fresh") {
-		errors.push(`${location}: custom system prompts require context to be fresh`);
-	}
-}
-
-function validateCommonSubagentEntry(value: unknown, location: string, extraKey: "focus" | "assignment", errors: string[]): void {
-	if (!isRecord(value)) {
-		errors.push(`${location}: expected object`);
-		return;
-	}
-	validateKnownKeys(value, ["description", extraKey, "model", "thinking"], location, errors);
-	validateRequiredString(value, "description", location, errors);
-	validateOptionalString(value, extraKey, location, errors);
-	validateOptionalString(value, "model", location, errors);
-	if (hasOwn(value, "thinking") && !(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) {
-		errors.push(`${location}.thinking: expected one of ${THINKING_LEVELS.join(", ")}`);
-	}
-}
-
-function validateReviewLaunchRequest(value: unknown, location: string): { params?: ReviewLaunchParams; errors: string[] } {
-	const errors: string[] = [];
-	if (!isRecord(value)) return { errors: [`${location}: expected JSON object`] };
-
-	validateKnownKeys(value, ["what_to_review", "context", "system_prompt", "system_prompt_file", "reviewers"], location, errors);
-	validateRequiredString(value, "what_to_review", location, errors);
-	validateOptionalContext(value, location, errors);
-	validateSystemPromptInput(value, location, errors);
-	if (!Array.isArray(value.reviewers) || value.reviewers.length === 0) {
-		errors.push(`${location}.reviewers: required non-empty array`);
-	} else {
-		value.reviewers.forEach((reviewer, index) => validateCommonSubagentEntry(reviewer, `${location}.reviewers[${index}]`, "focus", errors));
-	}
-
-	return errors.length > 0 ? { errors } : { params: value as unknown as ReviewLaunchParams, errors };
-}
-
-function validateGenericLaunchRequest(value: unknown, location: string): { params?: GenericLaunchParams; errors: string[] } {
-	const errors: string[] = [];
-	if (!isRecord(value)) return { errors: [`${location}: expected JSON object`] };
-
-	validateKnownKeys(value, ["task", "context", "system_prompt", "system_prompt_file", "subagents"], location, errors);
-	validateRequiredString(value, "task", location, errors);
-	validateOptionalContext(value, location, errors);
-	validateSystemPromptInput(value, location, errors);
-	if (!Array.isArray(value.subagents) || value.subagents.length === 0) {
-		errors.push(`${location}.subagents: required non-empty array`);
-	} else {
-		value.subagents.forEach((subagent, index) => validateCommonSubagentEntry(subagent, `${location}.subagents[${index}]`, "assignment", errors));
-	}
-
-	return errors.length > 0 ? { errors } : { params: value as unknown as GenericLaunchParams, errors };
-}
-
-async function readLaunchManifest(inputFile: unknown, cwd: string): Promise<{ value?: unknown; metadata?: LaunchManifestMetadata; errors?: string[] }> {
-	if (typeof inputFile !== "string" || !cleanText(inputFile)) {
-		return { errors: ["input_file: required non-empty string"] };
-	}
-
-	const normalized = cleanText(inputFile).replace(/^@/, "");
-	const resolvedPath = path.resolve(cwd, normalized);
-	let fileStat: Awaited<ReturnType<typeof stat>>;
-	try {
-		fileStat = await stat(resolvedPath);
-	} catch (error) {
-		return { errors: [`input_file: cannot read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-	if (!fileStat.isFile()) return { errors: [`input_file: expected a regular file: ${resolvedPath}`] };
-	if (fileStat.size > MAX_LAUNCH_MANIFEST_BYTES) {
-		return { errors: [`input_file: file is ${fileStat.size} bytes; maximum is ${MAX_LAUNCH_MANIFEST_BYTES} bytes`] };
-	}
-
-	let bytes: Buffer;
-	try {
-		bytes = await readFile(resolvedPath);
-	} catch (error) {
-		return { errors: [`input_file: failed to read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-	if (bytes.byteLength > MAX_LAUNCH_MANIFEST_BYTES) {
-		return { errors: [`input_file: file grew to ${bytes.byteLength} bytes while reading; maximum is ${MAX_LAUNCH_MANIFEST_BYTES} bytes`] };
-	}
-
-	let text: string;
-	try {
-		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-	} catch (error) {
-		return { errors: [`input_file: expected valid UTF-8: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-	if (!text.trim()) return { errors: ["input_file: file is empty"] };
-
-	let value: unknown;
-	try {
-		value = JSON.parse(text);
-	} catch (error) {
-		return { errors: [`input_file: invalid JSON: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-
-	let canonicalPath = resolvedPath;
-	try {
-		canonicalPath = await realpath(resolvedPath);
-	} catch {
-		// The already-read resolved path remains sufficient for diagnostics.
-	}
-	return {
-		value,
-		metadata: {
-			path: canonicalPath,
-			sha256: createHash("sha256").update(bytes).digest("hex"),
-			bytes: bytes.byteLength,
-			entries: 0,
-		},
-	};
-}
-
-async function resolveSystemPromptBytes(
-	params: { system_prompt?: string; system_prompt_file?: string },
-	cwd: string,
-): Promise<{ bytes?: Buffer; errors?: string[] }> {
-	if (params.system_prompt !== undefined) {
-		const bytes = Buffer.from(params.system_prompt, "utf8");
-		if (bytes.byteLength > MAX_SYSTEM_PROMPT_BYTES) {
-			return { errors: [`system_prompt is ${bytes.byteLength} bytes; maximum is ${MAX_SYSTEM_PROMPT_BYTES} bytes`] };
-		}
-		if (params.system_prompt.includes("\u0000")) return { errors: ["system_prompt must not contain NUL characters"] };
-		return { bytes };
-	}
-
-	if (params.system_prompt_file === undefined) return {};
-	const resolvedPath = path.resolve(cwd, params.system_prompt_file);
-	let fileStat: Awaited<ReturnType<typeof stat>>;
-	try {
-		fileStat = await stat(resolvedPath);
-	} catch (error) {
-		return { errors: [`system_prompt_file: cannot read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-	if (!fileStat.isFile()) return { errors: [`system_prompt_file: expected a regular file: ${resolvedPath}`] };
-	if (fileStat.size > MAX_SYSTEM_PROMPT_BYTES) {
-		return { errors: [`system_prompt_file is ${fileStat.size} bytes; maximum is ${MAX_SYSTEM_PROMPT_BYTES} bytes`] };
-	}
-
-	let bytes: Buffer;
-	try {
-		bytes = await readFile(resolvedPath);
-	} catch (error) {
-		return { errors: [`system_prompt_file: failed to read ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-	if (bytes.byteLength > MAX_SYSTEM_PROMPT_BYTES) {
-		return { errors: [`system_prompt_file grew to ${bytes.byteLength} bytes while reading; maximum is ${MAX_SYSTEM_PROMPT_BYTES} bytes`] };
-	}
-
-	let text: string;
-	try {
-		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-	} catch (error) {
-		return { errors: [`system_prompt_file: expected valid UTF-8: ${error instanceof Error ? error.message : String(error)}`] };
-	}
-	if (!text.trim()) return { errors: ["system_prompt_file is empty"] };
-	if (text.includes("\u0000")) return { errors: ["system_prompt_file must not contain NUL characters"] };
-	return { bytes };
-}
-
-async function resolveReviewLaunchInput(params: ReviewToolParams, cwd: string): Promise<ResolvedLaunchInput<ReviewLaunchParams>> {
-	if (!isRecord(params)) return { errors: ["tool input: expected object"] };
-	if (hasOwn(params, "input_file")) {
-		const invocationErrors: string[] = [];
-		validateKnownKeys(params, ["input_file"], "tool input", invocationErrors);
-		if (invocationErrors.length > 0) return { errors: invocationErrors };
-		const loaded = await readLaunchManifest(params.input_file, cwd);
-		if (loaded.errors) return { errors: loaded.errors };
-		if (loaded.metadata && isRecord(loaded.value) && Array.isArray(loaded.value.reviewers)) loaded.metadata.entries = loaded.value.reviewers.length;
-		const validated = validateReviewLaunchRequest(loaded.value, "manifest");
-		return { params: validated.params, manifest: loaded.metadata, errors: validated.errors.length > 0 ? validated.errors : undefined };
-	}
-
-	const validated = validateReviewLaunchRequest(params, "tool input");
-	return { params: validated.params, errors: validated.errors.length > 0 ? validated.errors : undefined };
-}
-
-async function resolveGenericLaunchInput(params: GenericToolParams, cwd: string): Promise<ResolvedLaunchInput<GenericLaunchParams>> {
-	if (!isRecord(params)) return { errors: ["tool input: expected object"] };
-	if (hasOwn(params, "input_file")) {
-		const invocationErrors: string[] = [];
-		validateKnownKeys(params, ["input_file"], "tool input", invocationErrors);
-		if (invocationErrors.length > 0) return { errors: invocationErrors };
-		const loaded = await readLaunchManifest(params.input_file, cwd);
-		if (loaded.errors) return { errors: loaded.errors };
-		if (loaded.metadata && isRecord(loaded.value) && Array.isArray(loaded.value.subagents)) loaded.metadata.entries = loaded.value.subagents.length;
-		const validated = validateGenericLaunchRequest(loaded.value, "manifest");
-		return { params: validated.params, manifest: loaded.metadata, errors: validated.errors.length > 0 ? validated.errors : undefined };
-	}
-
-	const validated = validateGenericLaunchRequest(params, "tool input");
-	return { params: validated.params, errors: validated.errors.length > 0 ? validated.errors : undefined };
+function cleanText(value: string): string {
+	return value.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
 }
 
 function oneLine(value: string, max = 120): string {
 	const text = cleanText(value).replace(/\s+/g, " ");
-	return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+	return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
-function describeSystemPrompt(
-	params: { system_prompt?: string; system_prompt_file?: string },
-	cwd: string,
-	bytes: Buffer | undefined,
-): string | undefined {
-	if (!bytes) return undefined;
-	if (params.system_prompt !== undefined) {
-		return `inline (${bytes.byteLength.toLocaleString("en-US")} bytes)`;
-	}
-	if (params.system_prompt_file !== undefined) {
-		return `file: ${path.resolve(cwd, params.system_prompt_file)} (${bytes.byteLength.toLocaleString("en-US")} bytes)`;
-	}
-	return undefined;
-}
-
-function systemPromptCallSuffix(args: any): string {
-	if (typeof args?.system_prompt === "string") return ` · system prompt: inline (${Buffer.byteLength(args.system_prompt, "utf8").toLocaleString("en-US")} bytes)`;
-	if (typeof args?.system_prompt_file === "string") return ` · system prompt: ${oneLine(args.system_prompt_file, 80)}`;
-	return "";
-}
-
-function sanitizeDescription(value: string): string {
-	const text = cleanText(value).replace(/[\t\r\n]+/g, " ").replace(/\s+/g, " ");
-	return text.slice(0, 96).trim() || "task";
-}
-
-function slugify(value: string): string {
-	const slug = value
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/^-+|-+$/g, "")
-		.slice(0, 48)
-		.replace(/^-+|-+$/g, "");
-	return slug || "subagent";
-}
-
-function formatTokens(count: number): string {
-	if (count < 1000) return String(Math.round(count));
-	const thousands = count / 1000;
-	return thousands < 10 ? `${Number(thousands.toFixed(1))}k` : `${Math.round(thousands)}k`;
-}
-
-function formatExactTokens(count: number): string {
-	return Math.round(count).toLocaleString("en-US");
-}
-
-function totalTokens(usage: UsageStats): number {
-	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-}
-
-function formatCost(cost: number): string {
-	if (cost === 0) return "$0.000000";
-	return `$${cost.toFixed(cost < 0.01 ? 6 : 4)}`;
+function sanitizeTitle(value: string): string {
+	return oneLine(value, 96) || "Subagent";
 }
 
 function formatDuration(ms: number): string {
 	const seconds = Math.max(0, ms) / 1000;
-	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+	if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
 	const minutes = Math.floor(seconds / 60);
-	return `${minutes}m ${(seconds % 60).toFixed(0)}s`;
+	if (minutes < 60) return `${minutes}m ${Math.round(seconds % 60)}s`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h ${minutes % 60}m`;
 }
 
-function countLabel(count: number, singular: string): string {
-	return `${count} ${singular}${count === 1 ? "" : "s"}`;
+function formatTokens(value: number): string {
+	if (value < 1_000) return String(Math.round(value));
+	if (value < 10_000) return `${Number((value / 1_000).toFixed(1))}k`;
+	return `${Math.round(value / 1_000)}k`;
 }
 
-function liveStatParts(state: RuntimeState): LiveStatPart[] {
-	const usage = state.usage;
-	const cacheKnown = usage.latestCacheHitRate !== undefined;
-	const costKnown = usage.turns > 0;
-	const contextKnown = state.contextPercent !== undefined;
-	const contextWindow = (state.contextWindow ?? 0) > 0 ? formatTokens(state.contextWindow!) : "---k";
-	return [
-		{ kind: "cache", text: cacheKnown ? `CH${usage.latestCacheHitRate!.toFixed(1)}%` : "CH??.?%", known: cacheKnown },
-		{ kind: "cost", text: costKnown ? `$${usage.cost.toFixed(3)}` : "$?.???", known: costKnown },
-		{ kind: "context", text: `${contextKnown ? `${state.contextPercent!.toFixed(1)}%` : "??.?%"}/${contextWindow}`, known: contextKnown },
-	];
+function formatCost(value: number): string {
+	return value === 0 ? "$0.000" : `$${value.toFixed(value < 0.01 ? 5 : 3)}`;
 }
 
-function liveStatWidth(kind: LiveStatPart["kind"]): number {
-	if (kind === "cache") return LIVE_CACHE_WIDTH;
-	if (kind === "cost") return LIVE_COST_WIDTH;
-	return LIVE_CONTEXT_WIDTH;
+function totalUsageTokens(usage: UsageStats): number {
+	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
-function formatLiveStats(state: RuntimeState): string {
-	// Detailed token counts remain in the final stats; the live row only keeps
-	// compact, independently separated at-a-glance values. Unknown values keep
-	// their slots so later usage updates do not shift the following columns.
-	return liveStatParts(state).map((part) => part.text.padEnd(liveStatWidth(part.kind))).join(" · ");
-}
-
-function formatContextUsage(state: RuntimeState): string {
-	const contextWindow = state.contextWindow ?? 0;
-	if (contextWindow <= 0) return "";
-	if (state.contextPercent === undefined) return `?/${formatTokens(contextWindow)}`;
-	return `${state.contextPercent.toFixed(1)}%/${formatTokens(contextWindow)}`;
-}
-
-function fitColumn(value: string, width: number): string {
-	const text = value.replace(/\s+/g, " ").trim();
-	if (text.length > width) return `${text.slice(0, Math.max(0, width - 1))}…`;
-	return text.padEnd(width);
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) return reject(new Error("aborted"));
-		let timeout: ReturnType<typeof setTimeout>;
-		const onAbort = () => {
-			clearTimeout(timeout);
-			reject(new Error("aborted"));
-		};
-		timeout = setTimeout(() => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve();
-		}, ms);
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
+function emptyUsage(): UsageStats {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 }
 
 function modelRef(model: Model<any>): string {
 	return `${model.provider}/${model.id}`;
 }
 
-function normalize(value: string): string {
-	return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+function exactModel(ctx: ExtensionContext, raw: string): Model<any> {
+	const requested = cleanText(raw);
+	const slash = requested.indexOf("/");
+	if (slash <= 0 || slash === requested.length - 1) {
+		throw new Error(`Model must be an exact provider/model-id, received: ${JSON.stringify(requested)}`);
+	}
+	const provider = requested.slice(0, slash);
+	const id = requested.slice(slash + 1);
+	const model = ctx.modelRegistry.find(provider, id) as Model<any> | undefined;
+	if (!model || model.provider !== provider || model.id !== id) {
+		throw new Error(`Exact model is unavailable: ${requested}`);
+	}
+	const available = ctx.modelRegistry.getAvailable() as Model<any>[];
+	if (!available.some((candidate) => candidate.provider === provider && candidate.id === id)) {
+		throw new Error(`Exact model is configured but not currently usable (check authentication): ${requested}`);
+	}
+	return model;
 }
 
-function getSupportedThinkingLevels(model: Model<any>): ThinkingLevel[] {
+function supportedThinkingLevels(model: Model<any>): ThinkingLevel[] {
 	if (!model.reasoning) return ["off"];
 	return THINKING_LEVELS.filter((level) => model.thinkingLevelMap?.[level] !== null);
 }
 
-function formatModelCandidate(model: Model<any>): string {
-	const ref = modelRef(model);
-	const levels = getSupportedThinkingLevels(model).join(",");
-	const label = model.name && model.name !== model.id ? ` (${model.name})` : "";
-	return `- ${ref}${label}; thinking: ${levels}`;
-}
-
-function parseModelSpec(raw: string): { query: string; thinking?: ThinkingLevel } {
-	const trimmed = raw.trim();
-	const colon = trimmed.lastIndexOf(":");
-	if (colon > 0) {
-		const suffix = trimmed.slice(colon + 1).trim() as ThinkingLevel;
-		if ((THINKING_LEVELS as readonly string[]).includes(suffix)) {
-			return { query: trimmed.slice(0, colon).trim(), thinking: suffix };
-		}
+function validateThinking(model: Model<any>, thinking: ThinkingLevel): void {
+	const supported = supportedThinkingLevels(model);
+	if (!supported.includes(thinking)) {
+		throw new Error(`${modelRef(model)} does not support thinking level ${thinking}. Supported: ${supported.join(", ")}`);
 	}
-	return { query: trimmed };
-}
-
-function uniqueModels(models: Model<any>[]): Model<any>[] {
-	const seen = new Set<string>();
-	const out: Model<any>[] = [];
-	for (const model of models) {
-		const ref = modelRef(model).toLowerCase();
-		if (seen.has(ref)) continue;
-		seen.add(ref);
-		out.push(model);
-	}
-	return out;
-}
-
-function resolveModelOverride(
-	query: string,
-	availableModels: Model<any>[],
-): { ok: true; model: Model<any> } | { ok: false; message: string } {
-	const q = query.trim();
-	if (!q) return { ok: false, message: "empty model override" };
-
-	const lower = q.toLowerCase();
-	const qNorm = normalize(q);
-	const ref = (model: Model<any>) => modelRef(model);
-	const fields = (model: Model<any>) => [ref(model), model.id, model.name, `${model.provider} ${model.id}`, `${model.provider} ${model.name}`];
-
-	const passes = [
-		(model: Model<any>) => ref(model).toLowerCase() === lower,
-		(model: Model<any>) => model.id.toLowerCase() === lower,
-		(model: Model<any>) => model.name.toLowerCase() === lower,
-		(model: Model<any>) => fields(model).some((field) => normalize(field) === qNorm),
-		(model: Model<any>) => qNorm.length >= 3 && fields(model).some((field) => normalize(field).includes(qNorm)),
-	];
-
-	for (const pass of passes) {
-		const matches = uniqueModels(availableModels.filter(pass));
-		if (matches.length === 1) return { ok: true, model: matches[0]! };
-		if (matches.length > 1) {
-			return {
-				ok: false,
-				message: [`ambiguous model override "${q}" matched ${matches.length} available models:`, ...matches.slice(0, 12).map(formatModelCandidate)].join("\n"),
-			};
-		}
-	}
-
-	return { ok: false, message: `no available model matched override "${q}". Ask the user to clarify, or run \`pi --list-models ${q}\` to inspect available model IDs.` };
-}
-
-function getCurrentModelRef(ctx: ExtensionContext): string | undefined {
-	return ctx.model ? modelRef(ctx.model as Model<any>) : undefined;
-}
-
-function validateRequestedThinking(
-	model: Model<any>,
-	thinking: ThinkingLevel | undefined,
-	explicit: boolean,
-): string | undefined {
-	if (!thinking || !explicit) return undefined;
-	const supported = getSupportedThinkingLevels(model);
-	if (supported.includes(thinking)) return undefined;
-	return `thinking level "${thinking}" is not supported by ${modelRef(model)}. Supported: ${supported.join(", ")}`;
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -634,11 +241,802 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	if (currentScript && !isBunVirtualScript && existsSync(currentScript)) {
 		return { command: process.execPath, args: [currentScript, ...args] };
 	}
-
 	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) return { command: process.execPath, args };
+	if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args };
 	return { command: "pi", args };
+}
+
+function assistantText(message: any): string {
+	if (!message || message.role !== "assistant") return "";
+	if (typeof message.content === "string") return cleanText(message.content);
+	if (!Array.isArray(message.content)) return "";
+	return cleanText(message.content.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n"));
+}
+
+function finalAssistantText(messages: any[]): string {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const text = assistantText(messages[index]);
+		if (text) return text;
+	}
+	return "";
+}
+
+function updateUsage(record: AgentRecord, message: any): void {
+	const usage = message?.usage;
+	if (!usage) return;
+	const input = Number(usage.input || 0);
+	const output = Number(usage.output || 0);
+	const cacheRead = Number(usage.cacheRead || 0);
+	const cacheWrite = Number(usage.cacheWrite || 0);
+	record.usage.input += input;
+	record.usage.output += output;
+	record.usage.cacheRead += cacheRead;
+	record.usage.cacheWrite += cacheWrite;
+	record.usage.cost += Number(usage.cost?.total || 0);
+	record.usage.turns++;
+	const contextTokens = Number(usage.totalTokens || input + output + cacheRead + cacheWrite);
+	if (contextTokens > 0) record.contextTokens = contextTokens;
+}
+
+function compactToolActivity(name: string, args: any): string {
+	if (name === "bash") return `bash — ${oneLine(String(args?.command ?? "command"), 100)}`;
+	if (name === "read") return `read — ${oneLine(String(args?.path ?? args?.file_path ?? "file"), 100)}`;
+	if (name === "write") return `write — ${oneLine(String(args?.path ?? args?.file_path ?? "file"), 100)}`;
+	if (name === "edit" || name === "apply_patch") return `${name} — ${oneLine(String(args?.path ?? args?.file_path ?? "project files"), 100)}`;
+	if (name === "grep") return `grep — ${oneLine(String(args?.pattern ?? "pattern"), 100)}`;
+	if (name === "find" || name === "everything_search") return `${name} — ${oneLine(String(args?.query ?? args?.pattern ?? "search"), 100)}`;
+	return `${name} — ${oneLine(JSON.stringify(args ?? {}), 100)}`;
+}
+
+function addActivity(record: AgentRecord, text: string, at = Date.now()): void {
+	record.lastObservedAt = at;
+	record.updatedAt = at;
+	record.recent.push({ at, text });
+	if (record.recent.length > MAX_RECENT_ACTIVITIES) record.recent.splice(0, record.recent.length - MAX_RECENT_ACTIVITIES);
+}
+
+function currentActivity(record: AgentRecord): string {
+	if (record.activeTools.size > 0) {
+		return [...record.activeTools.values()].map((tool) => tool.description).join("; ");
+	}
+	return record.recent.at(-1)?.text ?? (record.state === "cold" ? `last run ${record.lastOutcome}` : record.state);
+}
+
+function serializeAgent(record: AgentRecord): SerializedAgent {
+	return {
+		id: record.id,
+		title: record.title,
+		task: record.task,
+		modelRef: record.modelRef,
+		thinking: record.thinking,
+		contextMode: record.contextMode,
+		sessionFile: record.sessionFile,
+		sandboxDir: record.sandboxDir,
+		systemPromptPath: record.systemPromptPath,
+		promptCacheKey: record.promptCacheKey,
+		createdAt: record.createdAt,
+		runNumber: record.runNumber,
+	};
+}
+
+function newRecord(serialized: SerializedAgent): AgentRecord {
+	return {
+		...serialized,
+		state: "cold",
+		lastOutcome: "none",
+		updatedAt: serialized.createdAt,
+		activeTools: new Map(),
+		recent: [],
+		usage: emptyUsage(),
+		finalAnswer: "",
+		attempt: 0,
+		stopRequested: false,
+		waiters: 0,
+		deliveryPending: false,
+		deliveryConsumed: false,
+	};
+}
+
+function runMarker(runId: string): string {
+	return `<managed_subagent_run id="${runId}">`;
+}
+
+function wrapRunPrompt(runId: string, prompt: string): string {
+	return `${runMarker(runId)}\n${prompt}\n</managed_subagent_run>`;
+}
+
+function runIdFromText(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	return value.match(/<managed_subagent_run id="([^"]+)">/)?.[1];
+}
+
+function taskSummaryFromRunText(value: string): string {
+	const task = value.match(/<task>\s*([\s\S]*?)\s*<\/task>/)?.[1];
+	if (task) return oneLine(task, 160);
+	return oneLine(value
+		.replace(/^\s*<managed_subagent_run[^>]*>\s*/, "")
+		.replace(/\s*<\/managed_subagent_run>\s*$/, ""), 160);
+}
+
+function messageText(message: any): string {
+	if (typeof message?.content === "string") return message.content;
+	if (!Array.isArray(message?.content)) return "";
+	return message.content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n");
+}
+
+function inspectPersistedRecord(record: AgentRecord): void {
+	try {
+		const manager = SessionManager.open(record.sessionFile);
+		const entries = manager.getBranch();
+		const messages = entries.filter((entry: any) => entry?.type === "message").map((entry: any) => entry.message);
+		let maxRun = record.runNumber;
+		let latestRunId: string | undefined;
+		let latestRunIndex = -1;
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index];
+			if (message?.role === "user") {
+				const id = runIdFromText(messageText(message));
+				const match = id?.match(/-r(\d+)$/);
+				if (match) maxRun = Math.max(maxRun, Number(match[1]));
+				if (id) {
+					latestRunId = id;
+					latestRunIndex = index;
+					record.currentTaskSummary = taskSummaryFromRunText(messageText(message));
+				}
+			}
+			if (message?.role === "assistant") updateUsage(record, message);
+		}
+		record.runNumber = maxRun;
+		record.currentRunId = latestRunId;
+		const lastAssistant = latestRunIndex >= 0
+			? messages.slice(latestRunIndex + 1).reverse().find((message) => message?.role === "assistant")
+			: [...messages].reverse().find((message) => message?.role === "assistant");
+		if (lastAssistant) {
+			if (lastAssistant.stopReason === "error" || lastAssistant.errorMessage) {
+				record.lastOutcome = "failed";
+				record.error = lastAssistant.errorMessage || "assistant error";
+			} else if (lastAssistant.stopReason === "length") {
+				record.lastOutcome = "failed";
+				record.error = "Assistant response stopped at the token limit";
+			} else if (lastAssistant.stopReason !== "stop") {
+				record.lastOutcome = "interrupted";
+				record.error = undefined;
+			} else {
+				record.lastOutcome = "completed";
+				record.finalAnswer = assistantText(lastAssistant);
+			}
+		} else if (latestRunIndex >= 0) {
+			record.lastOutcome = "interrupted";
+		}
+	} catch (error) {
+		record.lastOutcome = "failed";
+		record.error = `Could not open child session: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	record.state = "cold";
+}
+
+class RpcClient {
+	private child: ChildProcessWithoutNullStreams | null = null;
+	private exitPromise?: Promise<number | null>;
+	private buffer = "";
+	private nextId = 1;
+	private pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timeout: ReturnType<typeof setTimeout> }>();
+	stderr = "";
+
+	constructor(
+		private readonly record: AgentRecord,
+		private readonly cwd: string,
+		private readonly onEvent: (event: any) => void,
+	) {}
+
+	start(): void {
+		const args = [
+			"--mode", "rpc",
+			"--session", this.record.sessionFile,
+			"--model", this.record.modelRef,
+			"--thinking", this.record.thinking,
+			"--name", `[Subagent ${this.record.id}] ${this.record.title}`,
+		];
+		if (this.record.systemPromptPath) args.push("--append-system-prompt", this.record.systemPromptPath);
+		const invocation = getPiInvocation(args);
+		this.child = spawn(invocation.command, invocation.args, {
+			cwd: this.cwd,
+			shell: false,
+			stdio: ["pipe", "pipe", "pipe"],
+			env: {
+				...process.env,
+				[MANAGED_CHILD_ENV]: "1",
+				PI_SUBAGENT_SANDBOX: this.record.sandboxDir,
+				[PROMPT_CACHE_ENV]: this.record.promptCacheKey ?? this.record.sessionFile,
+			},
+		});
+		this.child.stdout.on("data", (chunk) => {
+			this.buffer += chunk.toString();
+			let index = this.buffer.indexOf("\n");
+			while (index !== -1) {
+				const line = this.buffer.slice(0, index).trim();
+				this.buffer = this.buffer.slice(index + 1);
+				if (line) this.handleLine(line);
+				index = this.buffer.indexOf("\n");
+			}
+		});
+		this.child.stderr.on("data", (chunk) => {
+			this.stderr += chunk.toString();
+			if (this.stderr.length > MAX_RPC_STDERR_CHARS) this.stderr = this.stderr.slice(-MAX_RPC_STDERR_CHARS);
+		});
+		this.child.stdin.on("error", (error) => { this.rejectPending(error); });
+		this.child.on("error", (error) => {
+			this.rejectPending(error);
+		});
+	}
+
+	async send(type: string, payload: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<any> {
+		const child = this.child;
+		if (!child?.stdin || child.stdin.destroyed || child.stdin.writableEnded || child.exitCode !== null) {
+			throw new Error("Subagent RPC process is not running");
+		}
+		const id = `${this.record.id}-${this.nextId++}`;
+		return await new Promise((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				this.pending.delete(id);
+				reject(new Error(`Timed out waiting for RPC ${type}`));
+			}, timeoutMs);
+			this.pending.set(id, { resolve, reject, timeout });
+			try {
+				child.stdin.write(`${JSON.stringify({ id, type, ...payload })}\n`, (error?: Error | null) => {
+					if (!error) return;
+					this.rejectOne(id, error);
+				});
+			} catch (error) {
+				this.rejectOne(id, error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	waitForExit(): Promise<number | null> {
+		if (this.exitPromise) return this.exitPromise;
+		this.exitPromise = new Promise((resolve) => {
+			if (!this.child) return resolve(null);
+			this.child.once("close", (code) => {
+				if (this.buffer.trim()) this.handleLine(this.buffer.trim());
+				this.rejectPending(new Error(`Subagent exited with code ${code ?? "unknown"}`));
+				resolve(code);
+			});
+		});
+		return this.exitPromise;
+	}
+
+	kill(signal: NodeJS.Signals = "SIGTERM"): void {
+		try { this.child?.kill(signal); } catch {}
+	}
+
+	async terminate(graceMs = 2_000): Promise<void> {
+		this.kill("SIGTERM");
+		const exited = await Promise.race([
+			this.waitForExit().then(() => true),
+			new Promise<boolean>((resolve) => setTimeout(() => resolve(false), graceMs)),
+		]);
+		if (!exited) {
+			this.kill("SIGKILL");
+			await Promise.race([this.waitForExit(), new Promise((resolve) => setTimeout(resolve, 1_000))]);
+		}
+	}
+
+	private handleLine(line: string): void {
+		let parsed: any;
+		try { parsed = JSON.parse(line); } catch { return; }
+		if (parsed?.type === "response" && typeof parsed.id === "string") {
+			const pending = this.pending.get(parsed.id);
+			if (!pending) return;
+			this.pending.delete(parsed.id);
+			clearTimeout(pending.timeout);
+			if (parsed.success) pending.resolve(parsed);
+			else pending.reject(new Error(parsed.error || `RPC ${parsed.command || "command"} failed`));
+			return;
+		}
+		this.onEvent(parsed);
+	}
+
+	private rejectOne(id: string, error: Error): void {
+		const pending = this.pending.get(id);
+		if (!pending) return;
+		this.pending.delete(id);
+		clearTimeout(pending.timeout);
+		pending.reject(error);
+	}
+
+	private rejectPending(error: Error): void {
+		for (const [id] of this.pending) this.rejectOne(id, error);
+	}
+}
+
+class SubagentWaitAbortedError extends Error {
+	constructor() {
+		super("Subagent wait aborted; unfinished subagents are still running");
+		this.name = "SubagentWaitAbortedError";
+	}
+}
+
+class SubagentManager {
+	private readonly records = new Map<string, AgentRecord>();
+	private readonly queue: AgentRecord[] = [];
+	private readonly listeners = new Set<(event: ManagerEvent) => void>();
+	private activeCount = 0;
+	private disposed = false;
+
+	constructor(private readonly cwd: string, private readonly maxConcurrent = MAX_CONCURRENT_SUBAGENTS) {}
+
+	restore(items: SerializedAgent[]): void {
+		for (const item of items) {
+			if (this.records.has(item.id)) continue;
+			const record = newRecord(item);
+			inspectPersistedRecord(record);
+			this.records.set(record.id, record);
+		}
+	}
+
+	add(prepared: PreparedAgent): AgentRecord {
+		this.assertActive();
+		if (this.records.has(prepared.record.id)) throw new Error(`Duplicate subagent ID: ${prepared.record.id}`);
+		const record = prepared.record;
+		record.currentPrompt = prepared.prompt;
+		record.currentTaskSummary = oneLine(record.task, 160);
+		record.state = "queued";
+		record.lastOutcome = "none";
+		record.runNumber++;
+		record.currentRunId = `${record.id}-r${record.runNumber}`;
+		record.completion = new Promise<void>((resolve) => { record.resolveCompletion = resolve; });
+		this.records.set(record.id, record);
+		this.queue.push(record);
+		addActivity(record, "queued");
+		this.emit({ kind: "changed", id: record.id });
+		this.pump();
+		return record;
+	}
+
+	list(): AgentRecord[] {
+		return [...this.records.values()].sort((left, right) => left.createdAt - right.createdAt);
+	}
+
+	get(id: string): AgentRecord {
+		const record = this.records.get(id);
+		if (!record) throw new Error(`Unknown subagent ID: ${id}`);
+		return record;
+	}
+
+	async send(id: string, message: string, delivery: DeliveryMode): Promise<{ record: AgentRecord; continued: boolean }> {
+		this.assertActive();
+		const record = this.get(id);
+		const prompt = cleanText(message);
+		if (!prompt) throw new Error("message must not be empty");
+		if (record.state === "stopping") throw new Error(`${id} is stopping; wait until it is cold before sending another task`);
+		if ((record.state === "running" || record.state === "starting") && record.client) {
+			await record.client.send(delivery === "steer" ? "steer" : "follow_up", { message: prompt });
+			record.currentTaskSummary = oneLine(prompt, 160);
+			addActivity(record, `${delivery === "steer" ? "steering" : "follow-up"} message accepted: ${oneLine(prompt, 90)}`);
+			this.emit({ kind: "changed", id });
+			return { record, continued: false };
+		}
+		if (record.state === "queued") throw new Error(`${id} is queued and has not started; wait for it to begin before sending another task`);
+		record.currentPrompt = prompt;
+		record.currentTaskSummary = oneLine(prompt, 160);
+		record.runNumber++;
+		record.currentRunId = `${record.id}-r${record.runNumber}`;
+		record.state = "queued";
+		record.lastOutcome = "none";
+		record.error = undefined;
+		record.finalAnswer = "";
+		record.stopRequested = false;
+		record.attempt = 0;
+		record.activeTools.clear();
+		record.completion = new Promise<void>((resolve) => { record.resolveCompletion = resolve; });
+		record.deliveryPending = false;
+		record.deliveryConsumed = false;
+		this.queue.push(record);
+		addActivity(record, `continuation queued: ${oneLine(prompt, 90)}`);
+		this.emit({ kind: "changed", id });
+		this.pump();
+		return { record, continued: true };
+	}
+
+	async wait(ids: string[], signal?: AbortSignal, consumeDelivery = true): Promise<AgentRecord[]> {
+		this.assertActive();
+		const records = [...new Set(ids)].map((id) => this.get(id));
+		for (const record of records) record.waiters++;
+		let completed = false;
+		let abortHandler: (() => void) | undefined;
+		const abortPromise = signal ? new Promise<never>((_resolve, reject) => {
+			abortHandler = () => reject(new SubagentWaitAbortedError());
+			signal.addEventListener("abort", abortHandler, { once: true });
+		}) : new Promise<never>(() => {});
+		try {
+			if (signal?.aborted) throw new SubagentWaitAbortedError();
+			await Promise.race([
+				Promise.all(records.map((record) => record.completion ?? Promise.resolve())),
+				abortPromise,
+			]);
+			if (consumeDelivery) {
+				for (const record of records) {
+					record.deliveryConsumed = true;
+					record.deliveryPending = false;
+				}
+			}
+			completed = true;
+			return records;
+		} finally {
+			if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+			for (const record of records) {
+				record.waiters = Math.max(0, record.waiters - 1);
+				if (!completed && record.waiters === 0 && record.state === "cold" && !record.deliveryConsumed) {
+					record.deliveryPending = true;
+					this.emit({ kind: "settled", id: record.id });
+				}
+			}
+		}
+	}
+
+	async stop(ids: string[]): Promise<AgentRecord[]> {
+		const records = [...new Set(ids)].map((id) => this.get(id));
+		await Promise.all(records.map(async (record) => {
+			record.stopRequested = true;
+			record.deliveryConsumed = true;
+			record.deliveryPending = false;
+			if (record.state === "queued") {
+				const index = this.queue.indexOf(record);
+				if (index >= 0) this.queue.splice(index, 1);
+				record.state = "cold";
+				record.lastOutcome = "stopped";
+				record.settledAt = Date.now();
+				addActivity(record, "stopped before launch");
+				record.resolveCompletion?.();
+				record.resolveCompletion = undefined;
+				this.emit({ kind: "settled", id: record.id });
+				return;
+			}
+			if (record.state !== "running" && record.state !== "starting" && record.state !== "stopping") return;
+			record.state = "stopping";
+			addActivity(record, "stop requested");
+			this.emit({ kind: "changed", id: record.id });
+			try { await record.client?.send("abort", {}, 3_000); } catch {}
+			await Promise.race([record.completion ?? Promise.resolve(), new Promise((resolve) => setTimeout(resolve, 3_000))]);
+			if (record.state !== "cold") await record.client?.terminate();
+		}));
+		return records;
+	}
+
+	getDeliverable(): AgentRecord[] {
+		return this.list().filter((record) => record.deliveryPending && !record.deliveryConsumed && record.waiters === 0);
+	}
+
+	markDelivered(ids: string[]): void {
+		for (const id of ids) {
+			const record = this.records.get(id);
+			if (!record) continue;
+			record.deliveryPending = false;
+			record.deliveryConsumed = true;
+		}
+	}
+
+	subscribe(listener: (event: ManagerEvent) => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	async dispose(): Promise<void> {
+		if (this.disposed) return;
+		this.disposed = true;
+		const active = this.list().filter((record) => record.state === "running" || record.state === "starting" || record.state === "queued" || record.state === "stopping");
+		await this.stop(active.map((record) => record.id)).catch(() => {});
+		await Promise.all(active.map((record) => record.client?.terminate().catch(() => {})));
+		this.listeners.clear();
+	}
+
+	private pump(): void {
+		queueMicrotask(() => {
+			while (!this.disposed && this.activeCount < this.maxConcurrent && this.queue.length > 0) {
+				const record = this.queue.shift()!;
+				if (record.stopRequested || record.state !== "queued") continue;
+				this.activeCount++;
+				void this.run(record).finally(() => {
+					this.activeCount--;
+					this.pump();
+				});
+			}
+		});
+	}
+
+	private async run(record: AgentRecord): Promise<void> {
+		let terminalError: string | undefined;
+		for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+			record.attempt = attempt;
+			record.state = "starting";
+			record.startedAt ??= Date.now();
+			addActivity(record, attempt === 1 ? "starting Pi RPC session" : `retrying, attempt ${attempt}/${MAX_RETRIES + 1}`);
+			this.emit({ kind: "changed", id: record.id });
+			let attemptUsedTool = false;
+			let resolveSettled!: () => void;
+			const settledPromise = new Promise<void>((resolve) => { resolveSettled = resolve; });
+			const client = new RpcClient(record, this.cwd, (event) => {
+				if (event.type === "tool_execution_start") attemptUsedTool = true;
+				this.applyEvent(record, event);
+				if (event.type === "agent_settled") {
+					resolveSettled();
+				}
+				this.emit({ kind: "changed", id: record.id });
+			});
+			record.client = client;
+			try {
+				client.start();
+				const exitPromise = client.waitForExit();
+				const prompt = wrapRunPrompt(record.currentRunId!, record.currentPrompt!);
+				await client.send("prompt", { message: prompt });
+				record.state = "running";
+				addActivity(record, "task accepted");
+				this.emit({ kind: "changed", id: record.id });
+				try {
+					const stateResponse = await client.send("get_state", {}, 5_000);
+					if (typeof stateResponse?.data?.model?.contextWindow === "number") record.contextWindow = stateResponse.data.model.contextWindow;
+				} catch {}
+				const winner = await Promise.race([settledPromise.then(() => "settled" as const), exitPromise.then(() => "exit" as const)]);
+				if (winner === "settled") {
+					await client.terminate();
+					if (!record.stopRequested && !attemptUsedTool && isTransientFailure(record.error) && attempt <= MAX_RETRIES) {
+						terminalError = record.error;
+						record.error = undefined;
+						await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+						continue;
+					}
+					terminalError = undefined;
+					break;
+				}
+				const exitCode = await exitPromise;
+				terminalError = client.stderr.trim() || `Subagent exited before settling with code ${exitCode ?? "unknown"}`;
+			} catch (error) {
+				terminalError = error instanceof Error ? error.message : String(error);
+				await client.terminate().catch(() => {});
+			}
+			if (record.stopRequested) break;
+			if (attemptUsedTool || !isTransientFailure(terminalError) || attempt > MAX_RETRIES) break;
+			await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+		}
+		record.client = undefined;
+		record.activeTools.clear();
+		record.state = "cold";
+		record.settledAt = Date.now();
+		if (record.stopRequested) {
+			record.lastOutcome = "stopped";
+			record.error = undefined;
+			addActivity(record, "stopped");
+		} else if (terminalError) {
+			record.lastOutcome = "failed";
+			record.error = terminalError;
+			addActivity(record, `failed: ${oneLine(terminalError, 120)}`);
+		} else if (record.error) {
+			record.lastOutcome = "failed";
+			addActivity(record, `failed: ${oneLine(record.error, 120)}`);
+		} else {
+			record.lastOutcome = "completed";
+			addActivity(record, "completed");
+		}
+		record.deliveryPending = record.waiters === 0 && !record.deliveryConsumed;
+		record.resolveCompletion?.();
+		record.resolveCompletion = undefined;
+		this.emit({ kind: "settled", id: record.id });
+	}
+
+	private applyEvent(record: AgentRecord, event: any): void {
+		const now = Date.now();
+		record.updatedAt = now;
+		record.lastObservedAt = now;
+		if (event.type === "agent_start") {
+			record.state = "running";
+			addActivity(record, "agent running", now);
+			return;
+		}
+		if (event.type === "tool_execution_start") {
+			const description = compactToolActivity(event.toolName, event.args);
+			record.activeTools.set(event.toolCallId, { name: event.toolName, description, startedAt: now });
+			addActivity(record, description, now);
+			return;
+		}
+		if (event.type === "tool_execution_end") {
+			const active = record.activeTools.get(event.toolCallId);
+			record.activeTools.delete(event.toolCallId);
+			if (active) addActivity(record, `${active.name} ${event.isError ? "failed" : "finished"}`, now);
+			return;
+		}
+		if (event.type === "message_update") {
+			const type = event.assistantMessageEvent?.type;
+			if (type === "thinking_start") addActivity(record, "thinking", now);
+			else if (type === "text_start") addActivity(record, "writing response", now);
+			return;
+		}
+		if (event.type === "message_end" && event.message?.role === "assistant") {
+			updateUsage(record, event.message);
+			const text = assistantText(event.message);
+			if (text) record.finalAnswer = text;
+			if (event.message.stopReason === "error" || event.message.errorMessage) record.error = event.message.errorMessage || "assistant error";
+			else if (event.message.stopReason === "length") record.error = "Assistant response stopped at the token limit";
+			return;
+		}
+		if (event.type === "agent_end") {
+			const text = finalAssistantText(event.messages || []);
+			if (text) record.finalAnswer = text;
+		}
+	}
+
+	private emit(event: ManagerEvent): void {
+		for (const listener of [...this.listeners]) {
+			try { listener(event); } catch {}
+		}
+	}
+
+	private assertActive(): void {
+		if (this.disposed) throw new Error("Subagent manager is shutting down");
+	}
+}
+
+function isTransientFailure(message: string | undefined): boolean {
+	if (!message) return false;
+	return /WebSocket closed|provider_transport_failure|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network|stream closed|connection closed|timed out/i.test(message);
+}
+
+function validateStartSpec(value: unknown, location: string): string[] {
+	const errors: string[] = [];
+	if (!isRecord(value)) return [`${location}: expected object`];
+	const allowed = new Set(["title", "task", "model", "thinking", "context", "system_prompt", "system_prompt_file"]);
+	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
+	for (const key of ["title", "task", "model"] as const) {
+		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
+	}
+	if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) errors.push(`${location}.thinking: required; expected one of ${THINKING_LEVELS.join(", ")}`);
+	if (value.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(value.context)) errors.push(`${location}.context: expected one of ${CONTEXT_MODES.join(", ")}`);
+	if (value.system_prompt !== undefined && (typeof value.system_prompt !== "string" || !cleanText(value.system_prompt))) errors.push(`${location}.system_prompt: expected non-empty string`);
+	if (value.system_prompt_file !== undefined && (typeof value.system_prompt_file !== "string" || !cleanText(value.system_prompt_file))) errors.push(`${location}.system_prompt_file: expected non-empty string`);
+	if (value.system_prompt !== undefined && value.system_prompt_file !== undefined) errors.push(`${location}: system_prompt and system_prompt_file are mutually exclusive`);
+	if ((value.system_prompt !== undefined || value.system_prompt_file !== undefined) && value.context !== undefined && value.context !== "fresh") errors.push(`${location}: custom system prompts require fresh context`);
+	return errors;
+}
+
+async function readJsonFile(inputFile: string, cwd: string): Promise<{ value: unknown; metadata: LaunchManifestMetadata }> {
+	const resolved = path.resolve(cwd, inputFile.replace(/^@/, ""));
+	const info = await stat(resolved);
+	if (!info.isFile()) throw new Error(`Expected a regular file: ${resolved}`);
+	if (info.size > MAX_MANIFEST_BYTES) throw new Error(`Input file exceeds ${MAX_MANIFEST_BYTES} bytes: ${resolved}`);
+	const bytes = await readFile(resolved);
+	if (bytes.byteLength > MAX_MANIFEST_BYTES) throw new Error(`Input file grew beyond ${MAX_MANIFEST_BYTES} bytes while reading`);
+	const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	const value = JSON.parse(text);
+	let canonical = resolved;
+	try { canonical = await realpath(resolved); } catch {}
+	return {
+		value,
+		metadata: { path: canonical, sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.byteLength, entries: Array.isArray(value) ? value.length : 0 },
+	};
+}
+
+async function resolveStartSpecs(params: StartToolParams, cwd: string): Promise<{ specs: StartSpec[]; manifest?: LaunchManifestMetadata }> {
+	if (!isRecord(params)) throw new Error("Tool input must be an object");
+	if (Object.hasOwn(params, "input_file")) {
+		if (Object.keys(params).some((key) => key !== "input_file")) throw new Error("input_file must be supplied by itself");
+		if (typeof params.input_file !== "string" || !cleanText(params.input_file)) throw new Error("input_file is required and must be non-empty");
+		const loaded = await readJsonFile(params.input_file, cwd);
+		if (!Array.isArray(loaded.value) || loaded.value.length === 0) throw new Error("Start manifest must be a non-empty JSON array of normal subagent_start requests");
+		const errors = loaded.value.flatMap((value, index) => validateStartSpec(value, `manifest[${index}]`));
+		if (errors.length > 0) throw new Error(errors.slice(0, 50).join("\n"));
+		return { specs: loaded.value as StartSpec[], manifest: loaded.metadata };
+	}
+	const errors = validateStartSpec(params, "tool input");
+	if (errors.length > 0) throw new Error(errors.join("\n"));
+	return { specs: [params as StartSpec] };
+}
+
+async function readSystemPrompt(spec: Pick<StartSpec, "system_prompt" | "system_prompt_file">, cwd: string): Promise<Buffer | undefined> {
+	if (spec.system_prompt !== undefined) {
+		const bytes = Buffer.from(spec.system_prompt, "utf8");
+		if (bytes.byteLength > MAX_SYSTEM_PROMPT_BYTES) throw new Error(`system_prompt exceeds ${MAX_SYSTEM_PROMPT_BYTES} bytes`);
+		return bytes;
+	}
+	if (!spec.system_prompt_file) return undefined;
+	const resolved = path.resolve(cwd, spec.system_prompt_file);
+	const info = await stat(resolved);
+	if (!info.isFile()) throw new Error(`system_prompt_file is not a regular file: ${resolved}`);
+	if (info.size > MAX_SYSTEM_PROMPT_BYTES) throw new Error(`system_prompt_file exceeds ${MAX_SYSTEM_PROMPT_BYTES} bytes`);
+	const bytes = await readFile(resolved);
+	new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	return bytes;
+}
+
+function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): string {
+	const sourceSessionFile = ctx.sessionManager.getSessionFile();
+	if (!ctx.sessionManager.isPersisted() || !sourceSessionFile) throw new Error("clone context requires a persisted parent session");
+	const branch = ctx.sessionManager.getBranch();
+	let latestUserIndex = -1;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry: any = branch[index];
+		if (entry?.type === "message" && entry.message?.role === "user") { latestUserIndex = index; break; }
+	}
+	if (latestUserIndex < 0) throw new Error("clone context could not find the current user message");
+	const cloneLeafId = (branch[latestUserIndex - 1] as any)?.id;
+	const source = SessionManager.open(sourceSessionFile, ctx.sessionManager.getSessionDir());
+	if (!cloneLeafId) {
+		const manager = (SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession: sourceSessionFile }) as SessionManager;
+		return manager.getSessionFile()!;
+	}
+	const cloned = source.createBranchedSession(cloneLeafId);
+	if (!cloned) throw new Error("failed to create cloned subagent session");
+	return cloned;
+}
+
+async function prepareAgent(
+	spec: StartSpec,
+	ctx: ExtensionContext,
+	promptBuilder: (task: string, sandboxDir: string, transcript?: string) => string,
+	idPrefix = "sa",
+): Promise<PreparedAgent> {
+	const model = exactModel(ctx, spec.model);
+	validateThinking(model, spec.thinking);
+	const contextMode = spec.context ?? "fresh";
+	const id = `${idPrefix}-${randomUUID().slice(0, 8)}`;
+	const sandboxDir = path.join(tmpdir(), "pi-subagents", id);
+	let sessionFile: string | undefined;
+	try {
+		await mkdir(sandboxDir, { recursive: true });
+		const systemPromptBytes = await readSystemPrompt(spec, ctx.cwd);
+		const systemPromptPath = systemPromptBytes ? path.join(sandboxDir, "SUBAGENT_SYSTEM_PROMPT.md") : undefined;
+		if (systemPromptPath) await writeFile(systemPromptPath, systemPromptBytes!);
+		const parentSession = ctx.sessionManager.isPersisted() ? ctx.sessionManager.getSessionFile() : undefined;
+		sessionFile = contextMode === "clone"
+			? createClonedSessionBeforeLatestUser(ctx)
+			: ((SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession }) as SessionManager).getSessionFile()!;
+		const childSession = SessionManager.open(sessionFile, ctx.sessionManager.getSessionDir());
+		childSession.appendSessionInfo(`[Subagent ${id}] ${sanitizeTitle(spec.title)}`);
+		const transcript = contextMode === "transcript" ? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text : undefined;
+		if (contextMode === "transcript" && !transcript) throw new Error("transcript context was requested, but there is no completed parent conversation before the current turn");
+		const serialized: SerializedAgent = {
+			id,
+			title: sanitizeTitle(spec.title),
+			task: cleanText(spec.task),
+			modelRef: modelRef(model),
+			thinking: spec.thinking,
+			contextMode,
+			sessionFile,
+			sandboxDir,
+			systemPromptPath,
+			promptCacheKey: contextMode === "clone" ? ctx.sessionManager.getSessionId() : undefined,
+			createdAt: Date.now(),
+			runNumber: 0,
+		};
+		return { record: newRecord(serialized), prompt: promptBuilder(serialized.task, sandboxDir, transcript) };
+	} catch (error) {
+		await Promise.all([
+			rm(sandboxDir, { recursive: true, force: true }).catch(() => {}),
+			sessionFile ? unlink(sessionFile).catch(() => {}) : Promise.resolve(),
+		]);
+		throw error;
+	}
+}
+
+async function cleanupPreparedAgents(prepared: PreparedAgent[]): Promise<void> {
+	await Promise.all(prepared.flatMap(({ record }) => [
+		rm(record.sandboxDir, { recursive: true, force: true }).catch(() => {}),
+		unlink(record.sessionFile).catch(() => {}),
+	]));
+}
+
+function genericPrompt(task: string, sandboxDir: string, transcript?: string): string {
+	return [
+		transcript ? `<main_session_transcript>\n${transcript}\n</main_session_transcript>\n` : "",
+		"You are a managed Pi subagent. Complete the assigned task independently.",
+		`Your scratch sandbox is: ${sandboxDir}`,
+		"Use the sandbox for temporary files. Do not treat the project cwd as scratch space.",
+		"Do not make durable project changes unless the task explicitly asks for them.",
+		"Return a concise, self-contained final answer. The parent can continue this same session later if follow-up context is useful.",
+		"",
+		"<task>",
+		task,
+		"</task>",
+	].filter(Boolean).join("\n");
 }
 
 const REVIEW_RUBRIC = `# Review Guidelines
@@ -748,1197 +1146,618 @@ Possible callouts:
 - Do not stop at the first issue; report every qualifying finding.
 `;
 
-function buildReviewSubagentInstructions(task: ResolvedTask, cwd: string): string {
+function reviewPrompt(target: string, focus: string | undefined, sandboxDir: string, transcript?: string): string {
 	return [
-		"You are a Pi code review subagent launched by the main agent.",
-		"You are working from the same cwd as the main agent:",
-		cwd,
+		transcript ? `<main_session_transcript>\n${transcript}\n</main_session_transcript>\n` : "",
+		"You are a managed Pi code review subagent.",
+		`Your scratch sandbox is: ${sandboxDir}`,
+		"Do not make durable project changes. This is review only.",
+		"Inspect the complete relevant code before reaching conclusions.",
 		"",
-		"Your scratch sandbox is:",
-		task.sandboxDir,
+		"<review_rubric>", REVIEW_RUBRIC, "</review_rubric>",
 		"",
-		"You may freely create, edit, run, and inspect temporary scripts/files inside that sandbox.",
-		"Prefer the sandbox for scratch work, experiments, temporary logs, and throwaway scripts.",
-		"Do not treat the project cwd itself as scratch space.",
-		"Do not make durable project changes. This is code review only.",
-		"If you believe a durable project change is necessary, explain that recommendation in your final answer instead of doing it.",
-		"",
-		"Perform an independent code review of the assigned code review target. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
-	].join("\n");
+		"<review_target>", target, "</review_target>",
+		focus ? `\n<neutral_focus>\n${focus}\n</neutral_focus>` : "",
+	].filter(Boolean).join("\n");
 }
 
-function buildGenericSubagentInstructions(task: ResolvedTask, cwd: string): string {
-	return [
-		"You are a Pi generic subagent launched by the main agent.",
-		"You are working from the same cwd as the main agent:",
-		cwd,
-		"",
-		"Your scratch sandbox is:",
-		task.sandboxDir,
-		"",
-		"Use the sandbox for scratch work, experiments, temporary logs, and throwaway scripts.",
-		"Do not treat the project cwd itself as scratch space.",
-		"Do not make durable project changes unless the task explicitly asks you to modify project files.",
-		"",
-		"Complete the assigned task independently. Your final assistant answer is the only content that will be returned to the main agent, so make it self-contained and useful.",
-	].join("\n");
-}
-
-function subagentRetryDelayMs(completedAttempt: number): number {
-	return SUBAGENT_INITIAL_RETRY_DELAY_MS + (completedAttempt - 1) * SUBAGENT_RETRY_DELAY_INCREMENT_MS;
-}
-
-function buildTranscriptPromptSection(task: ResolvedTask): string[] {
-	if (task.contextMode !== "transcript" || !task.conversationTranscript) return [];
-	return [
-		"<main_session_transcript>",
-		"The following is a plain-text transcript of the completed conversation in the main session. It ends before the main session's current user request and in-progress assistant turn. Use it only as background context for the assignment below.",
-		"",
-		task.conversationTranscript,
-		"</main_session_transcript>",
-		"",
-	];
-}
-
-function buildReviewSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
-	const parts = [
-		...buildTranscriptPromptSection(task),
-		"<persistent_code_review_subagent_instructions>",
-		buildReviewSubagentInstructions(task, cwd),
-		"</persistent_code_review_subagent_instructions>",
-		"",
-		"<code_review_rubric>",
-		REVIEW_RUBRIC,
-		"</code_review_rubric>",
-		"",
-		"<code_review_target>",
-		task.whatToReview ?? task.mainTask,
-		"</code_review_target>",
-	];
-	if (task.focus) {
-		parts.push("", "<neutral_focus>", task.focus, "</neutral_focus>");
+function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
+	const byId = new Map<string, SerializedAgent>();
+	for (const entry of ctx.sessionManager.getBranch() as any[]) {
+		if (entry?.type !== "message" || entry.message?.role !== "toolResult") continue;
+		if (entry.message.toolName !== START_TOOL_NAME && entry.message.toolName !== REVIEW_TOOL_NAME) continue;
+		const agents = entry.message.details?.agents;
+		if (!Array.isArray(agents)) continue;
+		for (const value of agents) {
+			if (!isRecord(value)) continue;
+			if (typeof value.id !== "string" || typeof value.sessionFile !== "string" || typeof value.modelRef !== "string") continue;
+			if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) continue;
+			byId.set(value.id, value as unknown as SerializedAgent);
+		}
 	}
-	parts.push(
-		"",
-		"Important: follow the code review rubric above. The caller supplied only the code review target and optional neutral focus; do not infer suspected findings from the wording. Report only concrete, actionable code issues you can prove from the code.",
-	);
-	return parts.join("\n");
+	return [...byId.values()];
 }
 
-function buildGenericSubagentUserPrompt(task: ResolvedTask, cwd: string): string {
-	const parts = [
-		...buildTranscriptPromptSection(task),
-		"<persistent_generic_subagent_instructions>",
-		buildGenericSubagentInstructions(task, cwd),
-		"</persistent_generic_subagent_instructions>",
-		"",
-		"<task>",
-		task.mainTask,
-		"</task>",
+function compactRecord(record: AgentRecord): Record<string, unknown> {
+	return {
+		id: record.id,
+		title: record.title,
+		state: record.state,
+		lastOutcome: record.lastOutcome,
+		model: record.modelRef,
+		thinking: record.thinking,
+		currentRunId: record.currentRunId,
+		activity: currentActivity(record),
+		createdAt: record.createdAt,
+		startedAt: record.startedAt,
+		updatedAt: record.updatedAt,
+		settledAt: record.settledAt,
+		cost: record.usage.cost,
+		turns: record.usage.turns,
+		sessionFile: record.sessionFile,
+	};
+}
+
+function formatList(records: AgentRecord[]): string {
+	if (records.length === 0) return "No subagents are known in this parent session.";
+	return records.map((record) => {
+		const state = record.state === "cold" ? `cold; last run ${record.lastOutcome}` : record.state;
+		return `${record.id} · ${state} · ${record.modelRef} [${record.thinking}] · ${record.title} · ${oneLine(currentActivity(record), 100)}`;
+	}).join("\n");
+}
+
+function formatStatus(record: AgentRecord): string {
+	const now = Date.now();
+	const lines = [
+		`${record.id} — ${record.title}`,
+		`State: ${record.state}${record.state === "cold" ? `; last run ${record.lastOutcome}` : ""}`,
+		`Model: ${record.modelRef}`,
+		`Thinking: ${record.thinking}`,
+		`Context: ${record.contextMode}`,
+		record.currentRunId ? `Current/latest run: ${record.currentRunId}` : "",
+		`Task: ${oneLine(record.currentTaskSummary ?? record.task, 180)}`,
 	];
-	if (task.assignment) {
-		parts.push("", "<subagent_assignment>", task.assignment, "</subagent_assignment>");
+	if (record.activeTools.size > 0) {
+		lines.push("Now:", ...[...record.activeTools.values()].map((tool) => `  - ${tool.description} (${formatDuration(now - tool.startedAt)})`));
+	} else if (record.lastObservedAt) {
+		lines.push(`Last observed ${formatDuration(now - record.lastObservedAt)} ago: ${record.recent.at(-1)?.text ?? record.lastOutcome}`, "No tool is currently known to be active.");
 	}
-	parts.push("", "Return a concise, self-contained final answer for the main agent to synthesize.");
-	return parts.join("\n");
+	if (record.recent.length > 1) {
+		lines.push("Recently:", ...record.recent.slice(-MAX_RECENT_ACTIVITIES).map((activity) => `  - ${activity.text}`));
+	}
+	const context = record.contextWindow ? ` · ${record.contextTokens === undefined ? "?" : formatTokens(record.contextTokens)}/${formatTokens(record.contextWindow)} context` : "";
+	lines.push(`Usage: ${formatCost(record.usage.cost)} · ${record.usage.turns} model turn${record.usage.turns === 1 ? "" : "s"}${context}`);
+	if (record.error) lines.push(`Error: ${oneLine(record.error, 300)}`);
+	lines.push(`Session: ${record.sessionFile}`);
+	return lines.filter(Boolean).join("\n");
 }
 
-function buildMainSystemPromptAddition(): string {
-	return [
-		"Review subagents:",
-		`- You have a ${REVIEW_TOOL_NAME} tool that launches same-cwd Pi code review subagent sessions in parallel.`,
-		"- Review subagents are specifically for code reviews. Use them for reviewing code, diffs, implementation plans with code impact, or concrete code-review targets.",
-		"- Only launch review subagents when the user explicitly asks for subagents/parallel agents to review code, or unmistakably asks you to delegate code review work to other agents.",
-		"- If the user asks for multiple reviewers, use one parallel tool call rather than sequential calls when possible.",
-		"- The tool already injects the standard code review rubric and output format into each review subagent prompt.",
-		"- When calling the review tool, specify only what code to review and optional neutral focus areas. Do not paste review instructions, formatting requirements, expected verdicts, or suspected findings into the review target.",
-		"- Avoid biasing review subagents. Do not tell them what bugs you expect unless the user explicitly asked to verify a specific concern; if so, label it as user-provided focus.",
-		"- Each review subagent is a brand-new session named `[Review Subagent] <description>`. Choose short, distinctive descriptions; if repeating a similar review, add your own suffix like `#2`.",
-		"- The tool returns a final per-subagent stats summary followed by each review subagent's final answer. Synthesize the answers for the user, deduplicate findings, and call out disagreements or uncertainty.",
-		"- By default review subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-reviewer `model` and/or `thinking`.",
-		"- Model overrides may be loose names, but you should resolve ambiguity before launching when possible. If a name could refer to multiple providers/models, ask the user which provider/model they mean instead of guessing. You can inspect models with `pi --list-models <query>` if needed.",
-		"",
-		"Generic subagents:",
-		`- You also have a ${GENERIC_TOOL_NAME} tool that launches same-cwd Pi generic subagent sessions in parallel.`,
-		"- Generic subagents do not receive the code review rubric or any task-specific output format. Provide the complete task and any per-subagent assignment yourself.",
-		"- Use generic subagents only when the user explicitly asks for subagents/parallel agents/delegation, or unmistakably wants independent parallel investigation or exploration.",
-		"- Do not use generic subagents for code review tasks; use the review subagent tool for code reviews.",
-		"- Each generic subagent is a brand-new session named `[Generic Subagent] <description>`. Choose short, distinctive descriptions.",
-		"- The generic tool returns a final per-subagent stats summary followed by each subagent's final answer. Synthesize results for the user, deduplicate, and call out disagreements or uncertainty.",
-		"- By default generic subagents inherit your current model and thinking level. If the user asks for a different model/thinking, set per-subagent `model` and/or `thinking`.",
-		"- Generic subagent model overrides follow the same ambiguity rules as review subagents: ask the user to clarify rather than guessing among multiple possible model matches.",
-		"",
-		"Subagent context:",
-		"- Both launch tools default to fresh context. Unless the user explicitly requests a context mode, omit `context` so the fresh default is used.",
-		"- Set `context` to `transcript` only when explicitly requested. This pastes the completed main-session user/assistant transcript and summaries into each subagent prompt, ending before the current user request and in-progress assistant turn.",
-		"- Set `context` to `clone` only when explicitly requested. This starts each subagent from a native clone of the main session ending immediately before the current user request, then appends the subagent instructions and assignment.",
-		"- `system_prompt` and `system_prompt_file` add system-level instructions shared by every subagent in one launch. They are mutually exclusive and may be used only with fresh context, because changing the system prompt invalidates reusable provider prompt-cache prefixes.",
-		"- `system_prompt_file` is a local UTF-8 text file path, relative to the main cwd or absolute. Its contents, not its path, become the additional system instructions.",
-		"",
-		"Programmatic subagent manifests:",
-		"- Either launch tool may be called with `input_file` by itself instead of inline launch fields. The UTF-8 JSON file must contain the complete normal request object for that tool and is strictly validated before any subagent starts.",
-		"- Use `input_file` when code generated a large or dynamic launch request, so the tool call does not need to repeat every subagent entry.",
-	].join("\n");
+function formatCompletion(records: AgentRecord[]): string {
+	return records.map((record) => {
+		const duration = record.startedAt && record.settledAt ? formatDuration(record.settledAt - record.startedAt) : "unknown time";
+		const completed = record.lastOutcome === "completed";
+		const preview = oneLine(completed ? (record.finalAnswer || "No final answer") : (record.error || "No final answer"), 220);
+		const next = completed
+			? `Use ${RESULT_TOOL_NAME} with id ${record.id} for the complete final answer.`
+			: `Use ${STATUS_TOOL_NAME} with id ${record.id} for details; the child session is preserved.`;
+		return `${record.id} · ${record.title}\n${record.lastOutcome} · ${record.modelRef} [${record.thinking}] · ${duration} · ${formatCost(record.usage.cost)}\nPreview: ${preview}\n${next}`;
+	}).join("\n\n");
 }
 
-function assistantTextFromMessage(message: any): string {
-	const content = message?.content;
-	if (typeof content === "string") return cleanText(content);
-	if (!Array.isArray(content)) return "";
-	return cleanText(
-		content
-			.filter((part) => part?.type === "text" && typeof part.text === "string")
-			.map((part) => part.text)
-			.join("\n"),
-	);
-}
-
-function finalAssistantText(messages: any[]): string {
+function findRunResult(record: AgentRecord, requestedRunId?: string): { runId?: string; text: string } {
+	const manager = SessionManager.open(record.sessionFile);
+	const messages = manager.getBranch().filter((entry: any) => entry?.type === "message").map((entry: any) => entry.message);
+	let selectedRun = requestedRunId;
+	if (!selectedRun) {
+		for (let index = messages.length - 1; index >= 0; index--) {
+			if (messages[index]?.role !== "user") continue;
+			const candidate = runIdFromText(messageText(messages[index]));
+			if (candidate) { selectedRun = candidate; break; }
+		}
+	}
+	if (!selectedRun) return { text: finalAssistantText(messages) };
+	let start = -1;
 	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message?.role !== "assistant") continue;
-		const text = assistantTextFromMessage(message);
-		if (text) return text;
+		if (messages[index]?.role === "user" && runIdFromText(messageText(messages[index])) === selectedRun) { start = index; break; }
 	}
-	return "";
+	if (start < 0) throw new Error(`Run ${selectedRun} was not found in ${record.id}`);
+	let end = messages.length;
+	for (let index = start + 1; index < messages.length; index++) {
+		if (messages[index]?.role === "user" && runIdFromText(messageText(messages[index]))) { end = index; break; }
+	}
+	const runMessages = messages.slice(start + 1, end);
+	const assistant = [...runMessages].reverse().find((message) => message?.role === "assistant" && assistantText(message));
+	if (!assistant) throw new Error(`No assistant answer found for ${selectedRun}`);
+	if (assistant.stopReason === "error" || assistant.errorMessage) throw new Error(assistant.errorMessage || `Run ${selectedRun} failed`);
+	if (assistant.stopReason === "length") throw new Error(`Run ${selectedRun} stopped at the token limit before producing a complete answer`);
+	if (assistant.stopReason !== "stop") {
+		throw new Error(`No final assistant answer found for ${selectedRun}; the run was interrupted after a partial response`);
+	}
+	return { runId: selectedRun, text: assistantText(assistant) };
 }
 
-function updateUsageFromMessage(state: RuntimeState, message: any): void {
-	const usage = message?.usage;
-	if (!usage) return;
-	const input = Number(usage.input || 0);
-	const output = Number(usage.output || 0);
-	const cacheRead = Number(usage.cacheRead || 0);
-	const cacheWrite = Number(usage.cacheWrite || 0);
-	state.usage.input += input;
-	state.usage.output += output;
-	state.usage.cacheRead += cacheRead;
-	state.usage.cacheWrite += cacheWrite;
-	state.usage.cost += Number(usage.cost?.total || 0);
-	state.usage.turns++;
-	const latestPromptTokens = input + cacheRead + cacheWrite;
-	state.usage.latestCacheHitRate = latestPromptTokens > 0 ? (cacheRead / latestPromptTokens) * 100 : undefined;
-
-	const contextTokens = Number(usage.totalTokens || input + output + cacheRead + cacheWrite);
-	if (contextTokens > 0) {
-		state.contextTokens = contextTokens;
-		if ((state.contextWindow ?? 0) > 0) state.contextPercent = (contextTokens / state.contextWindow!) * 100;
+function transcriptText(record: AgentRecord): string {
+	const manager = SessionManager.open(record.sessionFile);
+	const lines: string[] = [`# ${record.title}`, ``, `Model: ${record.modelRef} [${record.thinking}]`, `Session: ${record.sessionFile}`, ``];
+	for (const entry of manager.getBranch() as any[]) {
+		if (entry?.type !== "message") continue;
+		const message = entry.message;
+		if (message.role === "user") lines.push("## User", messageText(message), "");
+		else if (message.role === "assistant") lines.push("## Assistant", assistantText(message) || "(no text)", "");
+		else if (message.role === "toolResult") lines.push(`### Tool result: ${message.toolName}`, messageText(message), "");
 	}
-}
-
-function formatToolActivity(toolName: string, args: any): string {
-	if (toolName === "bash") return `$ ${oneLine(String(args?.command ?? "..."), 90)}`;
-	if (toolName === "read") return `read ${oneLine(String(args?.path ?? args?.file_path ?? "..."), 90)}`;
-	if (toolName === "edit") return `edit ${oneLine(String(args?.path ?? args?.file_path ?? "..."), 90)}`;
-	if (toolName === "write") return `write ${oneLine(String(args?.path ?? args?.file_path ?? "..."), 90)}`;
-	if (toolName === "grep") return `grep ${oneLine(String(args?.pattern ?? ""), 60)}`;
-	if (toolName === "find") return `find ${oneLine(String(args?.pattern ?? "*"), 60)}`;
-	if (toolName === "ls") return `ls ${oneLine(String(args?.path ?? "."), 90)}`;
-	return `${toolName} ${oneLine(JSON.stringify(args ?? {}), 90)}`;
-}
-
-function statusIcon(status: SubagentStatus): string {
-	switch (status) {
-		case "done": return "✓";
-		case "error": return "✗";
-		case "aborted": return "■";
-		case "thinking": return "◌";
-		case "tool": return "↦";
-		case "running": return "…";
-		case "starting": return "◐";
-		default: return "·";
-	}
-}
-
-function buildSubagentPromptHeader(states: RuntimeState[], includePerSubagentDetails = true): string {
-	const first = states[0];
-	const mainTask = states.find((state) => state.mainTask)?.mainTask;
-	const lines: string[] = [];
-	if (first) lines.push(`Context: ${first.contextMode}`);
-	if (first?.systemPromptDisplay) lines.push(`System prompt: ${first.systemPromptDisplay}`);
-	if (mainTask) {
-		lines.push("", first?.kind === "generic" ? "Generic task prompt sent to subagents:" : "Code review target prompt sent to subagents:", "<<<", mainTask, ">>>");
-	}
-	if (!includePerSubagentDetails) return lines.join("\n");
-	const detailLines = states
-		.map((state) => {
-			if (state.kind === "generic" && state.assignment) return `- ${state.sessionName}: ${state.assignment}`;
-			if (state.kind === "review" && state.focus) return `- ${state.sessionName}: ${state.focus}`;
-			return undefined;
-		})
-		.filter((line): line is string => Boolean(line));
-	if (detailLines.length > 0) lines.push("", first?.kind === "generic" ? "Assignment by subagent:" : "Neutral focus by subagent:", ...detailLines);
 	return lines.join("\n");
 }
 
-function statusColor(status: SubagentStatus): ThemeColor {
-	if (status === "done") return "success";
-	if (status === "error") return "error";
-	if (status === "aborted") return "warning";
-	if (status === "running" || status === "thinking" || status === "tool") return "accent";
-	return "dim";
+function result(text: string, details: Record<string, unknown> = {}, isError = false) {
+	return { content: [{ type: "text" as const, text }], details, isError };
 }
 
-function thinkingColor(thinking: ThinkingLevel | undefined): ThemeColor {
-	if (!thinking) return "dim";
-	return `thinking${thinking === "xhigh" ? "Xhigh" : thinking[0]!.toUpperCase() + thinking.slice(1)}` as ThemeColor;
+function idsFromHandleFileValue(value: unknown): string[] {
+	if (Array.isArray(value)) return value.map((item) => typeof item === "string" ? item : isRecord(item) && typeof item.id === "string" ? item.id : "").filter(Boolean);
+	if (isRecord(value) && Array.isArray(value.agents)) return idsFromHandleFileValue(value.agents);
+	return [];
 }
 
-function renderLiveStats(state: RuntimeState, theme: Theme): string {
-	const parts = liveStatParts(state);
-	return parts.map((part) => {
-		const color = !part.known ? "dim" : part.kind === "cache" ? "success" : part.kind === "cost" ? "warning" : "accent";
-		return theme.fg(color, part.text) + " ".repeat(Math.max(0, liveStatWidth(part.kind) - part.text.length));
-	}).join(theme.fg("dim", " · "));
-}
-
-function formatStatusRow(state: RuntimeState, includeActivity: boolean): string {
-	const status = fitColumn(`${statusIcon(state.status)} ${state.status}`, LIVE_STATUS_WIDTH);
-	const stats = formatLiveStats(state);
-	const attempt = state.maxAttempts > 1 && state.attempt > 1 ? ` attempt=${state.attempt}/${state.maxAttempts}` : "";
-	const model = `model=${state.modelRef ?? "(unknown)"} [${state.thinking ?? "(unknown)"}]${attempt}`;
-	const columns = [status, stats, model, state.sessionName];
-	if (includeActivity) columns.push(state.error ?? state.lastActivity);
-	return columns.filter(Boolean).join(" · ");
-}
-
-function renderStatusRow(state: RuntimeState, theme: Theme, includeActivity: boolean): string {
-	const status = theme.fg(statusColor(state.status), fitColumn(`${statusIcon(state.status)} ${state.status}`, LIVE_STATUS_WIDTH));
-	const stats = renderLiveStats(state, theme);
-	const attempt = state.maxAttempts > 1 && state.attempt > 1 ? theme.fg("warning", ` attempt=${state.attempt}/${state.maxAttempts}`) : "";
-	const model = `${theme.fg("dim", "model=")}${theme.fg("muted", state.modelRef ?? "(unknown)")} ${theme.fg(thinkingColor(state.thinking), `[${state.thinking ?? "(unknown)"}]`)}${attempt}`;
-	const columns = [status, stats, model, theme.fg("toolTitle", state.sessionName)];
-	if (includeActivity) columns.push(theme.fg(state.error ? "error" : "dim", state.error ?? state.lastActivity));
-	return columns.filter(Boolean).join(theme.fg("dim", " · "));
-}
-
-function renderToolPartial(states: RuntimeState[], prefix: string, theme: Theme): Text {
-	const lines = states.map((state) => renderStatusRow(state, theme, true));
-	const header = buildSubagentPromptHeader(states);
-	return new Text([prefix, header, lines.join("\n")].filter(Boolean).join("\n\n"), 0, 0);
-}
-
-function buildToolPartial(states: RuntimeState[]) {
-	const lines = states.map((state) => formatStatusRow(state, true));
-	const header = buildSubagentPromptHeader(states);
-	const text = [header, lines.join("\n")].filter(Boolean).join("\n\n") || "subagents preparing...";
-	return {
-		content: [{ type: "text" as const, text }],
-		details: { states },
-	};
-}
-
-class RpcClient {
-	private child: ChildProcessWithoutNullStreams | null = null;
-	private buffer = "";
-	private nextId = 0;
-	private pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timeout: ReturnType<typeof setTimeout> }>();
-	stderr = "";
-
-	constructor(
-		private readonly task: ResolvedTask,
-		private readonly cwd: string,
-		private readonly state: RuntimeState,
-		private readonly onEvent: (event: any) => void,
-	) {}
-
-	start(signal?: AbortSignal): void {
-		const args = ["--mode", "rpc", "--name", this.task.sessionName];
-		const sessionFile = this.state.attempt > 1 && this.state.sessionFile
-			? this.state.sessionFile
-			: this.task.initialSessionFile;
-		if (sessionFile) args.push("--session", sessionFile);
-		if (this.task.modelRef) args.push("--model", this.task.modelRef);
-		if (this.task.thinking) args.push("--thinking", this.task.thinking);
-		if (this.task.systemPromptPath) args.push("--append-system-prompt", this.task.systemPromptPath);
-
-		const invocation = getPiInvocation(args);
-		this.child = spawn(invocation.command, invocation.args, {
-			cwd: this.cwd,
-			shell: false,
-			stdio: ["pipe", "pipe", "pipe"],
-			env: {
-				...process.env,
-				PI_SUBAGENT_SANDBOX: this.task.sandboxDir,
-				...(this.task.promptCacheKey ? { PI_SUBAGENT_PROMPT_CACHE_KEY: this.task.promptCacheKey } : {}),
-			},
-		});
-
-		const abort = () => this.kill("SIGTERM");
-		signal?.addEventListener("abort", abort, { once: true });
-		this.child.once("close", () => signal?.removeEventListener("abort", abort));
-
-		this.child.stdout.on("data", (chunk) => {
-			this.buffer += chunk.toString();
-			let index = this.buffer.indexOf("\n");
-			while (index !== -1) {
-				const line = this.buffer.slice(0, index).trim();
-				this.buffer = this.buffer.slice(index + 1);
-				if (line) this.handleLine(line);
-				index = this.buffer.indexOf("\n");
-			}
-		});
-
-		this.child.stderr.on("data", (chunk) => {
-			this.stderr += chunk.toString();
-		});
-
-		this.child.on("error", (error) => {
-			for (const pending of this.pending.values()) pending.reject(error);
-			this.pending.clear();
-		});
+async function resolveIds(params: { ids?: string[]; input_file?: string }, cwd: string): Promise<string[]> {
+	if (params.input_file !== undefined) {
+		if (params.ids !== undefined) throw new Error("ids and input_file are mutually exclusive");
+		const loaded = await readJsonFile(params.input_file, cwd);
+		const ids = idsFromHandleFileValue(loaded.value);
+		if (ids.length === 0) throw new Error("input_file did not contain any subagent handles");
+		return [...new Set(ids)];
 	}
-
-	waitForExit(): Promise<number | null> {
-		return new Promise((resolve) => {
-			if (!this.child) return resolve(null);
-			this.child.once("close", (code) => {
-				if (this.buffer.trim()) this.handleLine(this.buffer.trim());
-				for (const pending of this.pending.values()) pending.reject(new Error(`subagent exited with code ${code ?? "unknown"}`));
-				this.pending.clear();
-				resolve(code);
-			});
-		});
-	}
-
-	async send(type: string, payload: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<any> {
-		if (!this.child?.stdin) throw new Error("subagent process is not running");
-		const id = `subagent-${this.task.index}-${this.nextId++}`;
-		const command = { id, type, ...payload };
-		return await new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				this.pending.delete(id);
-				reject(new Error(`timed out waiting for ${type}`));
-			}, timeoutMs);
-			this.pending.set(id, { resolve, reject, timeout });
-			this.child?.stdin.write(`${JSON.stringify(command)}\n`);
-		});
-	}
-
-	kill(signal: NodeJS.Signals = "SIGTERM"): void {
-		try {
-			this.child?.kill(signal);
-		} catch {}
-	}
-
-	private handleLine(line: string): void {
-		let parsed: any;
-		try {
-			parsed = JSON.parse(line);
-		} catch {
-			return;
-		}
-
-		if (parsed?.type === "response" && typeof parsed.id === "string") {
-			const pending = this.pending.get(parsed.id);
-			if (!pending) return;
-			this.pending.delete(parsed.id);
-			clearTimeout(pending.timeout);
-			if (parsed.success) pending.resolve(parsed);
-			else pending.reject(new Error(parsed.error || `RPC ${parsed.command || "command"} failed`));
-			return;
-		}
-
-		this.onEvent(parsed);
-	}
+	if (!Array.isArray(params.ids) || params.ids.length === 0) throw new Error("ids is required and must not be empty");
+	return [...new Set(params.ids.map((id) => cleanText(id)).filter(Boolean))];
 }
 
-function rpcModelRef(model: any): string | undefined {
-	if (model && typeof model.provider === "string" && typeof model.id === "string") return `${model.provider}/${model.id}`;
-	return undefined;
-}
+function buildMainInstructions(): string {
+	return `Managed subagents:
+- Do not launch subagents unless the user explicitly asks for delegated/subagent work or has already established that subagents should be used for the current task.
+- Use ${START_TOOL_NAME} for ordinary delegated work. ${START_TOOL_NAME} returns immediately; continue useful work instead of polling.
+- Every new subagent requires an exact provider/model-id and an explicit thinking level. Never inherit or guess either value from the main session.
+- Before launching, the user must have established a clear contract for which exact model and thinking level to use for that task or class of tasks. If no such contract exists, ask the user before launching.
+- A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
+- Reuse an existing subagent with ${SEND_TOOL_NAME} only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
+- Use ${STATUS_TOOL_NAME} only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
+- Use ${WAIT_TOOL_NAME} only when further work truly depends on completion. Cancelling a wait leaves unfinished subagents running.
+- Use ${RESULT_TOOL_NAME} only for completed runs whose final answer is needed.
+- ${STOP_TOOL_NAME} stops current work but preserves the child Pi session for later continuation.
+- Multiple ${START_TOOL_NAME} calls in one assistant turn may run in parallel. For large programmatic launches, ${START_TOOL_NAME} accepts input_file by itself containing a JSON array of complete normal start requests.
 
-function applyRpcStateMetadata(state: RuntimeState, data: any): void {
-	if (!data) return;
-	if (typeof data.sessionFile === "string") state.sessionFile = data.sessionFile;
-	const actualModelRef = rpcModelRef(data.model);
-	if (actualModelRef) state.modelRef = actualModelRef;
-	if (typeof data.model?.contextWindow === "number") state.contextWindow = data.model.contextWindow;
-	if ((THINKING_LEVELS as readonly string[]).includes(data.thinkingLevel)) state.thinking = data.thinkingLevel;
-}
-
-function applyEventToState(state: RuntimeState, event: any): void {
-	state.updatedAt = Date.now();
-	if (event.type === "agent_start") {
-		state.status = "running";
-		state.lastActivity = "started";
-		return;
-	}
-	if (event.type === "message_update") {
-		const update = event.assistantMessageEvent;
-		if (update?.type === "thinking_start" || update?.type === "thinking_delta") {
-			state.status = "thinking";
-			state.lastActivity = "thinking…";
-		} else if (update?.type === "text_delta") {
-			state.status = "running";
-			state.lastActivity = "providing final answer…";
-		} else if (update?.type === "toolcall_end" && update.toolCall) {
-			state.status = "tool";
-			state.lastActivity = formatToolActivity(update.toolCall.name, update.toolCall.arguments);
-		}
-		return;
-	}
-	if (event.type === "tool_execution_start") {
-		state.status = "tool";
-		state.lastActivity = formatToolActivity(event.toolName, event.args);
-		return;
-	}
-	if (event.type === "tool_execution_update") {
-		state.status = "tool";
-		state.lastActivity = event.toolName ? `${event.toolName} running…` : "tool running…";
-		return;
-	}
-	if (event.type === "message_end" && event.message?.role === "assistant") {
-		updateUsageFromMessage(state, event.message);
-		const text = assistantTextFromMessage(event.message);
-		if (text) state.finalAnswer = text;
-		if (event.message.stopReason === "error" || event.message.errorMessage) {
-			state.status = "error";
-			state.error = event.message.errorMessage || "assistant response ended with an error";
-			state.lastActivity = "failed";
-		}
-		return;
-	}
-	if (event.type === "agent_end") {
-		const text = finalAssistantText(event.messages || []);
-		if (state.status === "error" || state.status === "aborted") {
-			if (text && !state.finalAnswer) state.finalAnswer = text;
-			return;
-		}
-		if (text) {
-			state.finalAnswer = text;
-			state.status = "done";
-			state.lastActivity = "finished";
-		} else {
-			state.status = "done";
-			state.lastActivity = "finished without final answer";
-		}
-	}
-}
-
-type PendingResolvedTask = Omit<ResolvedTask, "sandboxDir" | "systemPromptPath" | "userPrompt">;
-
-type PreparedTasks = { tasks?: ResolvedTask[]; errors?: string[] };
-
-function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): string | undefined {
-	const sourceSessionFile = ctx.sessionManager.getSessionFile();
-	if (!ctx.sessionManager.isPersisted() || !sourceSessionFile) {
-		throw new Error("clone context requires a persisted main session");
-	}
-
-	const branch = ctx.sessionManager.getBranch();
-	let latestUserIndex = -1;
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry?.type === "message" && entry.message.role === "user") {
-			latestUserIndex = index;
-			break;
-		}
-	}
-	if (latestUserIndex < 0) throw new Error("clone context could not find the current user message");
-
-	const cloneLeafId = branch[latestUserIndex - 1]?.id;
-	if (!cloneLeafId) return undefined;
-
-	const source = SessionManager.open(sourceSessionFile, ctx.sessionManager.getSessionDir());
-	const clonedSessionFile = source.createBranchedSession(cloneLeafId);
-	if (!clonedSessionFile) throw new Error("failed to create cloned subagent session");
-	return clonedSessionFile;
-}
-
-function resolveCommonSubagentParams(
-	params: CommonSubagentParams,
-	index: number,
-	label: string,
-	errors: string[],
-	availableModels: Model<any>[],
-	currentModelRef: string | undefined,
-	currentThinking: ThinkingLevel,
-): CommonSubagentParams & { description: string; modelRef?: string; thinking?: ThinkingLevel } {
-	const description = sanitizeDescription(params.description || "");
-	if (!description) errors.push(`${label} ${index + 1}: description is required`);
-
-	let modelOverride = params.model?.trim();
-	let thinking = params.thinking ?? currentThinking;
-	let explicitThinking = Boolean(params.thinking);
-	let modelRefForTask = currentModelRef;
-
-	if (modelOverride) {
-		const parsed = parseModelSpec(modelOverride);
-		modelOverride = parsed.query;
-		if (parsed.thinking) {
-			if (params.thinking && params.thinking !== parsed.thinking) {
-				errors.push(`${label} ${index + 1}: model override includes :${parsed.thinking} but thinking is also set to ${params.thinking}`);
-			} else {
-				thinking = parsed.thinking;
-				explicitThinking = true;
-			}
-		}
-
-		const match = resolveModelOverride(modelOverride, availableModels);
-		if (match.ok === false) {
-			errors.push(`${label} ${index + 1} (${description}): ${match.message}`);
-		} else {
-			modelRefForTask = modelRef(match.model);
-			const thinkingError = validateRequestedThinking(match.model, thinking, explicitThinking);
-			if (thinkingError) errors.push(`${label} ${index + 1} (${description}): ${thinkingError}`);
-		}
-	}
-
-	return {
-		...params,
-		description,
-		modelRef: modelRefForTask,
-		thinking,
-	};
-}
-
-async function finalizeTasks(
-	pending: PendingResolvedTask[],
-	ctx: ExtensionContext,
-	systemPromptFileName: string,
-	buildUserPrompt: (task: ResolvedTask, cwd: string) => string,
-): Promise<ResolvedTask[]> {
-	const withSandboxes: ResolvedTask[] = [];
-	for (const task of pending) {
-		const sandboxRoot = path.join(tmpdir(), "pi-subagents");
-		await mkdir(sandboxRoot, { recursive: true });
-		const unique = `${slugify(task.description)}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
-		const sandboxDir = path.join(sandboxRoot, unique);
-		await mkdir(sandboxDir, { recursive: true });
-		const systemPromptPath = task.systemPromptBytes
-			? path.join(sandboxDir, systemPromptFileName)
-			: undefined;
-		const initialSessionFile = task.contextMode === "clone"
-			? createClonedSessionBeforeLatestUser(ctx)
-			: undefined;
-		const parentSessionFile = ctx.sessionManager.isPersisted()
-			? ctx.sessionManager.getSessionFile()
-			: undefined;
-		const finalTask: ResolvedTask = {
-			...task,
-			sandboxDir,
-			systemPromptPath,
-			userPrompt: "",
-			initialSessionFile,
-			parentSessionFile,
-			promptCacheKey: task.contextMode === "clone" ? ctx.sessionManager.getSessionId() : undefined,
-		};
-		finalTask.userPrompt = buildUserPrompt(finalTask, ctx.cwd);
-		if (systemPromptPath && finalTask.systemPromptBytes) await writeFile(systemPromptPath, finalTask.systemPromptBytes);
-		withSandboxes.push(finalTask);
-	}
-	return withSandboxes;
-}
-
-async function prepareReviewTasks(params: ReviewLaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<PreparedTasks> {
-	const errors: string[] = [];
-	const whatToReview = cleanText(params.what_to_review || "");
-	const contextMode = params.context ?? "fresh";
-	if (!whatToReview) errors.push("what_to_review is required and should describe only the code review target");
-	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
-	if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) errors.push("reviewers must contain at least one code review subagent");
-	if (errors.length > 0) return { errors };
-	const customSystemPrompt = await resolveSystemPromptBytes(params, ctx.cwd);
-	if (customSystemPrompt.errors) return { errors: customSystemPrompt.errors };
-	const systemPromptDisplay = describeSystemPrompt(params, ctx.cwd, customSystemPrompt.bytes);
-	const conversationTranscript = contextMode === "transcript"
-		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
-		: undefined;
-	if (contextMode === "transcript" && !conversationTranscript) return { errors: ["transcript context was requested, but the main session has no completed conversation before the current turn"] };
-
-	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
-	const currentModelRef = getCurrentModelRef(ctx);
-	const currentThinking = pi.getThinkingLevel() as ThinkingLevel;
-	const resolved: PendingResolvedTask[] = [];
-
-	params.reviewers.forEach((reviewer, index) => {
-		const common = resolveCommonSubagentParams(reviewer, index, "reviewer", errors, availableModels, currentModelRef, currentThinking);
-		const focus = cleanText(reviewer.focus || "");
-		resolved.push({
-			...common,
-			kind: "review",
-			index,
-			sessionName: `${REVIEW_SESSION_PREFIX} ${common.description}`,
-			mainTask: whatToReview,
-			contextMode,
-			systemPromptBytes: customSystemPrompt.bytes,
-			systemPromptDisplay,
-			conversationTranscript,
-			whatToReview,
-			focus: focus || undefined,
-		});
-	});
-
-	if (errors.length > 0) return { errors };
-	return { tasks: await finalizeTasks(resolved, ctx, "REVIEW_SUBAGENT_SYSTEM_PROMPT.md", buildReviewSubagentUserPrompt) };
-}
-
-async function prepareGenericTasks(params: GenericLaunchParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<PreparedTasks> {
-	const errors: string[] = [];
-	const task = cleanText(params.task || "");
-	const contextMode = params.context ?? "fresh";
-	if (!task) errors.push("task is required and should contain the full generic subagent task");
-	if (contextMode !== "fresh" && contextMode !== "transcript" && contextMode !== "clone") errors.push(`unsupported context mode "${String(contextMode)}"`);
-	if (!Array.isArray(params.subagents) || params.subagents.length === 0) errors.push("subagents must contain at least one generic subagent");
-	if (errors.length > 0) return { errors };
-	const customSystemPrompt = await resolveSystemPromptBytes(params, ctx.cwd);
-	if (customSystemPrompt.errors) return { errors: customSystemPrompt.errors };
-	const systemPromptDisplay = describeSystemPrompt(params, ctx.cwd, customSystemPrompt.bytes);
-	const conversationTranscript = contextMode === "transcript"
-		? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text
-		: undefined;
-	if (contextMode === "transcript" && !conversationTranscript) return { errors: ["transcript context was requested, but the main session has no completed conversation before the current turn"] };
-
-	const availableModels = ctx.modelRegistry.getAvailable() as Model<any>[];
-	const currentModelRef = getCurrentModelRef(ctx);
-	const currentThinking = pi.getThinkingLevel() as ThinkingLevel;
-	const resolved: PendingResolvedTask[] = [];
-
-	params.subagents.forEach((subagent, index) => {
-		const common = resolveCommonSubagentParams(subagent, index, "subagent", errors, availableModels, currentModelRef, currentThinking);
-		const assignment = cleanText(subagent.assignment || "");
-		resolved.push({
-			...common,
-			kind: "generic",
-			index,
-			sessionName: `${GENERIC_SESSION_PREFIX} ${common.description}`,
-			mainTask: task,
-			contextMode,
-			systemPromptBytes: customSystemPrompt.bytes,
-			systemPromptDisplay,
-			conversationTranscript,
-			assignment: assignment || undefined,
-		});
-	});
-
-	if (errors.length > 0) return { errors };
-	return { tasks: await finalizeTasks(resolved, ctx, "GENERIC_SUBAGENT_SYSTEM_PROMPT.md", buildGenericSubagentUserPrompt) };
-}
-
-function buildSubagentRetryPrompt(task: ResolvedTask, state: RuntimeState): string {
-	const reason = state.previousErrors.at(-1) ?? state.error ?? "the previous subagent attempt failed before completing";
-	return [
-		"The previous attempt for this subagent appears to have failed due to a transient/runtime error.",
-		`Failure note: ${reason}`,
-		"",
-		"You are being resumed in the same subagent session. Continue the assigned work from the existing conversation and any scratch files in your sandbox.",
-		"Do not start over unless the prior context is unusable. If needed, briefly inspect relevant files/state, then finish the original assignment.",
-		"",
-		`Original assignment summary: ${task.assignment || task.focus || task.whatToReview || task.mainTask}`,
-	].join("\n");
-}
-
-async function runSubagent(task: ResolvedTask, ctx: ExtensionContext, state: RuntimeState, emit: () => void, signal?: AbortSignal): Promise<ChildResult> {
-	state.status = "starting";
-	state.lastActivity = state.attempt > 1 ? `starting retry attempt ${state.attempt}/${state.maxAttempts}…` : "starting pi rpc session…";
-	emit();
-
-	let client: RpcClient | null = null;
-
-	try {
-		let sawAgentEnd = false;
-		let resolveDone!: () => void;
-		const donePromise = new Promise<void>((resolve) => {
-			resolveDone = resolve;
-		});
-		client = new RpcClient(task, ctx.cwd, state, (event) => {
-			applyEventToState(state, event);
-			if (event.type === "agent_end") {
-				sawAgentEnd = true;
-				resolveDone();
-			}
-			emit();
-		});
-
-		client.start(signal);
-		const exitPromise = client.waitForExit();
-		if (state.attempt === 1 && !task.initialSessionFile && task.parentSessionFile) {
-			const response = await client.send("new_session", { parentSession: task.parentSessionFile }, 30_000);
-			if (response?.data?.cancelled) throw new Error("subagent session creation was cancelled");
-			// --name applies to the startup session; new_session replaces it, so name the
-			// linked replacement explicitly.
-			await client.send("set_session_name", { name: task.sessionName }, 5_000);
-		}
-		const prompt = state.attempt > 1 && state.sessionFile ? buildSubagentRetryPrompt(task, state) : task.userPrompt;
-		await client.send("prompt", { message: prompt }, 30_000);
-		try {
-			const stateResponse = await client.send("get_state", {}, 5_000);
-			applyRpcStateMetadata(state, stateResponse.data);
-			emit();
-		} catch {
-			// Session path and actual selected model are nice-to-have only.
-		}
-
-		const completed = await Promise.race([donePromise.then(() => "done" as const), exitPromise.then(() => "exit" as const)]);
-		if (completed === "done") {
-			client.kill("SIGTERM");
-			const forceKill = setTimeout(() => client?.kill("SIGKILL"), 2_000);
-			forceKill.unref?.();
-			const exitCode = await exitPromise;
-			clearTimeout(forceKill);
-			if (signal?.aborted) {
-				state.status = "aborted";
-				state.error = "aborted by user";
-				state.lastActivity = "aborted";
-			} else if (!sawAgentEnd && (state.status as SubagentStatus) !== "done") {
-				state.status = "error";
-				state.error = "subagent exited before agent_end";
-				state.lastActivity = "failed";
-			}
-			emit();
-			return { state, exitCode };
-		}
-
-		const exitCode = await exitPromise;
-		if (signal?.aborted) {
-			state.status = "aborted";
-			state.error = "aborted by user";
-			state.lastActivity = "aborted";
-		} else if ((state.status as SubagentStatus) !== "done") {
-			state.status = "error";
-			state.error = client.stderr.trim() || `subagent exited before completion with code ${exitCode ?? "unknown"}`;
-			state.lastActivity = "failed";
-		}
-		if (!state.finalAnswer && client.stderr.trim() && state.status === "error") state.finalAnswer = client.stderr.trim();
-		emit();
-		return { state, exitCode };
-	} catch (error) {
-		client?.kill("SIGTERM");
-		state.status = signal?.aborted ? "aborted" : "error";
-		state.error = error instanceof Error ? error.message : String(error);
-		state.lastActivity = state.status;
-		emit();
-		return { state, exitCode: null };
-	}
-}
-
-function retryReason(state: RuntimeState): string {
-	const parts = [state.error, state.finalAnswer].filter(Boolean);
-	return cleanText(parts.join("\n")) || (state.status === "done" ? "subagent finished without a final answer" : `subagent ended with status ${state.status}`);
-}
-
-function isLikelyTransientSubagentFailure(result: ChildResult, signal?: AbortSignal): boolean {
-	const state = result.state;
-	if (signal?.aborted || state.status === "aborted") return false;
-	if (state.status === "done") return !state.finalAnswer.trim();
-	if (state.status !== "error") return false;
-
-	const reason = retryReason(state);
-	return /WebSocket closed|provider_transport_failure|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network|terminated|stream closed|connection closed|timed out/i.test(reason);
-}
-
-async function runSubagentWithRetries(task: ResolvedTask, ctx: ExtensionContext, state: RuntimeState, emit: () => void, signal?: AbortSignal): Promise<ChildResult> {
-	let lastResult: ChildResult | undefined;
-	for (let attempt = 1; attempt <= state.maxAttempts; attempt++) {
-		state.attempt = attempt;
-		state.error = undefined;
-		state.finalAnswer = "";
-		lastResult = await runSubagent(task, ctx, state, emit, signal);
-		const retryable = isLikelyTransientSubagentFailure(lastResult, signal);
-		if (attempt >= state.maxAttempts || !retryable) {
-			if (!state.finalAnswer.trim() && state.status === "done") {
-				state.status = "error";
-				state.error = retryReason(state);
-				state.lastActivity = "failed";
-				emit();
-			}
-			return lastResult;
-		}
-
-		const reason = retryReason(state);
-		state.previousErrors.push(`attempt ${attempt}: ${reason}`);
-		state.status = "starting";
-		state.error = undefined;
-		state.lastActivity = `retrying after ${oneLine(reason, 90)}`;
-		state.updatedAt = Date.now();
-		emit();
-		try {
-			await delay(subagentRetryDelayMs(attempt), signal);
-		} catch {
-			state.status = "aborted";
-			state.error = "aborted by user";
-			state.lastActivity = "aborted";
-			emit();
-			return { state, exitCode: lastResult.exitCode };
-		}
-	}
-	return lastResult ?? { state, exitCode: null };
-}
-
-function sumUsage(states: RuntimeState[]): UsageStats {
-	return states.reduce<UsageStats>((total, state) => ({
-		input: total.input + state.usage.input,
-		output: total.output + state.usage.output,
-		cacheRead: total.cacheRead + state.usage.cacheRead,
-		cacheWrite: total.cacheWrite + state.usage.cacheWrite,
-		cost: total.cost + state.usage.cost,
-		turns: total.turns + state.usage.turns,
-	}), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
-}
-
-function buildFinalStats(states: RuntimeState[]): { text: string; summary: Record<string, unknown> } {
-	const usage = sumUsage(states);
-	const statusCounts = states.reduce<Record<string, number>>((counts, state) => {
-		counts[state.status] = (counts[state.status] ?? 0) + 1;
-		return counts;
-	}, {});
-	const attempts = states.reduce((total, state) => total + state.attempt, 0);
-	const earliestStart = states.length > 0 ? Math.min(...states.map((state) => state.startedAt)) : 0;
-	const latestFinish = states.length > 0 ? Math.max(...states.map((state) => state.updatedAt)) : earliestStart;
-	const wallDurationMs = Math.max(0, latestFinish - earliestStart);
-	const combinedAgentDurationMs = states.reduce((total, state) => total + Math.max(0, state.updatedAt - state.startedAt), 0);
-	const statusText = Object.entries(statusCounts).map(([status, count]) => `${count} ${status}`).join(", ") || "none";
-
-	const overall = [
-		"# Final Subagent Stats",
-		"",
-		"## Overall",
-		`- **Subagents:** ${states.length} (${statusText})`,
-		`- **Attempts / model turns:** ${countLabel(attempts, "attempt")} · ${countLabel(usage.turns, "turn")}`,
-		`- **Time:** ${formatDuration(wallDurationMs)} wall · ${formatDuration(combinedAgentDurationMs)} combined agent time`,
-		`- **Tokens:** ${formatExactTokens(totalTokens(usage))} total (input ${formatExactTokens(usage.input)} · output ${formatExactTokens(usage.output)} · cache read ${formatExactTokens(usage.cacheRead)} · cache write ${formatExactTokens(usage.cacheWrite)})`,
-		`- **Total cost:** ${formatCost(usage.cost)}`,
-	];
-
-	return {
-		text: overall.join("\n").trim(),
-		summary: {
-			count: states.length,
-			statusCounts,
-			attempts,
-			wallDurationMs,
-			combinedAgentDurationMs,
-			usage: { ...usage, totalTokens: totalTokens(usage) },
-		},
-	};
-}
-
-function buildFinalToolResult(results: ChildResult[], manifest?: LaunchManifestMetadata) {
-	const states = results.map((result) => result.state);
-	const stats = buildFinalStats(states);
-	const overallText = manifest
-		? `${stats.text}\n- **Input manifest:** \`${manifest.path}\` · ${countLabel(manifest.entries, "entry")} · ${manifest.bytes.toLocaleString("en-US")} bytes · SHA-256 \`${manifest.sha256}\``
-		: stats.text;
-	const answers = results.map(({ state }, index) => {
-		const title = `## Subagent ${index + 1} — ${state.sessionName}`;
-		const metadata = `> ${formatStatusRow(state, false)}`;
-		const specificAssignment = state.kind === "review" ? state.focus : state.assignment;
-		const details = [
-			`- **Context:** ${state.contextMode}`,
-			specificAssignment ? `- **${state.kind === "review" ? "Focus" : "Assignment"}:** ${specificAssignment}` : "",
-			`- **Attempts / model turns / duration:** ${countLabel(state.attempt, "attempt")} · ${countLabel(state.usage.turns, "turn")} · ${formatDuration(state.updatedAt - state.startedAt)}`,
-			`- **Tokens:** ${formatExactTokens(totalTokens(state.usage))} total (input ${formatExactTokens(state.usage.input)} · output ${formatExactTokens(state.usage.output)} · cache read ${formatExactTokens(state.usage.cacheRead)} · cache write ${formatExactTokens(state.usage.cacheWrite)})`,
-			`- **Exact cost:** ${formatCost(state.usage.cost)}`,
-			`- **Session:** ${state.sessionFile ?? "unavailable"}`,
-		].filter(Boolean);
-		if (state.previousErrors.length > 0) details.push("- **Retry history:**", ...state.previousErrors.map((error) => `  - ${oneLine(error, 180)}`));
-		const body = state.finalAnswer || state.error || (state.status === "done" ? "(Subagent finished without a final answer.)" : "Subagent failed without a final answer.");
-		return `---\n\n${title}\n\n${metadata}\n\n${details.join("\n")}\n\n### Answer\n\n${body}`;
-	});
-	const failures = results.filter((result) => result.state.status === "error" || result.state.status === "aborted").length;
-	const header = buildSubagentPromptHeader(states, false);
-	const assignmentContext = header ? `# Assignment Context\n\n${header}` : "";
-	const priorityLegend = results[0]?.state.kind === "review"
-		? "Priority legend: [P0] critical/blocking, [P1] high/should fix before merge/use, [P2] medium/actionable, [P3] low/minor or test gap."
-		: "";
-	const answersSection = ["# Subagent Answers", priorityLegend, ...answers].filter(Boolean).join("\n\n");
-	return {
-		content: [{ type: "text" as const, text: [overallText, assignmentContext, answersSection, "---", FINAL_RESULT_DISCLAIMER].filter(Boolean).join("\n\n") }],
-		details: {
-			failures,
-			summary: stats.summary,
-			overallText,
-			manifest,
-			assignmentContext,
-			priorityLegend,
-			results: results.map((result) => ({
-				kind: result.state.kind,
-				description: result.state.description,
-				sessionName: result.state.sessionName,
-				sessionFile: result.state.sessionFile,
-				sandboxDir: result.state.sandboxDir,
-				mainTask: result.state.mainTask,
-				contextMode: result.state.contextMode,
-				systemPromptDisplay: result.state.systemPromptDisplay,
-				whatToReview: result.state.whatToReview,
-				focus: result.state.focus,
-				assignment: result.state.assignment,
-				status: result.state.status,
-				modelRef: result.state.modelRef,
-				thinking: result.state.thinking,
-				error: result.state.error,
-				finalAnswer: result.state.finalAnswer,
-				lastActivity: result.state.lastActivity,
-				usage: { ...result.state.usage, totalTokens: totalTokens(result.state.usage) },
-				durationMs: Math.max(0, result.state.updatedAt - result.state.startedAt),
-				contextWindow: result.state.contextWindow,
-				contextTokens: result.state.contextTokens,
-				contextPercent: result.state.contextPercent,
-				attempt: result.state.attempt,
-				attempts: result.state.attempt,
-				maxAttempts: result.state.maxAttempts,
-				previousErrors: result.state.previousErrors,
-			})),
-		},
-		isError: failures === results.length,
-	};
-}
-
-function renderFinalSubagentResult(result: any, prefix: string, theme: Theme): Container | undefined {
-	const details = result?.details;
-	if (!Array.isArray(details?.results)) return undefined;
-
-	const container = new Container();
-	container.addChild(new Text(prefix, 0, 0));
-	if (details.overallText) container.addChild(new Markdown(details.overallText, 0, 0, getMarkdownTheme()));
-	if (details.assignmentContext) container.addChild(new Markdown(details.assignmentContext, 0, 0, getMarkdownTheme()));
-	container.addChild(new Text(theme.fg("toolTitle", theme.bold("Subagent Answers")), 0, 0));
-	if (details.priorityLegend) container.addChild(new Text(theme.fg("dim", details.priorityLegend), 0, 0));
-
-	details.results.forEach((item: any, index: number) => {
-		container.addChild(new DynamicBorder((text: string) => theme.fg("borderMuted", text)));
-		container.addChild(new Text(theme.fg("toolTitle", theme.bold(`Subagent ${index + 1}`)), 0, 0));
-		container.addChild(new Text(renderStatusRow(item as RuntimeState, theme, false), 0, 0));
-
-		const specificAssignment = item.kind === "review" ? item.focus : item.assignment;
-		const usage = item.usage as UsageStats;
-		const info = [
-			`context: ${item.contextMode ?? "fresh"}`,
-			specificAssignment ? `${item.kind === "review" ? "focus" : "assignment"}: ${specificAssignment}` : "",
-			`${countLabel(item.attempts ?? item.attempt ?? 1, "attempt")} · ${countLabel(usage?.turns ?? 0, "turn")} · ${formatDuration(item.durationMs ?? 0)}`,
-			`tokens: ${formatExactTokens(totalTokens(usage))} total (input ${formatExactTokens(usage.input)} · output ${formatExactTokens(usage.output)} · cache read ${formatExactTokens(usage.cacheRead)} · cache write ${formatExactTokens(usage.cacheWrite)})`,
-			`exact cost: ${formatCost(usage.cost)}`,
-			`session: ${item.sessionFile ?? "unavailable"}`,
-		].filter(Boolean);
-		if (Array.isArray(item.previousErrors) && item.previousErrors.length > 0) {
-			info.push("retry history:", ...item.previousErrors.map((error: string) => `  ${oneLine(error, 180)}`));
-		}
-		container.addChild(new Text(theme.fg("muted", info.join("\n")), 0, 0));
-
-		const body = item.finalAnswer || item.error || (item.status === "done" ? "(Subagent finished without a final answer.)" : "Subagent failed without a final answer.");
-		container.addChild(new Text(theme.fg("accent", theme.bold("Answer")), 0, 0));
-		container.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
-	});
-
-	container.addChild(new DynamicBorder((text: string) => theme.fg("borderMuted", text)));
-	container.addChild(new Text(theme.fg("dim", FINAL_RESULT_DISCLAIMER), 0, 0));
-	return container;
-}
-
-function buildLaunchValidationFailure(label: string, errors: string[], manifest?: LaunchManifestMetadata) {
-	const reportedErrors = reportValidationErrors(errors);
-	return {
-		content: [{ type: "text" as const, text: [`${label} were not launched because validation failed:`, ...reportedErrors.map((error) => `- ${error}`)].join("\n") }],
-		details: { errors: reportedErrors, totalErrors: errors.length, manifest },
-		isError: true,
-	};
+Code review subagents:
+- Use ${REVIEW_TOOL_NAME} for code reviews. It is intentionally blocking and injects the standard review rubric.
+- Only launch reviewers when the user explicitly requests delegated/parallel code review or unmistakably asks for independent reviewers.
+- Every reviewer entry requires an exact provider/model-id and explicit thinking level covered by the user's established model contract.
+- Supply only a neutral review target and optional neutral focus. Do not bias reviewers with suspected findings unless the user explicitly asks to verify one.
+- Synthesize reviewer answers, deduplicate findings, and call out disagreement or uncertainty.`;
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event) => {
-		const promptCacheKey = process.env.PI_SUBAGENT_PROMPT_CACHE_KEY;
+		const promptCacheKey = process.env[PROMPT_CACHE_ENV];
 		if (!promptCacheKey || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
 		const payload = event.payload as Record<string, unknown>;
 		if (Object.hasOwn(payload, "prompt_cache_key")) return { ...payload, prompt_cache_key: promptCacheKey };
 		if (Object.hasOwn(payload, "promptCacheKey")) return { ...payload, promptCacheKey };
 	});
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${buildMainSystemPromptAddition()}`,
-	}));
+	// Managed children are workers, not orchestrators. Their prompts are supplied by the parent.
+	if (process.env[MANAGED_CHILD_ENV] === "1") return;
+
+	let manager: SubagentManager | undefined;
+	let latestCtx: ExtensionContext | undefined;
+	let unsubscribe: (() => void) | undefined;
+	let completionFlushScheduled = false;
+	let shuttingDown = false;
+
+	const flushCompletions = () => {
+		if (shuttingDown || !latestCtx?.isIdle() || !manager) return;
+		const deliverable = manager.getDeliverable();
+		if (deliverable.length === 0) return;
+		const ids = deliverable.map((record) => record.id);
+		pi.sendMessage({
+			customType: "subagent-completions",
+			content: `Background subagent completion${deliverable.length === 1 ? "" : "s"}:\n\n${formatCompletion(deliverable)}`,
+			display: true,
+			details: { agents: deliverable.map(compactRecord) },
+		}, { deliverAs: "followUp", triggerTurn: true });
+		manager.markDelivered(ids);
+	};
+
+	const scheduleCompletionFlush = () => {
+		if (completionFlushScheduled || !latestCtx?.isIdle()) return;
+		completionFlushScheduled = true;
+		queueMicrotask(() => {
+			completionFlushScheduled = false;
+			flushCompletions();
+		});
+	};
+
+	const ensureManager = (ctx: ExtensionContext): SubagentManager => {
+		latestCtx = ctx;
+		if (shuttingDown) throw new Error("Subagent extension is shutting down");
+		if (manager) return manager;
+		manager = new SubagentManager(ctx.cwd);
+		manager.restore(scanSerializedAgents(ctx));
+		unsubscribe = manager.subscribe((event) => {
+			if (event.kind === "settled") scheduleCompletionFlush();
+		});
+		return manager;
+	};
+
+	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions()}` }));
 
 	pi.registerTool({
-		name: REVIEW_TOOL_NAME,
-		label: "Launch Code Review Subagents",
-		description: "Launch one or more same-cwd Pi code review subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. A mutually exclusive system_prompt or system_prompt_file may add shared system-level instructions only with fresh context. The extension injects the code review rubric and output format.",
+		name: START_TOOL_NAME,
+		label: "Start Subagent",
+		description: "Start one managed same-cwd Pi subagent and return immediately. Exact provider/model-id and thinking are required. Alternatively supply input_file by itself containing a non-empty JSON array of complete normal start requests. Small launches return normal per-agent output; large handle lists spill to a file.",
 		parameters: Type.Object({
-			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: what_to_review, optional context/system prompt, and reviewers. Must be supplied by itself." })),
-			what_to_review: Type.Optional(Type.String({ description: "Required in inline mode. Neutral description of the code review target. Specify only what code to review; do not include review rubric, output formatting, suspected findings, or expected verdict." })),
-			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
-			system_prompt: Type.Optional(Type.String({ description: "Optional additional system instructions shared by all reviewers. Mutually exclusive with system_prompt_file and allowed only with fresh context." })),
-			system_prompt_file: Type.Optional(Type.String({ description: "Optional local UTF-8 text file whose contents become additional system instructions shared by all reviewers. Relative paths resolve from cwd. Mutually exclusive with system_prompt and allowed only with fresh context." })),
-			reviewers: Type.Optional(Type.Array(
-				Type.Object({
-					description: Type.String({ description: "Short session description used as `[Review Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated reviewers." }),
-					focus: Type.Optional(Type.String({ description: "Optional neutral focus area, such as 'data safety' or 'performance'. Do not include suspected findings unless the user explicitly asked to verify them." })),
-					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
-					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
-				}, { additionalProperties: false }),
-				{ minItems: 1, description: "Code review subagents to launch in parallel." },
-			)),
+			input_file: Type.Optional(Type.String({ description: "Alternative to inline fields. JSON file containing an array of complete subagent_start requests. Must be supplied by itself." })),
+			title: Type.Optional(Type.String({ description: "Short human-readable subagent title. Required inline." })),
+			task: Type.Optional(Type.String({ description: "Complete task for this subagent. Required inline." })),
+			model: Type.Optional(Type.String({ description: "Required exact provider/model-id. Never inherited or loosely matched." })),
+			thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Required explicit Pi thinking level." })),
+			context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
+			system_prompt: Type.Optional(Type.String({ description: "Optional additional system prompt; fresh context only." })),
+			system_prompt_file: Type.Optional(Type.String({ description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 		}, { additionalProperties: false }),
-		async execute(_toolCallId, params: ReviewToolParams, signal, onUpdate, ctx) {
-			const resolvedInput = await resolveReviewLaunchInput(params, ctx.cwd).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] } as ResolvedLaunchInput<ReviewLaunchParams>));
-			if (resolvedInput.errors?.length || !resolvedInput.params) {
-				return buildLaunchValidationFailure("Code review subagents", resolvedInput.errors ?? ["launch request did not resolve to valid parameters"], resolvedInput.manifest);
-			}
-			const prepared: PreparedTasks = await prepareReviewTasks(resolvedInput.params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
-			if (prepared.errors?.length) {
-				return buildLaunchValidationFailure("Code review subagents", prepared.errors, resolvedInput.manifest);
-			}
-
-			const tasks = prepared.tasks ?? [];
-			const activeStates: RuntimeState[] = tasks.map((task) => ({
-				kind: task.kind,
-				index: task.index,
-				description: task.description,
-				sessionName: task.sessionName,
-				sandboxDir: task.sandboxDir,
-				mainTask: task.mainTask,
-				whatToReview: task.whatToReview,
-				focus: task.focus,
-				assignment: task.assignment,
-				modelRef: task.modelRef,
-				thinking: task.thinking,
-				contextMode: task.contextMode,
-				systemPromptDisplay: task.systemPromptDisplay,
-				status: "preparing",
-				lastActivity: "prepared",
-				finalAnswer: "",
-				sessionFile: task.initialSessionFile,
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-				attempt: 1,
-				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
-				previousErrors: [],
-				startedAt: Date.now(),
-				updatedAt: Date.now(),
-			}));
-
-			const emit = () => {
-				onUpdate?.(buildToolPartial(activeStates));
-			};
-
-			emit();
-
-			if (signal?.aborted) {
-				for (const state of activeStates) {
-					state.status = "aborted";
-					state.error = "aborted before launch";
+		async execute(_id, params: StartToolParams, signal, _onUpdate, ctx) {
+			const prepared: PreparedAgent[] = [];
+			let addedCount = 0;
+			try {
+				if (signal?.aborted) throw new Error("Subagent start aborted before preparation");
+				const resolved = await resolveStartSpecs(params, ctx.cwd);
+				// Validate the complete request before creating any child session files.
+				for (const spec of resolved.specs) {
+					const model = exactModel(ctx, spec.model);
+					validateThinking(model, spec.thinking);
+					await readSystemPrompt(spec, ctx.cwd);
 				}
-				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })), resolvedInput.manifest);
+				for (const spec of resolved.specs) {
+					if (signal?.aborted) throw new Error("Subagent start aborted during preparation");
+					prepared.push(await prepareAgent(spec, ctx, genericPrompt));
+				}
+				if (signal?.aborted) throw new Error("Subagent start aborted during preparation");
+				const activeManager = ensureManager(ctx);
+				const records: AgentRecord[] = [];
+				for (const item of prepared) {
+					records.push(activeManager.add(item));
+					addedCount++;
+				}
+				const serialized = records.map(serializeAgent);
+				let text: string;
+				let handlesFile: string | undefined;
+				if (records.length <= NORMAL_LAUNCH_DETAIL_LIMIT) {
+					text = `Started ${records.length} subagent${records.length === 1 ? "" : "s"}:\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
+				} else {
+					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+					const running = Math.min(records.length, MAX_CONCURRENT_SUBAGENTS);
+					try {
+						await writeFile(handlesFile, `${JSON.stringify(serialized, null, 2)}\n`, "utf8");
+						text = `Accepted ${records.length} subagents.\nStarting/running: ${running}\nQueued internally: ${Math.max(0, records.length - running)}\nHandle list saved to: ${handlesFile}`;
+					} catch (error) {
+						handlesFile = undefined;
+						text = `Accepted ${records.length} subagents.\nStarting/running: ${running}\nQueued internally: ${Math.max(0, records.length - running)}\nWarning: the compact handle file could not be written (${error instanceof Error ? error.message : String(error)}). Handles remain preserved in this tool result's details.`;
+					}
+				}
+				if (resolved.manifest) text += `\nInput: ${resolved.manifest.path} · ${resolved.manifest.bytes.toLocaleString("en-US")} bytes · SHA-256 ${resolved.manifest.sha256}`;
+				return result(text, { agents: serialized, handlesFile, manifest: resolved.manifest });
+			} catch (error) {
+				await cleanupPreparedAgents(prepared.slice(addedCount));
+				return result(`Subagents were not started: ${error instanceof Error ? error.message : String(error)}`, { error: error instanceof Error ? error.message : String(error) }, true);
 			}
-
-			const results = await Promise.all(tasks.map((task, index) => runSubagentWithRetries(task, ctx, activeStates[index]!, emit, signal)));
-			emit();
-			return buildFinalToolResult(results, resolvedInput.manifest);
 		},
 		renderCall(args, theme) {
-			const inputFile = typeof (args as any)?.input_file === "string" ? oneLine((args as any).input_file, 80) : "";
-			if (inputFile) return new Text(`${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `manifest ${inputFile}`)}`, 0, 0);
-			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
-			const label = `${theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME))} ${theme.fg("accent", `${count} reviewer${count === 1 ? "" : "s"}`)}${theme.fg("muted", systemPromptCallSuffix(args))}`;
-			return new Text(label, 0, 0);
-		},
-		renderResult(result, { isPartial }, theme) {
-			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
-			const prefix = result?.isError ? theme.fg("error", "code review subagents") : theme.fg("success", "code review subagents");
-			if (isPartial && Array.isArray(result?.details?.states)) return renderToolPartial(result.details.states as RuntimeState[], prefix, theme);
-			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
-			const finalResult = renderFinalSubagentResult(result, prefix, theme);
-			if (finalResult) return finalResult;
-
-			const container = new Container();
-			container.addChild(new Text(prefix, 0, 0));
-			if (text) container.addChild(new Markdown(text, 0, 0, getMarkdownTheme()));
-			return container;
+			const file = typeof (args as any)?.input_file === "string" ? ` ${oneLine((args as any).input_file, 70)}` : ` ${oneLine((args as any)?.title ?? "subagent", 70)}`;
+			return new Text(theme.fg("toolTitle", theme.bold(START_TOOL_NAME)) + theme.fg("muted", file), 0, 0);
 		},
 	});
 
 	pi.registerTool({
-		name: GENERIC_TOOL_NAME,
-		label: "Launch Generic Subagents",
-		description: "Launch one or more same-cwd Pi generic subagents in parallel. Supply the normal inline fields, or input_file by itself pointing to a strictly validated UTF-8 JSON file containing the complete normal request. Context defaults to fresh; explicitly requested transcript or native-clone context is supported. A mutually exclusive system_prompt or system_prompt_file may add shared system-level instructions only with fresh context. No task-specific output format is injected.",
+		name: LIST_TOOL_NAME,
+		label: "List Subagents",
+		description: "List managed subagents compactly. Does not return transcripts, raw tool output, or full final answers.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const records = ensureManager(ctx).list();
+			const formatted = formatList(records);
+			const truncated = truncateHead(formatted);
+			return result(truncated.content, { agents: records.map(compactRecord), truncated: truncated.truncated });
+		},
+	});
+
+	pi.registerTool({
+		name: STATUS_TOOL_NAME,
+		label: "Subagent Status",
+		description: "Return accurate compact status for selected subagents: active tools, last observed activity, recent compact activity, usage, and session path. Never returns transcript or raw tool output.",
+		parameters: Type.Object({ ids: Type.Array(Type.String(), { minItems: 1, maxItems: 32 }) }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const records = [...new Set(params.ids)].map((id) => ensureManager(ctx).get(id));
+				return result(records.map(formatStatus).join("\n\n---\n\n"), { agents: records.map(compactRecord) });
+			} catch (error) {
+				return result(error instanceof Error ? error.message : String(error), {}, true);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: SEND_TOOL_NAME,
+		label: "Message Subagent",
+		description: "Send a continuation to a cold subagent, steer a running subagent, or queue a running follow-up. Continuations use the subagent's fixed model and thinking level.",
 		parameters: Type.Object({
-			input_file: Type.Optional(Type.String({ description: "Alternative to all inline fields. Path, relative to cwd or absolute, to a UTF-8 JSON file containing the complete request object: task, optional context/system prompt, and subagents. Must be supplied by itself." })),
-			task: Type.Optional(Type.String({ description: "Required in inline mode. Complete generic task to give every subagent. Include all relevant context and desired output shape." })),
-			context: Type.Optional(StringEnum(["fresh", "transcript", "clone"] as const, { description: "Optional context mode. Omit unless explicitly requested; defaults to fresh. transcript pastes completed conversation text. clone starts from a native session clone ending before the current user request." })),
-			system_prompt: Type.Optional(Type.String({ description: "Optional additional system instructions shared by all subagents. Mutually exclusive with system_prompt_file and allowed only with fresh context." })),
-			system_prompt_file: Type.Optional(Type.String({ description: "Optional local UTF-8 text file whose contents become additional system instructions shared by all subagents. Relative paths resolve from cwd. Mutually exclusive with system_prompt and allowed only with fresh context." })),
-			subagents: Type.Optional(Type.Array(
-				Type.Object({
-					description: Type.String({ description: "Short session description used as `[Generic Subagent] <description>`. Make it distinctive; add #2 etc yourself for repeated subagents." }),
-					assignment: Type.Optional(Type.String({ description: "Optional per-subagent assignment, angle, or scope. This is appended to the shared task." })),
-					model: Type.Optional(Type.String({ description: "Optional model override. Prefer explicit provider/model-id when known; loose names are accepted only if they match one available model." })),
-					thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)) as any, { description: "Optional Pi thinking level override." })),
-				}, { additionalProperties: false }),
-				{ minItems: 1, description: "Generic subagents to launch in parallel." },
-			)),
-		}, { additionalProperties: false }),
-		async execute(_toolCallId, params: GenericToolParams, signal, onUpdate, ctx) {
-			const resolvedInput = await resolveGenericLaunchInput(params, ctx.cwd).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] } as ResolvedLaunchInput<GenericLaunchParams>));
-			if (resolvedInput.errors?.length || !resolvedInput.params) {
-				return buildLaunchValidationFailure("Generic subagents", resolvedInput.errors ?? ["launch request did not resolve to valid parameters"], resolvedInput.manifest);
+			id: Type.String({ minLength: 1 }),
+			message: Type.String({ minLength: 1 }),
+			delivery: Type.Optional(StringEnum(["steer", "follow_up"] as const, { description: "For a running subagent: steer after current tool calls, or follow_up after it otherwise finishes. Defaults to follow_up." })),
+		}),
+		async execute(_toolId, params, _signal, _onUpdate, ctx) {
+			try {
+				const sent = await ensureManager(ctx).send(params.id, params.message, params.delivery ?? "follow_up");
+				return result(sent.continued
+					? `Continued ${sent.record.id} as ${sent.record.currentRunId} using ${sent.record.modelRef} [${sent.record.thinking}].`
+					: `Message accepted by running ${sent.record.id} using ${sent.record.modelRef} [${sent.record.thinking}].`,
+				{ agent: serializeAgent(sent.record), runId: sent.record.currentRunId, continued: sent.continued });
+			} catch (error) {
+				return result(error instanceof Error ? error.message : String(error), {}, true);
 			}
-			const prepared: PreparedTasks = await prepareGenericTasks(resolvedInput.params, ctx, pi).catch((error) => ({ errors: [error instanceof Error ? error.message : String(error)] }));
-			if (prepared.errors?.length) {
-				return buildLaunchValidationFailure("Generic subagents", prepared.errors, resolvedInput.manifest);
-			}
+		},
+	});
 
-			const tasks = prepared.tasks ?? [];
-			const activeStates: RuntimeState[] = tasks.map((task) => ({
-				kind: task.kind,
-				index: task.index,
-				description: task.description,
-				sessionName: task.sessionName,
-				sandboxDir: task.sandboxDir,
-				mainTask: task.mainTask,
-				whatToReview: task.whatToReview,
-				focus: task.focus,
-				assignment: task.assignment,
-				modelRef: task.modelRef,
-				thinking: task.thinking,
-				contextMode: task.contextMode,
-				systemPromptDisplay: task.systemPromptDisplay,
-				status: "preparing",
-				lastActivity: "prepared",
-				finalAnswer: "",
-				sessionFile: task.initialSessionFile,
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-				attempt: 1,
-				maxAttempts: MAX_SUBAGENT_ATTEMPTS,
-				previousErrors: [],
-				startedAt: Date.now(),
-				updatedAt: Date.now(),
-			}));
+	const IdSelector = Type.Object({
+		ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+		input_file: Type.Optional(Type.String({ description: "Handle JSON file returned by a large subagent_start call. Mutually exclusive with ids." })),
+	});
 
-			const emit = () => {
-				onUpdate?.(buildToolPartial(activeStates));
-			};
-
-			emit();
-
-			if (signal?.aborted) {
-				for (const state of activeStates) {
-					state.status = "aborted";
-					state.error = "aborted before launch";
+	pi.registerTool({
+		name: WAIT_TOOL_NAME,
+		label: "Wait for Subagents",
+		description: "Wait for selected subagents to become cold. Cancellation leaves unfinished subagents running. Returns compact outcomes, not final answers.",
+		parameters: Type.Object({
+			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+			input_file: Type.Optional(Type.String()),
+			timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400 })),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx) {
+			try {
+				const ids = await resolveIds(params, ctx.cwd);
+				const activeManager = ensureManager(ctx);
+				const waitController = new AbortController();
+				let timedOut = false;
+				const onAbort = () => waitController.abort();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				const timeout = params.timeout_seconds === undefined ? undefined : setTimeout(() => {
+					timedOut = true;
+					waitController.abort();
+				}, params.timeout_seconds * 1_000);
+				const heartbeat = setInterval(() => {
+					const records = ids.map((id) => activeManager.get(id));
+					onUpdate?.(result(formatList(records), { agents: records.map(compactRecord) }));
+				}, 1_000);
+				try {
+					const records = await activeManager.wait(ids, waitController.signal, true);
+					return result(`Selected subagents settled:\n${formatList(records)}\n\nUse ${RESULT_TOOL_NAME} only for answers you need.`, { agents: records.map(compactRecord) });
+				} catch (error) {
+					if (!timedOut) throw error;
+					const records = ids.map((id) => activeManager.get(id));
+					return result(`Wait timed out; unfinished subagents are still running:\n${formatList(records)}`, { agents: records.map(compactRecord), timedOut: true });
+				} finally {
+					clearInterval(heartbeat);
+					if (timeout) clearTimeout(timeout);
+					signal?.removeEventListener("abort", onAbort);
 				}
-				return buildFinalToolResult(activeStates.map((state) => ({ state, exitCode: null })), resolvedInput.manifest);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return result(message, { unfinishedStillRunning: error instanceof SubagentWaitAbortedError }, true);
 			}
+		},
+	});
 
-			const results = await Promise.all(tasks.map((task, index) => runSubagentWithRetries(task, ctx, activeStates[index]!, emit, signal)));
-			emit();
-			return buildFinalToolResult(results, resolvedInput.manifest);
+	pi.registerTool({
+		name: RESULT_TOOL_NAME,
+		label: "Read Subagent Result",
+		description: "Read the final assistant answer for one subagent run. Status and list intentionally omit full answers.",
+		parameters: Type.Object({
+			id: Type.String({ minLength: 1 }),
+			run_id: Type.Optional(Type.String({ minLength: 1, description: "Specific run ID. Omit for the latest run." })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const record = ensureManager(ctx).get(params.id);
+				const found = findRunResult(record, params.run_id);
+				if (!found.text) return result(`${record.id}${found.runId ? ` ${found.runId}` : ""} has no final assistant answer.`, { agent: compactRecord(record), runId: found.runId }, true);
+				const truncated = truncateHead(found.text);
+				let text = `${record.id}${found.runId ? ` · ${found.runId}` : ""}\n${record.modelRef} [${record.thinking}]\n\n${truncated.content}`;
+				if (truncated.truncated) text += `\n\n[Result truncated. The complete answer remains in ${record.sessionFile}]`;
+				return result(text, { agent: compactRecord(record), runId: found.runId, truncated: truncated.truncated });
+			} catch (error) {
+				return result(error instanceof Error ? error.message : String(error), {}, true);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: STOP_TOOL_NAME,
+		label: "Stop Subagents",
+		description: "Stop selected queued or running subagents while preserving their normal Pi session files for later continuation.",
+		parameters: IdSelector,
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const ids = await resolveIds(params, ctx.cwd);
+				const records = await ensureManager(ctx).stop(ids);
+				return result(`Stop requested:\n${formatList(records)}`, { agents: records.map(compactRecord) });
+			} catch (error) {
+				return result(error instanceof Error ? error.message : String(error), {}, true);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: REVIEW_TOOL_NAME,
+		label: "Launch Code Review Subagents",
+		description: "Launch independent code review subagents through the shared manager, wait for all reviewers, and return their structured answers. This operation is intentionally blocking. Every reviewer requires an exact provider/model-id and explicit thinking level.",
+		parameters: Type.Object({
+			input_file: Type.Optional(Type.String({ description: "Alternative to inline fields. Existing review manifest object. Must be supplied by itself." })),
+			what_to_review: Type.Optional(Type.String({ description: "Neutral code review target. Required inline." })),
+			context: Type.Optional(StringEnum(CONTEXT_MODES)),
+			system_prompt: Type.Optional(Type.String()),
+			system_prompt_file: Type.Optional(Type.String()),
+			reviewers: Type.Optional(Type.Array(Type.Object({
+				description: Type.String({ minLength: 1 }),
+				focus: Type.Optional(Type.String()),
+				model: Type.String({ minLength: 1, description: "Required exact provider/model-id." }),
+				thinking: StringEnum(THINKING_LEVELS, { description: "Required explicit thinking level." }),
+			}, { additionalProperties: false }), { minItems: 1 })),
+		}, { additionalProperties: false }),
+		async execute(_id, rawParams: ReviewToolParams, signal, onUpdate, ctx) {
+			const prepared: PreparedAgent[] = [];
+			let addedCount = 0;
+			try {
+				let params: ReviewParams;
+				let manifest: LaunchManifestMetadata | undefined;
+				if (rawParams.input_file !== undefined) {
+					if (Object.keys(rawParams).some((key) => key !== "input_file")) throw new Error("input_file must be supplied by itself");
+					const loaded = await readJsonFile(rawParams.input_file, ctx.cwd);
+					if (!isRecord(loaded.value)) throw new Error("Review manifest must be an object");
+					params = loaded.value as unknown as ReviewParams;
+					manifest = { ...loaded.metadata, entries: Array.isArray((loaded.value as any).reviewers) ? (loaded.value as any).reviewers.length : 0 };
+				} else params = rawParams as ReviewParams;
+				if (typeof params.what_to_review !== "string" || !cleanText(params.what_to_review)) throw new Error("what_to_review is required");
+				if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) throw new Error("reviewers is required and must not be empty");
+				if (params.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(params.context)) throw new Error(`Invalid context: ${String(params.context)}`);
+				if (params.system_prompt !== undefined && params.system_prompt_file !== undefined) throw new Error("system_prompt and system_prompt_file are mutually exclusive");
+				if ((params.system_prompt !== undefined || params.system_prompt_file !== undefined) && params.context !== undefined && params.context !== "fresh") throw new Error("custom system prompts require fresh context");
+				const target = cleanText(params.what_to_review);
+				// Validate every reviewer before creating any child session files.
+				for (const [index, reviewer] of params.reviewers.entries()) {
+					if (signal?.aborted) throw new Error("Code review launch aborted during preparation");
+					if (!isRecord(reviewer) || typeof reviewer.description !== "string" || !cleanText(reviewer.description)) throw new Error(`reviewers[${index}].description is required`);
+					if (typeof reviewer.model !== "string" || !cleanText(reviewer.model)) throw new Error(`reviewers[${index}].model is required and must be exact provider/model-id`);
+					if (!(THINKING_LEVELS as readonly unknown[]).includes(reviewer.thinking)) throw new Error(`reviewers[${index}].thinking is required`);
+					const model = exactModel(ctx, reviewer.model);
+					validateThinking(model, reviewer.thinking);
+				}
+				await readSystemPrompt({ system_prompt: params.system_prompt, system_prompt_file: params.system_prompt_file }, ctx.cwd);
+				for (const [index, reviewer] of params.reviewers.entries()) {
+					if (signal?.aborted) throw new Error("Code review launch aborted during preparation");
+					if (!isRecord(reviewer) || typeof reviewer.description !== "string" || !cleanText(reviewer.description)) throw new Error(`reviewers[${index}].description is required`);
+					if (typeof reviewer.model !== "string" || !cleanText(reviewer.model)) throw new Error(`reviewers[${index}].model is required and must be exact provider/model-id`);
+					if (!(THINKING_LEVELS as readonly unknown[]).includes(reviewer.thinking)) throw new Error(`reviewers[${index}].thinking is required`);
+					const spec: StartSpec = {
+						title: `[Review] ${reviewer.description}`,
+						task: target,
+						model: reviewer.model,
+						thinking: reviewer.thinking,
+						context: params.context,
+						system_prompt: params.system_prompt,
+						system_prompt_file: params.system_prompt_file,
+					};
+					prepared.push(await prepareAgent(spec, ctx, (_task, sandbox, transcript) => reviewPrompt(target, cleanText(reviewer.focus || "") || undefined, sandbox, transcript), "review"));
+				}
+				if (signal?.aborted) throw new Error("Code review launch aborted during preparation");
+				const activeManager = ensureManager(ctx);
+				const records: AgentRecord[] = [];
+				for (const item of prepared) {
+					records.push(activeManager.add(item));
+					addedCount++;
+				}
+				const heartbeat = setInterval(() => onUpdate?.(result(formatList(records), { agents: records.map(compactRecord) })), 500);
+				try {
+					await activeManager.wait(records.map((record) => record.id), signal, true);
+				} catch (error) {
+					if (signal?.aborted) await activeManager.stop(records.map((record) => record.id));
+					throw error;
+				} finally { clearInterval(heartbeat); }
+				const answers = records.map((record, index) => {
+					let answer = record.finalAnswer || record.error || "(No final answer.)";
+					try { answer = findRunResult(record).text || answer; } catch {}
+					const duration = record.startedAt && record.settledAt ? formatDuration(record.settledAt - record.startedAt) : "unknown";
+					return `---\n\n## Reviewer ${index + 1} — ${record.title}\n\n> ${record.id} · ${record.modelRef} [${record.thinking}] · ${record.lastOutcome}\n\n- **Attempts / model turns / duration:** ${record.attempt} · ${record.usage.turns} · ${duration}\n- **Tokens:** ${totalUsageTokens(record.usage).toLocaleString("en-US")} total (input ${record.usage.input.toLocaleString("en-US")} · output ${record.usage.output.toLocaleString("en-US")} · cache read ${record.usage.cacheRead.toLocaleString("en-US")} · cache write ${record.usage.cacheWrite.toLocaleString("en-US")})\n- **Exact cost:** ${formatCost(record.usage.cost)}\n- **Session:** ${record.sessionFile}\n\n${answer}`;
+				});
+				const failures = records.filter((record) => record.lastOutcome !== "completed").length;
+				const totalCost = records.reduce((sum, record) => sum + record.usage.cost, 0);
+				const totalTokens = records.reduce((sum, record) => sum + totalUsageTokens(record.usage), 0);
+				const header = `# Review Subagent Results\n\nReviewers: ${records.length} · failures: ${failures}\nTokens: ${totalTokens.toLocaleString("en-US")} · total cost: ${formatCost(totalCost)}${manifest ? `\nManifest: ${manifest.path}` : ""}`;
+				const fullReview = [header, ...answers, "---", FINAL_RESULT_DISCLAIMER].join("\n\n");
+				const truncated = truncateHead(fullReview);
+				let reviewFile: string | undefined;
+				let reviewText = truncated.content;
+				if (truncated.truncated) {
+					reviewFile = path.join(tmpdir(), `pi-review-subagents-${Date.now()}-${randomUUID().slice(0, 8)}.md`);
+					try {
+						await writeFile(reviewFile, fullReview, "utf8");
+						reviewText += `\n\n[Combined review output truncated. Full output saved to: ${reviewFile}]`;
+					} catch (error) {
+						reviewFile = undefined;
+						reviewText += `\n\n[Combined review output truncated. The complete reviewer answers remain in their child sessions. Could not write a combined artifact: ${error instanceof Error ? error.message : String(error)}]`;
+					}
+				}
+				return result(reviewText, { agents: records.map(serializeAgent), failures, manifest, reviewFile, truncated: truncated.truncated }, failures === records.length);
+			} catch (error) {
+				await cleanupPreparedAgents(prepared.slice(addedCount));
+				return result(`Code review subagents failed: ${error instanceof Error ? error.message : String(error)}`, { error: error instanceof Error ? error.message : String(error) }, true);
+			}
 		},
 		renderCall(args, theme) {
-			const inputFile = typeof (args as any)?.input_file === "string" ? oneLine((args as any).input_file, 80) : "";
-			if (inputFile) return new Text(`${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `manifest ${inputFile}`)}`, 0, 0);
-			const count = Array.isArray((args as any)?.subagents) ? (args as any).subagents.length : 0;
-			const label = `${theme.fg("toolTitle", theme.bold(GENERIC_TOOL_NAME))} ${theme.fg("accent", `${count} subagent${count === 1 ? "" : "s"}`)}${theme.fg("muted", systemPromptCallSuffix(args))}`;
-			return new Text(label, 0, 0);
+			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
+			return new Text(theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME)) + theme.fg("muted", (args as any)?.input_file ? ` manifest ${(args as any).input_file}` : ` ${count} reviewer${count === 1 ? "" : "s"}`), 0, 0);
 		},
-		renderResult(result, { isPartial }, theme) {
-			const text = result?.content?.find?.((part: any) => part?.type === "text")?.text ?? "";
-			const prefix = result?.isError ? theme.fg("error", "generic subagents") : theme.fg("success", "generic subagents");
-			if (isPartial && Array.isArray(result?.details?.states)) return renderToolPartial(result.details.states as RuntimeState[], prefix, theme);
-			if (isPartial) return new Text(`${prefix}\n\n${text}`, 0, 0);
-			const finalResult = renderFinalSubagentResult(result, prefix, theme);
-			if (finalResult) return finalResult;
+	});
 
-			const container = new Container();
-			container.addChild(new Text(prefix, 0, 0));
-			if (text) container.addChild(new Markdown(text, 0, 0, getMarkdownTheme()));
-			return container;
+	pi.registerMessageRenderer("subagent-completions", (message, _options, theme) => new Text(theme.fg("accent", theme.bold("Subagent completion")) + `\n${String(message.content)}`, 0, 0));
+
+	pi.registerCommand("subagents", {
+		description: "Inspect and interact with managed subagents",
+		handler: async (_args, ctx) => {
+			const activeManager = ensureManager(ctx);
+			if (!ctx.hasUI) return;
+			while (true) {
+				const records = activeManager.list();
+				if (records.length === 0) { ctx.ui.notify("No subagents are known in this parent session.", "info"); return; }
+				const choices = records.map((record) => `${record.id} · ${record.state === "cold" ? `cold/${record.lastOutcome}` : record.state} · ${record.title} · ${record.modelRef} [${record.thinking}]`);
+				const selected = await ctx.ui.select("Managed subagents", choices);
+				if (!selected) return;
+				const id = selected.split(" · ")[0]!;
+				const record = activeManager.get(id);
+				const action = await ctx.ui.select(`${record.id} — ${record.title}`, ["View status", "View transcript", "Send message", "Stop", "Show native session command", "Back"]);
+				if (!action || action === "Back") continue;
+				if (action === "View status") await ctx.ui.editor(`${record.id} status`, formatStatus(record));
+				else if (action === "View transcript") await ctx.ui.editor(`${record.id} transcript (read-only; edits are discarded)`, transcriptText(record));
+				else if (action === "Send message") {
+					const message = await ctx.ui.editor(`Message ${record.id}`, "");
+					if (message?.trim()) {
+						await activeManager.send(record.id, message, "follow_up");
+						ctx.ui.notify(`Message sent to ${record.id}.`, "info");
+					}
+				} else if (action === "Stop") {
+					await activeManager.stop([record.id]);
+					ctx.ui.notify(`Stop requested for ${record.id}.`, "info");
+				} else if (action === "Show native session command") {
+					const command = `pi --session ${JSON.stringify(record.sessionFile)}`;
+					await ctx.ui.editor("Native Pi command (copy this; edits are discarded)", command);
+					ctx.ui.notify("Stop the managed subagent before opening the same session in another Pi process.", "warning");
+				}
+			}
 		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		latestCtx = ctx;
+		shuttingDown = false;
+		ensureManager(ctx);
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		latestCtx = ctx;
+		flushCompletions();
+	});
+
+	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
+		unsubscribe?.();
+		unsubscribe = undefined;
+		const active = manager;
+		manager = undefined;
+		if (active) await active.dispose();
 	});
 }
