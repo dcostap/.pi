@@ -1455,8 +1455,9 @@ function buildMainInstructions(): string {
 - Multiple ${START_TOOL_NAME} calls in one assistant turn may run in parallel. For large programmatic launches, ${START_TOOL_NAME} accepts input_file by itself containing a JSON array of complete normal start requests.
 
 Code review subagents:
-- Use ${REVIEW_TOOL_NAME} for code reviews. It is intentionally blocking and injects the standard review rubric.
-- Only launch reviewers when the user explicitly requests delegated/parallel code review or unmistakably asks for independent reviewers.
+- Use ${REVIEW_TOOL_NAME} for code reviews. It is intentionally blocking and injects the standard review rubric, which lets them know to not edit anything, among other things.
+- Only launch review subagents when the user explicitly asks for them.
+- If user specifies "non-blocking review subagents", then you must use the more generic subagents.
 - Every reviewer entry requires an exact provider/model-id and explicit thinking level covered by the user's established model contract.
 - Supply only a neutral review target and optional neutral focus. Do not bias reviewers with suspected findings unless the user explicitly asks to verify one.
 - Synthesize reviewer answers, deduplicate findings, and call out disagreement or uncertainty.`;
@@ -1638,11 +1639,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			id: Type.String({ minLength: 1 }),
 			message: Type.String({ minLength: 1 }),
-			delivery: Type.Optional(StringEnum(["steer", "follow_up"] as const, { description: "For a running subagent: steer after current tool calls, or follow_up after it otherwise finishes. Defaults to follow_up." })),
+			delivery: Type.Optional(StringEnum(["steer", "follow_up"] as const, { description: "For a running subagent: steer after current tool calls, or follow_up after it otherwise finishes. Defaults to steer." })),
 		}),
 		async execute(_toolId, params, _signal, _onUpdate, ctx) {
 			try {
-				const sent = await ensureManager(ctx).send(params.id, params.message, params.delivery ?? "follow_up");
+				const sent = await ensureManager(ctx).send(params.id, params.message, params.delivery ?? "steer");
 				return result(sent.continued
 					? `Continued ${sent.record.id} as ${sent.record.currentRunId} using ${sent.record.modelRef} [${sent.record.thinking}].`
 					: `Message accepted by running ${sent.record.id} using ${sent.record.modelRef} [${sent.record.thinking}].`,
@@ -1653,7 +1654,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 		renderCall(args, theme, context) {
 			const input = args as any;
-			const delivery = input?.delivery ?? "follow_up";
+			const delivery = input?.delivery ?? "steer";
 			const preview = input?.message ? ` · “${oneLine(input.message, 70)}”` : "";
 			return toolHeader("Message subagent", `${input?.id ?? ""} · ${delivery}${preview}`, theme, context.lastComponent);
 		},
