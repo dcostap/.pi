@@ -5,13 +5,16 @@ import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+	getMarkdownTheme,
+	keyHint,
 	SessionManager,
 	truncateHead,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "./_shared/conversation-transcript.ts";
 
@@ -1289,8 +1292,134 @@ function transcriptText(record: AgentRecord): string {
 	return lines.join("\n");
 }
 
-function result(text: string, details: Record<string, unknown> = {}, isError = false) {
-	return { content: [{ type: "text" as const, text }], details, isError };
+function result(text: string, details: Record<string, unknown> = {}) {
+	return { content: [{ type: "text" as const, text }], details };
+}
+
+type DisplayAgent = {
+	id: string;
+	title: string;
+	state: string;
+	outcome: string;
+	model: string;
+	thinking: string;
+	activity: string;
+	cost: number;
+	turns: number;
+};
+
+function resultText(value: any): string {
+	if (!Array.isArray(value?.content)) return "";
+	return value.content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n");
+}
+
+function displayAgent(value: unknown): DisplayAgent | undefined {
+	if (!isRecord(value) || typeof value.id !== "string") return undefined;
+	return {
+		id: value.id,
+		title: typeof value.title === "string" ? value.title : "subagent",
+		state: typeof value.state === "string" ? value.state : "accepted",
+		outcome: typeof value.lastOutcome === "string" ? value.lastOutcome : "none",
+		model: typeof value.model === "string" ? value.model : typeof value.modelRef === "string" ? value.modelRef : "",
+		thinking: typeof value.thinking === "string" ? value.thinking : "",
+		activity: typeof value.activity === "string" ? value.activity : "",
+		cost: typeof value.cost === "number" ? value.cost : 0,
+		turns: typeof value.turns === "number" ? value.turns : 0,
+	};
+}
+
+function displayAgents(details: any): DisplayAgent[] {
+	const source = Array.isArray(details?.displayAgents) ? details.displayAgents : Array.isArray(details?.agents) ? details.agents : details?.agent ? [details.agent] : [];
+	return source.map(displayAgent).filter((agent): agent is DisplayAgent => agent !== undefined);
+}
+
+function displayState(agent: DisplayAgent): string {
+	return agent.state === "cold" ? agent.outcome : agent.state;
+}
+
+function stateGlyph(state: string): string {
+	if (state === "completed") return "✓";
+	if (state === "running" || state === "starting") return "◐";
+	if (state === "queued" || state === "accepted") return "…";
+	if (state === "stopped") return "■";
+	if (state === "failed") return "!";
+	if (state === "interrupted" || state === "stopping") return "◆";
+	return "·";
+}
+
+function styledState(state: string, theme: Theme): string {
+	const text = `${stateGlyph(state)} ${state}`;
+	if (state === "completed") return theme.fg("success", text);
+	if (state === "failed") return theme.fg("error", text);
+	if (state === "interrupted" || state === "stopped" || state === "stopping") return theme.fg("warning", text);
+	if (state === "running" || state === "starting") return theme.fg("accent", text);
+	return theme.fg("muted", text);
+}
+
+function agentCounts(agents: DisplayAgent[]): string {
+	const counts = new Map<string, number>();
+	for (const agent of agents) {
+		const state = displayState(agent);
+		counts.set(state, (counts.get(state) ?? 0) + 1);
+	}
+	const order = ["completed", "running", "starting", "queued", "accepted", "stopped", "interrupted", "failed", "none"];
+	return order.filter((state) => counts.has(state)).map((state) => `${counts.get(state)} ${state}`).join(" · ");
+}
+
+function agentRows(agents: DisplayAgent[], theme: Theme, expanded: boolean, maxCollapsed = 4, showMoreHint = true): string {
+	const shown = expanded ? agents : agents.slice(0, maxCollapsed);
+	const rows = shown.map((agent) => {
+		const state = displayState(agent);
+		const activity = agent.activity && agent.activity !== state ? ` · ${theme.fg("dim", oneLine(agent.activity, 80))}` : "";
+		const cost = agent.cost > 0 ? ` · ${theme.fg("dim", formatCost(agent.cost))}` : "";
+		const model = expanded && agent.model ? `\n    ${theme.fg("dim", `${agent.model}${agent.thinking ? ` [${agent.thinking}]` : ""}`)}` : "";
+		return `${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${activity}${cost}${model}`;
+	});
+	if (!expanded && agents.length > shown.length && showMoreHint) rows.push(theme.fg("dim", `… ${agents.length - shown.length} more (${keyHint("app.tools.expand", "details")})`));
+	return rows.join("\n");
+}
+
+function toolHeader(label: string, detail: string, theme: Theme, lastComponent?: unknown): Text {
+	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
+	component.setText(theme.fg("toolTitle", theme.bold(label)) + (detail ? ` ${theme.fg("muted", detail)}` : ""));
+	return component;
+}
+
+function agentSummaryResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown, verb = "Subagents"): Text {
+	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
+	const agents = displayAgents(resultValue?.details);
+	if (options.isError || resultValue?.details?.error) {
+		component.setText(theme.fg("error", `! ${oneLine(String(resultValue?.details?.error || resultText(resultValue) || "Tool failed"), 500)}`));
+		return component;
+	}
+	if (agents.length === 0) {
+		component.setText(resultText(resultValue));
+		return component;
+	}
+	const hasFailure = agents.some((agent) => displayState(agent) === "failed");
+	const prefix = options.isPartial
+		? theme.fg("accent", `◐ ${verb}`)
+		: hasFailure
+			? theme.fg("warning", `◆ ${verb}`)
+			: theme.fg("success", `✓ ${verb}`);
+	const counts = agentCounts(agents);
+	const totalCost = agents.reduce((sum, agent) => sum + agent.cost, 0);
+	const summary = `${prefix}${counts ? ` · ${counts}` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
+	component.setText(`${summary}\n${agentRows(agents, theme, options.expanded)}`);
+	return component;
+}
+
+function textOrMarkdownResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown, preview = 260) {
+	const text = resultText(resultValue);
+	if (options.isError) {
+		const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
+		component.setText(theme.fg("error", `! ${oneLine(text || "Tool failed", 500)}`));
+		return component;
+	}
+	if (options.expanded && !options.isPartial) return new Markdown(text, 0, 0, getMarkdownTheme());
+	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
+	component.setText(options.isPartial ? theme.fg("accent", `◐ ${oneLine(text, preview)}`) : theme.fg("muted", oneLine(text, preview)));
+	return component;
 }
 
 function idsFromHandleFileValue(value: unknown): string[] {
@@ -1442,15 +1571,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					}
 				}
 				if (resolved.manifest) text += `\nInput: ${resolved.manifest.path} · ${resolved.manifest.bytes.toLocaleString("en-US")} bytes · SHA-256 ${resolved.manifest.sha256}`;
-				return result(text, { agents: serialized, handlesFile, manifest: resolved.manifest });
+				return result(text, { agents: serialized, displayAgents: records.map(compactRecord), handlesFile, manifest: resolved.manifest });
 			} catch (error) {
 				await cleanupPreparedAgents(prepared.slice(addedCount));
-				return result(`Subagents were not started: ${error instanceof Error ? error.message : String(error)}`, { error: error instanceof Error ? error.message : String(error) }, true);
+				throw new Error(`Subagents were not started: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		},
-		renderCall(args, theme) {
-			const file = typeof (args as any)?.input_file === "string" ? ` ${oneLine((args as any).input_file, 70)}` : ` ${oneLine((args as any)?.title ?? "subagent", 70)}`;
-			return new Text(theme.fg("toolTitle", theme.bold(START_TOOL_NAME)) + theme.fg("muted", file), 0, 0);
+		renderCall(args, theme, context) {
+			const input = args as any;
+			const detail = typeof input?.input_file === "string"
+				? `manifest ${path.basename(input.input_file)}`
+				: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}`;
+			return toolHeader("Start subagent", detail, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			return agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, options.isPartial ? "Starting" : "Accepted");
 		},
 	});
 
@@ -1465,6 +1600,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const truncated = truncateHead(formatted);
 			return result(truncated.content, { agents: records.map(compactRecord), truncated: truncated.truncated });
 		},
+		renderCall(_args, theme, context) {
+			return toolHeader("List subagents", "", theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			return agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, "Known");
+		},
 	});
 
 	pi.registerTool({
@@ -1477,8 +1618,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const records = [...new Set(params.ids)].map((id) => ensureManager(ctx).get(id));
 				return result(records.map(formatStatus).join("\n\n---\n\n"), { agents: records.map(compactRecord) });
 			} catch (error) {
-				return result(error instanceof Error ? error.message : String(error), {}, true);
+				throw error instanceof Error ? error : new Error(String(error));
 			}
+		},
+		renderCall(args, theme, context) {
+			const ids = Array.isArray((args as any)?.ids) ? (args as any).ids : [];
+			return toolHeader("Subagent status", ids.length === 1 ? ids[0] : `${ids.length} agents`, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			if (options.expanded && !options.isPartial && !context.isError) return new Text(resultText(resultValue), 0, 0);
+			return agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, "Status");
 		},
 	});
 
@@ -1497,10 +1646,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return result(sent.continued
 					? `Continued ${sent.record.id} as ${sent.record.currentRunId} using ${sent.record.modelRef} [${sent.record.thinking}].`
 					: `Message accepted by running ${sent.record.id} using ${sent.record.modelRef} [${sent.record.thinking}].`,
-				{ agent: serializeAgent(sent.record), runId: sent.record.currentRunId, continued: sent.continued });
+				{ agent: compactRecord(sent.record), runId: sent.record.currentRunId, continued: sent.continued });
 			} catch (error) {
-				return result(error instanceof Error ? error.message : String(error), {}, true);
+				throw error instanceof Error ? error : new Error(String(error));
 			}
+		},
+		renderCall(args, theme, context) {
+			const input = args as any;
+			const delivery = input?.delivery ?? "follow_up";
+			const preview = input?.message ? ` · “${oneLine(input.message, 70)}”` : "";
+			return toolHeader("Message subagent", `${input?.id ?? ""} · ${delivery}${preview}`, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			if (context.isError) return textOrMarkdownResult(resultValue, { ...options, isError: true }, theme, context.lastComponent);
+			const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			const agent = displayAgents(resultValue?.details)[0];
+			const continued = resultValue?.details?.continued === true;
+			component.setText(theme.fg("success", `✓ ${continued ? "Continuation queued" : "Message accepted"}`) + (agent ? ` · ${theme.fg("accent", agent.id)}${resultValue?.details?.runId ? ` · ${theme.fg("muted", resultValue.details.runId)}` : ""}` : ""));
+			return component;
 		},
 	});
 
@@ -1548,8 +1711,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				return result(message, { unfinishedStillRunning: error instanceof SubagentWaitAbortedError }, true);
+				throw new Error(message);
 			}
+		},
+		renderCall(args, theme, context) {
+			const input = args as any;
+			const count = Array.isArray(input?.ids) ? input.ids.length : undefined;
+			const selected = count !== undefined ? `${count} agent${count === 1 ? "" : "s"}` : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "agents";
+			const timeout = input?.timeout_seconds ? ` · timeout ${formatDuration(input.timeout_seconds * 1_000)}` : "";
+			return toolHeader("Wait for subagents", `${selected}${timeout}`, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			const verb = resultValue?.details?.timedOut ? "Wait timed out" : options.isPartial ? "Waiting" : "Settled";
+			const rendered = agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, verb);
+			if (resultValue?.details?.timedOut) {
+				const agents = displayAgents(resultValue?.details);
+				rendered.setText(`${theme.fg("warning", `◷ Wait timed out · ${agentCounts(agents)}`)}\n${agentRows(agents, theme, options.expanded)}`);
+			}
+			return rendered;
 		},
 	});
 
@@ -1565,14 +1744,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			try {
 				const record = ensureManager(ctx).get(params.id);
 				const found = findRunResult(record, params.run_id);
-				if (!found.text) return result(`${record.id}${found.runId ? ` ${found.runId}` : ""} has no final assistant answer.`, { agent: compactRecord(record), runId: found.runId }, true);
+				if (!found.text) throw new Error(`${record.id}${found.runId ? ` ${found.runId}` : ""} has no final assistant answer.`);
 				const truncated = truncateHead(found.text);
 				let text = `${record.id}${found.runId ? ` · ${found.runId}` : ""}\n${record.modelRef} [${record.thinking}]\n\n${truncated.content}`;
 				if (truncated.truncated) text += `\n\n[Result truncated. The complete answer remains in ${record.sessionFile}]`;
 				return result(text, { agent: compactRecord(record), runId: found.runId, truncated: truncated.truncated });
 			} catch (error) {
-				return result(error instanceof Error ? error.message : String(error), {}, true);
+				throw error instanceof Error ? error : new Error(String(error));
 			}
+		},
+		renderCall(args, theme, context) {
+			const input = args as any;
+			return toolHeader("Subagent result", `${input?.id ?? ""}${input?.run_id ? ` · ${input.run_id}` : " · latest"}`, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			if (context.isError || options.expanded) return textOrMarkdownResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, 320);
+			const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			const agent = displayAgents(resultValue?.details)[0];
+			const runId = typeof resultValue?.details?.runId === "string" ? resultValue.details.runId : "latest";
+			const heading = theme.fg("success", "✓ Final answer") + (agent ? ` · ${theme.fg("accent", agent.id)}` : "") + ` · ${theme.fg("muted", runId)}`;
+			const raw = resultText(resultValue);
+			const answer = raw.includes("\n\n") ? raw.slice(raw.indexOf("\n\n") + 2) : raw;
+			component.setText(`${heading}\n${theme.fg("muted", oneLine(answer, 320))}`);
+			return component;
 		},
 	});
 
@@ -1587,8 +1781,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const records = await ensureManager(ctx).stop(ids);
 				return result(`Stop requested:\n${formatList(records)}`, { agents: records.map(compactRecord) });
 			} catch (error) {
-				return result(error instanceof Error ? error.message : String(error), {}, true);
+				throw error instanceof Error ? error : new Error(String(error));
 			}
+		},
+		renderCall(args, theme, context) {
+			const input = args as any;
+			const count = Array.isArray(input?.ids) ? input.ids.length : undefined;
+			const detail = count !== undefined ? `${count} agent${count === 1 ? "" : "s"}` : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "agents";
+			return toolHeader("Stop subagents", detail, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			return agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, "Stopped");
 		},
 	});
 
@@ -1692,19 +1895,48 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						reviewText += `\n\n[Combined review output truncated. The complete reviewer answers remain in their child sessions. Could not write a combined artifact: ${error instanceof Error ? error.message : String(error)}]`;
 					}
 				}
-				return result(reviewText, { agents: records.map(serializeAgent), failures, manifest, reviewFile, truncated: truncated.truncated }, failures === records.length);
+				return result(reviewText, { agents: records.map(serializeAgent), displayAgents: records.map(compactRecord), failures, totalCost, totalTokens, manifest, reviewFile, truncated: truncated.truncated });
 			} catch (error) {
 				await cleanupPreparedAgents(prepared.slice(addedCount));
-				return result(`Code review subagents failed: ${error instanceof Error ? error.message : String(error)}`, { error: error instanceof Error ? error.message : String(error) }, true);
+				throw new Error(`Code review subagents failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		},
-		renderCall(args, theme) {
-			const count = Array.isArray((args as any)?.reviewers) ? (args as any).reviewers.length : 0;
-			return new Text(theme.fg("toolTitle", theme.bold(REVIEW_TOOL_NAME)) + theme.fg("muted", (args as any)?.input_file ? ` manifest ${(args as any).input_file}` : ` ${count} reviewer${count === 1 ? "" : "s"}`), 0, 0);
+		renderCall(args, theme, context) {
+			const input = args as any;
+			const count = Array.isArray(input?.reviewers) ? input.reviewers.length : 0;
+			const detail = input?.input_file ? `manifest ${path.basename(input.input_file)}` : `${count} reviewer${count === 1 ? "" : "s"} · ${oneLine(input?.what_to_review ?? "code review", 80)}`;
+			return toolHeader("Code review", detail, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			if (context.isError) return textOrMarkdownResult(resultValue, { ...options, isError: true }, theme, context.lastComponent);
+			if (options.expanded && !options.isPartial) return new Markdown(resultText(resultValue), 0, 0, getMarkdownTheme());
+			const agents = displayAgents(resultValue?.details);
+			const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			const failures = Number(resultValue?.details?.failures ?? agents.filter((agent) => displayState(agent) === "failed").length);
+			const totalCost = Number(resultValue?.details?.totalCost ?? agents.reduce((sum, agent) => sum + agent.cost, 0));
+			const totalTokens = Number(resultValue?.details?.totalTokens ?? 0);
+			const headline = options.isPartial
+				? theme.fg("accent", `◐ Reviewing · ${agentCounts(agents)}`)
+				: failures > 0
+					? theme.fg("warning", `◆ Review complete · ${failures} failed`)
+					: theme.fg("success", `✓ Review complete · ${agents.length} reviewer${agents.length === 1 ? "" : "s"}`);
+			const metrics = `${totalTokens > 0 ? ` · ${totalTokens.toLocaleString("en-US")} tokens` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
+			component.setText(`${headline}${metrics}${agents.length ? `\n${agentRows(agents, theme, false, 5, false)}` : ""}${agents.length > 5 ? `\n${theme.fg("dim", `… ${agents.length - 5} more`)}` : ""}${!options.isPartial ? `\n${theme.fg("dim", keyHint("app.tools.expand", "full review"))}` : ""}`);
+			return component;
 		},
 	});
 
-	pi.registerMessageRenderer("subagent-completions", (message, _options, theme) => new Text(theme.fg("accent", theme.bold("Subagent completion")) + `\n${String(message.content)}`, 0, 0));
+	pi.registerMessageRenderer("subagent-completions", (message, options, theme) => {
+		const agents = displayAgents(message.details);
+		if (options.expanded || agents.length === 0) return new Text(theme.fg("accent", theme.bold(agents.length === 1 ? "Subagent completion" : "Subagent completions")) + `\n${String(message.content)}`, 0, 0);
+		const completed = agents.filter((agent) => displayState(agent) === "completed").length;
+		const exceptional = agents.length - completed;
+		const totalCost = agents.reduce((sum, agent) => sum + agent.cost, 0);
+		const title = completed === agents.length
+			? theme.fg("success", `✓ ${agents.length} subagent${agents.length === 1 ? "" : "s"} completed`)
+			: theme.fg("warning", `◆ ${agents.length} subagent update${agents.length === 1 ? "" : "s"} · ${exceptional} exceptional`);
+		return new Text(`${title}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}\n${agentRows(agents, theme, false, 4)}`, 0, 0);
+	});
 
 	pi.registerCommand("subagents", {
 		description: "Inspect and interact with managed subagents",
