@@ -121,6 +121,8 @@ function isStaleContextError(error: unknown) {
 type WidgetState = {
   active: boolean;
   interval: NodeJS.Timeout | undefined;
+  widgetInitialized: boolean;
+  lastWidgetSignature: string | null;
 };
 
 function clearWidget(ctx: ExtensionContext) {
@@ -134,8 +136,13 @@ function clearWidget(ctx: ExtensionContext) {
 function setWidget(ctx: ExtensionContext, state: WidgetState, lines: string[] | undefined) {
   if (!state.active) return;
 
+  const signature = lines === undefined ? null : JSON.stringify(lines);
+  if (state.widgetInitialized && state.lastWidgetSignature === signature) return;
+
   try {
     ctx.ui.setWidget(WIDGET_ID, lines);
+    state.widgetInitialized = true;
+    state.lastWidgetSignature = signature;
   } catch (error) {
     if (!isStaleContextError(error)) console.error(error);
   }
@@ -177,10 +184,17 @@ async function updateWidget(ctx: ExtensionContext, state: WidgetState) {
 }
 
 export default function (pi: ExtensionAPI) {
-  const state: WidgetState = { active: true, interval: undefined };
+  const state: WidgetState = {
+    active: true,
+    interval: undefined,
+    widgetInitialized: false,
+    lastWidgetSignature: null,
+  };
 
   pi.on("session_start", async (_event, ctx) => {
     state.active = true;
+    state.widgetInitialized = false;
+    state.lastWidgetSignature = null;
     if (state.interval) clearInterval(state.interval);
 
     await updateWidget(ctx, state);

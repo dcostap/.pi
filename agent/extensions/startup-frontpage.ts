@@ -31,6 +31,8 @@ export interface SessionFamilyNode {
 	firstMessage?: string;
 	messageCount?: number;
 	modifiedAt?: number;
+	/** Relative age captured when the session family is loaded; stable during rendering. */
+	ageLabel?: string;
 	children: SessionFamilyNode[];
 }
 
@@ -242,12 +244,16 @@ async function loadSessionFamily(ctx: ExtensionContext): Promise<{
 	};
 	collect(root, new Set());
 
+	const ageReferenceMs = Date.now();
 	const labels = await mapWithConcurrency(family, FILE_CONCURRENCY, (node) => readSessionLabel(node.path));
 	for (let i = 0; i < family.length; i++) {
 		family[i]!.name = labels[i]!.name;
 		family[i]!.firstMessage = labels[i]!.firstMessage;
 		family[i]!.messageCount = labels[i]!.messageCount;
 		family[i]!.modifiedAt = labels[i]!.modifiedAt;
+		const createdAt = Date.parse(family[i]!.timestamp);
+		const ageTimestamp = labels[i]!.modifiedAt ?? (Number.isFinite(createdAt) ? createdAt : ageReferenceMs);
+		family[i]!.ageLabel = formatSessionAge(ageTimestamp, ageReferenceMs);
 	}
 
 	// The in-memory manager is authoritative if /name just changed but the file is still flushing.
@@ -261,8 +267,8 @@ function sessionDisplayName(node: SessionFamilyNode): string {
 	return node.name || node.firstMessage || "(no messages)";
 }
 
-function formatSessionAge(timestamp: number): string {
-	const diffMs = Date.now() - timestamp;
+function formatSessionAge(timestamp: number, nowMs: number): string {
+	const diffMs = nowMs - timestamp;
 	const minutes = Math.floor(diffMs / 60_000);
 	const hours = Math.floor(diffMs / 3_600_000);
 	const days = Math.floor(diffMs / 86_400_000);
@@ -303,8 +309,7 @@ function styledHierarchyLines(
 			? theme.bold(theme.fg("accent", label))
 			: node.name ? theme.fg("warning", label) : label;
 		const guid = theme.fg("toolDiffAdded", node.id.slice(-6));
-		const createdAt = Date.parse(node.timestamp);
-		const age = formatSessionAge(node.modifiedAt ?? (Number.isFinite(createdAt) ? createdAt : Date.now()));
+		const age = node.ageLabel ?? "?";
 		return {
 			content: `${theme.fg("dim", prefix)}${guid}  ${styledLabel}`,
 			metadata: `${node.messageCount ?? 0} ${age}`,

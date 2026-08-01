@@ -112,22 +112,38 @@ function renderStatus(ctx: ExtensionContext, state: PeakState): string {
   ].join("");
 }
 
-function updateStatus(ctx: ExtensionContext): void {
+function updateStatus(
+  ctx: ExtensionContext,
+  setStatus: (ctx: ExtensionContext, value: string | undefined) => void = safeSetStatus,
+): void {
   if (!isOfficialDeepSeekV4(ctx)) {
-    safeSetStatus(ctx, undefined);
+    setStatus(ctx, undefined);
     return;
   }
 
-  safeSetStatus(ctx, renderStatus(ctx, getPeakState()));
+  setStatus(ctx, renderStatus(ctx, getPeakState()));
 }
 
 export default function (pi: ExtensionAPI) {
   let interval: ReturnType<typeof setInterval> | undefined;
+  let statusInitialized = false;
+  let lastStatus: string | undefined;
+
+  function setStatusIfChanged(ctx: ExtensionContext, value: string | undefined): void {
+    if (!ctx.hasUI) return;
+    if (statusInitialized && value === lastStatus) return;
+
+    safeSetStatus(ctx, value);
+    statusInitialized = true;
+    lastStatus = value;
+  }
 
   function startTimer(ctx: ExtensionContext): void {
     if (interval) clearInterval(interval);
-    updateStatus(ctx);
-    interval = setInterval(() => updateStatus(ctx), UPDATE_INTERVAL_MS);
+    statusInitialized = false;
+    lastStatus = undefined;
+    updateStatus(ctx, setStatusIfChanged);
+    interval = setInterval(() => updateStatus(ctx, setStatusIfChanged), UPDATE_INTERVAL_MS);
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -135,7 +151,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("model_select", async (_event, ctx) => {
-    updateStatus(ctx);
+    updateStatus(ctx, setStatusIfChanged);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -158,7 +174,7 @@ export default function (pi: ExtensionAPI) {
         `DeepSeek API is currently in ${status}. Next change: ${until} (${remaining} left). ${schedule}.`,
         state.isPeak ? "warning" : "info",
       );
-      updateStatus(ctx);
+      updateStatus(ctx, setStatusIfChanged);
     },
   });
 }
