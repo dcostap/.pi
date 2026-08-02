@@ -618,10 +618,11 @@ export default async function (pi: ExtensionAPI) {
 		description: "Search files and folders anywhere on this PC using Everything.",
 		promptSnippet: "Search local files and folders with Everything",
 		promptGuidelines: [
-			"Use `everything_search` as the preferred option for very fast file and folder discovery, anywhere on the local PC, or scoped to a folder.",
+			"MUST use `everything_search` as the fast alternative to local/recursive discovery commands such as `rg --files`, `find`, `ls -R`, and `Get-ChildItem -Recurse`.",
 			"Prefer `rg` over Everything's `content:` filter for searching file contents.",
 			"`everything_search` query syntax: `space`=AND, `|`=OR, `<...>`=grouping, and `\"...\"`=exact phrase. If mixing `|` with spaces, use `<...>`.",
-			"Use `scope_path` to limit results to a folder tree, `children_only` for direct children only, and `search_full_path` to match against full path+filename text.",
+			"Use the narrowest practical `scope_path`; use `children_only` for direct children.",
+			"Set `search_full_path: true` when matching tokens against directory names or complete paths.",
 			"Use `ext:` to filter by extension; for example `ext:py`, `ext:ts;tsx`, or `ext:jpg;png`.",
 			"Use `file:` or `folder:` to limit results to files only or folders only. Useful with filters such as `dm:today` or `size:>1mb`.",
 			"Common `everything_search` filters: `dm:` for modified date, `dc:` for created date, `size:` for file size, `regex:` to enable regex, and `wholeword:` or `case:` when needed.",
