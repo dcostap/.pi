@@ -15,13 +15,14 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "../_shared/conversation-transcript.ts";
 import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
 import { loadSubagentProfiles, type SubagentProfile } from "./profiles.ts";
 import { applyRuntimeStatusEvent } from "./runtime-events.ts";
 import { materializeSessionFile } from "./session-file.ts";
+import { renderAlignedTable, type AlignedColumn } from "./table.ts";
 import { buildVisibleTree } from "./tree.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
@@ -49,6 +50,38 @@ const RECENT_FINISHED_WIDGET_MS = 60_000;
 
 const WIDGET_ID = "subagents-tree";
 const MAX_WIDGET_NODES = 25;
+
+type SubagentDisplayRow = {
+	connector: string;
+	state: string;
+	id: string;
+	title: string;
+	model: string;
+	profile: string;
+	context: string;
+	duration: string;
+	cost: string;
+	cache: string;
+	activity: string;
+};
+
+// Keep the durable widget and tool-result previews as a compact table. The
+// preferred widths come from the current rows; these bounds only stop a long
+// title/path/activity from stealing the whole terminal. Flexible columns are
+// shrunk first, then low-priority metrics disappear on narrow terminals.
+const SUBAGENT_COLUMNS: readonly AlignedColumn<keyof SubagentDisplayRow>[] = [
+	{ key: "connector", minWidth: 3 },
+	{ key: "state", minWidth: 7 },
+	{ key: "id", minWidth: 8 },
+	{ key: "title", minWidth: 12, maxWidth: 46, shrinkPriority: 2 },
+	{ key: "model", minWidth: 12, maxWidth: 42, shrinkPriority: 1 },
+	{ key: "profile", maxWidth: 20, shrinkPriority: 1, optional: true, hidePriority: 1 },
+	{ key: "context", minWidth: 8, maxWidth: 12, align: "right", optional: true, hidePriority: 2 },
+	{ key: "duration", minWidth: 5, maxWidth: 10, align: "right", optional: true, hidePriority: 3 },
+	{ key: "cost", minWidth: 6, maxWidth: 9, align: "right", optional: true, hidePriority: 4 },
+	{ key: "cache", minWidth: 6, maxWidth: 9, align: "right", optional: true, hidePriority: 5 },
+	{ key: "activity", minWidth: 12, maxWidth: 70, shrinkPriority: 4 },
+];
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type ContextMode = (typeof CONTEXT_MODES)[number];
@@ -1430,7 +1463,7 @@ function contextMeterValues(contextWindow: number | undefined, contextTokens: nu
 	return theme.fg("muted", display);
 }
 
-function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): string[] {
+function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now(), width = Number.POSITIVE_INFINITY): string[] {
 	const active = records.filter(isActive);
 	const inactive = records.filter((record) => !isActive(record));
 	const recentFinished = records.filter((record) => isRecentlyFinished(record, now));
@@ -1452,31 +1485,48 @@ function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): st
 		parentId: record.parentAgentId,
 		active: isActive(record) || isRecentlyFinished(record, now),
 	})), MAX_WIDGET_NODES);
-	const rows = tree.rows.map(({ item: record, prefix, isLast }) => {
+	const rows = tree.rows.map(({ item: record, prefix, isLast }): SubagentDisplayRow => {
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
 		const connector = `${prefix}${isLast ? "└─" : "├─"} `;
 		const elapsedFrom = record.activeTools.size > 0
 			? Math.min(...[...record.activeTools.values()].map((tool) => tool.startedAt))
 			: record.startedAt;
 		const elapsedUntil = isActive(record) ? now : (record.settledAt ?? now);
-		const elapsed = elapsedFrom ? ` · ${formatDuration(Math.max(0, elapsedUntil - elapsedFrom))}` : "";
+		const duration = elapsedFrom ? formatDuration(Math.max(0, elapsedUntil - elapsedFrom)) : "";
 		const activity = oneLine(finishedActivity(record, now) ?? currentActivity(record), 70);
 		const context = contextMeter(record, theme);
-		const contextText = context ? ` · ${context}` : "";
-		const cost = record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : "";
+		const cost = record.usage.cost ? formatCost(record.usage.cost) : "";
 		const cache = formatCacheHitRate(record.usage.latestCacheHitRate, record.usage.cacheRead > 0 || record.usage.cacheWrite > 0);
-		const cacheText = cache ? ` · ${cache}` : "";
-		// Activity changes frequently; keep it last so duration and cost do not jump.
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}${contextText}${elapsed}${cost}${cacheText} · ${theme.fg("muted", activity)}`;
+		// Activity changes frequently; keep it last so duration and cost remain
+		// stable columns while the value itself updates.
+		return {
+			connector: theme.fg("dim", connector),
+			state: styledState(state, theme),
+			id: theme.fg("accent", record.id),
+			title: theme.fg("muted", oneLine(record.title, 70)),
+			model: theme.fg("dim", `${record.modelRef} [${record.thinking}]`),
+			profile: "",
+			context,
+			duration: duration ? theme.fg("dim", duration) : "",
+			cost: cost ? theme.fg("dim", cost) : "",
+			cache: cache ? theme.fg("dim", cache) : "",
+			activity: theme.fg("muted", activity),
+		};
 	});
-	if (tree.omitted > 0) rows.push(theme.fg("dim", `… ${tree.omitted} more active/ancestor node${tree.omitted === 1 ? "" : "s"}`));
-	return [header, ...rows];
+	const renderedRows = renderAlignedTable(rows, width, SUBAGENT_COLUMNS, {
+		gap: "  ",
+		visibleWidth,
+		truncate: (value, cellWidth) => truncateToWidth(value, cellWidth),
+	});
+	if (tree.omitted > 0) renderedRows.push(theme.fg("dim", `… ${tree.omitted} more active/ancestor node${tree.omitted === 1 ? "" : "s"}`));
+	return [header, ...renderedRows];
 }
 
 function widgetComponent(records: AgentRecord[], theme: Theme) {
 	return {
 		render(width: number): string[] {
-			return widgetLines(records, theme).map((line) => truncateToWidth(` ${line}`, width));
+			const contentWidth = Math.max(0, width - 1);
+			return widgetLines(records, theme, Date.now(), contentWidth).map((line) => truncateToWidth(` ${line}`, width));
 		},
 		invalidate() {},
 	};
@@ -1496,22 +1546,37 @@ function agentRows(agents: DisplayAgent[], theme: Theme, expanded: boolean, maxC
 	// Keep tool results aligned with the persistent widget: every agent is a
 	// node, and parentAgentId determines the connector/indentation.
 	const tree = buildVisibleTree(agents.map((agent) => ({ ...agent, active: true })), expanded ? Math.max(agents.length, 1) : maxCollapsed);
-	const rows = tree.rows.map(({ item: agent, prefix, isLast }) => {
+	const rows = tree.rows.map(({ item: agent, prefix, isLast }): SubagentDisplayRow => {
 		const state = displayState(agent);
 		const connector = `${prefix}${isLast ? "└─" : "├─"} `;
-		const activity = agent.activity && agent.activity !== state ? ` · ${theme.fg("dim", oneLine(agent.activity, 80))}` : "";
-		const cost = agent.cost > 0 ? ` · ${theme.fg("dim", formatCost(agent.cost))}` : "";
-		const model = agent.model ? ` · ${theme.fg("dim", `${agent.model}${agent.thinking ? ` [${agent.thinking}]` : ""}`)}` : "";
-		const profile = expanded && agent.profile ? ` · ${theme.fg("dim", `profile ${agent.profile}`)}` : "";
+		const activity = agent.activity && agent.activity !== state ? theme.fg("dim", oneLine(agent.activity, 80)) : "";
+		const cost = agent.cost > 0 ? theme.fg("dim", formatCost(agent.cost)) : "";
+		const model = agent.model ? theme.fg("dim", `${agent.model}${agent.thinking ? ` [${agent.thinking}]` : ""}`) : "";
+		const profile = expanded && agent.profile ? theme.fg("dim", `profile ${agent.profile}`) : "";
 		const context = contextMeterValues(agent.contextWindow, agent.contextTokens, theme);
-		const contextText = context ? ` · ${context}` : "";
 		const cache = formatCacheHitRate(agent.cacheHitRate, agent.hasCacheUsage);
-		const cacheText = cache ? ` · ${theme.fg("dim", cache)}` : "";
-		const durationText = agent.durationMs === undefined ? "" : ` · ${theme.fg("dim", formatDuration(agent.durationMs))}`;
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${contextText}${cost}${cacheText}${durationText}${activity}`;
+		const duration = agent.durationMs === undefined ? "" : theme.fg("dim", formatDuration(agent.durationMs));
+		return {
+			connector: theme.fg("dim", connector),
+			state: styledState(state, theme),
+			id: theme.fg("accent", agent.id),
+			title: theme.fg("muted", oneLine(agent.title, 70)),
+			model,
+			profile,
+			context,
+			duration,
+			cost,
+			cache: cache ? theme.fg("dim", cache) : "",
+			activity,
+		};
 	});
-	if (tree.omitted > 0 && showMoreHint) rows.push(theme.fg("dim", `… ${tree.omitted} more (${keyHint("app.tools.expand", "details")})`));
-	return rows.join("\n");
+	const renderedRows = renderAlignedTable(rows, Number.POSITIVE_INFINITY, SUBAGENT_COLUMNS, {
+		gap: "  ",
+		visibleWidth,
+		truncate: (value, cellWidth) => truncateToWidth(value, cellWidth),
+	});
+	if (tree.omitted > 0 && showMoreHint) renderedRows.push(theme.fg("dim", `… ${tree.omitted} more (${keyHint("app.tools.expand", "details")})`));
+	return renderedRows.join("\n");
 }
 
 function toolHeader(label: string, detail: string, theme: Theme, lastComponent?: unknown): Text {
