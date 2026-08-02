@@ -53,6 +53,7 @@ type ContextMode = (typeof CONTEXT_MODES)[number];
 type AgentRuntimeState = "queued" | "starting" | "running" | "stopping" | "cold";
 type RunOutcome = "none" | "completed" | "failed" | "stopped" | "interrupted";
 type DeliveryMode = "steer" | "follow_up";
+type WaitMode = "all" | "any";
 
 type UsageStats = {
 	input: number;
@@ -104,6 +105,7 @@ type SerializedAgent = {
 	promptCacheKey?: string;
 	createdAt: number;
 	runNumber: number;
+	contextWindow?: number;
 	// Runtime fields recovered from later parent-session tool results. Older
 	// launch records do not contain these fields.
 	restoredOutcome?: RunOutcome;
@@ -150,6 +152,13 @@ type PreparedAgent = {
 type ManagerEvent =
 	| { kind: "changed"; id: string }
 	| { kind: "settled"; id: string };
+
+type WaitResult = {
+	mode: WaitMode;
+	selected: AgentRecord[];
+	settled: AgentRecord[];
+	pending: AgentRecord[];
+};
 
 type LaunchManifestMetadata = {
 	path: string;
@@ -223,6 +232,14 @@ function exactModel(ctx: ExtensionContext, raw: string): Model<any> {
 		throw new Error(`Exact model is configured but not currently usable (check authentication): ${requested}`);
 	}
 	return model;
+}
+
+function modelContextWindow(ctx: ExtensionContext, raw: string): number | undefined {
+	const requested = cleanText(raw);
+	const slash = requested.indexOf("/");
+	if (slash <= 0 || slash === requested.length - 1) return undefined;
+	const model = ctx.modelRegistry.find(requested.slice(0, slash), requested.slice(slash + 1)) as Model<any> | undefined;
+	return typeof model?.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : undefined;
 }
 
 function supportedThinkingLevels(model: Model<any>): ThinkingLevel[] {
@@ -320,6 +337,7 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 		promptCacheKey: record.promptCacheKey,
 		createdAt: record.createdAt,
 		runNumber: record.runNumber,
+		contextWindow: record.contextWindow,
 	};
 }
 
@@ -687,7 +705,7 @@ class SubagentManager {
 		return { record, continued: true };
 	}
 
-	async wait(ids: string[], signal?: AbortSignal, consumeDelivery = true): Promise<AgentRecord[]> {
+	async wait(ids: string[], signal: AbortSignal | undefined, consumeDelivery: boolean, mode: WaitMode): Promise<WaitResult> {
 		this.assertActive();
 		const records = [...new Set(ids)].map((id) => this.get(id));
 		for (const record of records) record.waiters++;
@@ -699,18 +717,20 @@ class SubagentManager {
 		}) : new Promise<never>(() => {});
 		try {
 			if (signal?.aborted) throw new SubagentWaitAbortedError();
-			await Promise.race([
-				Promise.all(records.map((record) => record.completion ?? Promise.resolve())),
-				abortPromise,
-			]);
+			const completion = mode === "any"
+				? Promise.race(records.map((record) => record.completion ?? Promise.resolve()))
+				: Promise.all(records.map((record) => record.completion ?? Promise.resolve()));
+			await Promise.race([completion, abortPromise]);
+			const settled = mode === "any" ? records.filter((record) => record.state === "cold") : records;
+			const pending = records.filter((record) => !settled.includes(record));
 			if (consumeDelivery) {
-				for (const record of records) {
+				for (const record of settled) {
 					record.deliveryConsumed = true;
 					record.deliveryPending = false;
 				}
 			}
 			completed = true;
-			return records;
+			return { mode, selected: records, settled, pending };
 		} finally {
 			if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
 			for (const record of records) {
@@ -1066,6 +1086,7 @@ async function prepareAgent(
 			promptCacheKey: contextMode === "clone" ? ctx.sessionManager.getSessionId() : undefined,
 			createdAt: Date.now(),
 			runNumber: 0,
+			contextWindow: model.contextWindow,
 		};
 		return { record: newRecord(serialized), prompt: promptBuilder(serialized.task, sandboxDir, transcript) };
 	} catch (error) {
@@ -1149,6 +1170,8 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		cost: record.usage.cost,
 		turns: record.usage.turns,
 		tokens: totalUsageTokens(record.usage),
+		contextWindow: record.contextWindow,
+		contextTokens: record.contextTokens,
 		sessionFile: record.sessionFile,
 	};
 }
@@ -1189,8 +1212,8 @@ function formatStatus(record: AgentRecord): string {
 	return lines.filter(Boolean).join("\n");
 }
 
-async function buildCompletionResult(snapshots: CompletionSnapshot[], artifactPrefix: string) {
-	const fullText = formatCompletionBatch(snapshots);
+async function buildCompletionResult(snapshots: CompletionSnapshot[], artifactPrefix: string, heading?: string) {
+	const fullText = formatCompletionBatch(snapshots, heading);
 	const truncated = truncateHead(fullText);
 	let text = truncated.content;
 	let outputFile: string | undefined;
@@ -1330,23 +1353,29 @@ function isActive(record: AgentRecord): boolean {
 	return record.state !== "cold";
 }
 
+function contextMeter(record: AgentRecord, theme: Theme): string {
+	if (!record.contextWindow || record.contextWindow <= 0) return "";
+	if (record.contextTokens === undefined) return theme.fg("muted", `?/${formatTokens(record.contextWindow)}`);
+	const percent = Math.max(0, (record.contextTokens / record.contextWindow) * 100);
+	const display = `${percent.toFixed(1)}%/${formatTokens(record.contextWindow)}`;
+	if (percent > 90) return theme.fg("error", display);
+	if (percent > 70) return theme.fg("warning", display);
+	return theme.fg("muted", display);
+}
+
 function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): string[] {
 	const active = records.filter(isActive);
 	const inactive = records.filter((record) => !isActive(record));
 	const completed = inactive.filter((record) => record.lastOutcome === "completed").length;
 	const failed = inactive.filter((record) => record.lastOutcome === "failed").length;
 	const stopped = inactive.filter((record) => record.lastOutcome === "stopped" || record.lastOutcome === "interrupted").length;
-	const turns = records.reduce((sum, record) => sum + record.usage.turns, 0);
-	const tokens = records.reduce((sum, record) => sum + totalUsageTokens(record.usage), 0);
-	const cost = records.reduce((sum, record) => sum + record.usage.cost, 0);
 	const inactiveParts = [completed ? `${completed} completed` : "", failed ? `${failed} failed` : "", stopped ? `${stopped} stopped` : ""].filter(Boolean).join(" · ");
-	const totals = `${turns ? ` · ${turns} turns` : ""}${tokens ? ` · ${formatTokens(tokens)} tokens` : ""}${cost ? ` · ${formatCost(cost)}` : ""}`;
 	if (active.length === 0) {
 		const known = records.length === 0 ? "none known" : `${records.length} total${inactiveParts ? ` · ${inactiveParts}` : ""}`;
-		return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${totals}`)];
+		return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}`)];
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
-		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${totals}`);
+		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}`);
 	const tree = buildVisibleTree(records.map((record) => ({ ...record, parentId: record.parentAgentId, active: isActive(record) })), MAX_WIDGET_NODES);
 	const rows = tree.rows.map(({ item: record, prefix, isLast }) => {
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
@@ -1356,7 +1385,9 @@ function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): st
 			: record.startedAt;
 		const elapsed = elapsedFrom ? ` · ${formatDuration(now - elapsedFrom)}` : "";
 		const activity = oneLine(currentActivity(record), 70);
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)} · ${theme.fg("muted", activity)}${elapsed}${record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : ""}`;
+		const context = contextMeter(record, theme);
+		const contextText = context ? ` · ${context}` : "";
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}${contextText} · ${theme.fg("muted", activity)}${elapsed}${record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : ""}`;
 	});
 	if (tree.omitted > 0) rows.push(theme.fg("dim", `… ${tree.omitted} more active/ancestor node${tree.omitted === 1 ? "" : "s"}`));
 	return [header, ...rows];
@@ -1435,14 +1466,19 @@ function completionSummaryResult(resultValue: any, options: { expanded: boolean;
 		component.setText(theme.fg("muted", oneLine(resultText(resultValue), 500)));
 		return component;
 	}
+	const anyMode = resultValue?.details?.waitMode === "any";
+	const pendingCount = Array.isArray(resultValue?.details?.pendingAgents) ? resultValue.details.pendingAgents.length : 0;
 	const failures = Number(resultValue?.details?.failures ?? agents.filter((agent) => displayState(agent) !== "completed").length);
 	const totalCost = Number(resultValue?.details?.totalCost ?? agents.reduce((sum, agent) => sum + agent.cost, 0));
 	const totalTokens = Number(resultValue?.details?.totalTokens ?? agents.reduce((sum, agent) => sum + agent.tokens, 0));
+	const resultLabel = anyMode ? "First available" : "Batch complete";
+	const countLabel = anyMode ? `${agents.length} settled` : `${agents.length} agent${agents.length === 1 ? "" : "s"}`;
 	const headline = failures > 0
-		? theme.fg("warning", `◆ Batch complete · ${agents.length} agent${agents.length === 1 ? "" : "s"} · ${failures} exceptional`)
-		: theme.fg("success", `✓ Batch complete · ${agents.length} agent${agents.length === 1 ? "" : "s"}`);
+		? theme.fg("warning", `◆ ${resultLabel} · ${countLabel} · ${failures} exceptional`)
+		: theme.fg("success", `✓ ${resultLabel} · ${countLabel}`);
 	const metrics = `${totalTokens > 0 ? ` · ${totalTokens.toLocaleString("en-US")} tokens` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
-	component.setText(`${headline}${metrics}\n${agentRows(agents, theme, false, 12, false)}${agents.length > 12 ? `\n${theme.fg("dim", `… ${agents.length - 12} more`)}` : ""}\n${theme.fg("dim", keyHint("app.tools.expand", "full batch results"))}`);
+	const pending = pendingCount > 0 ? `\n${theme.fg("dim", `${pendingCount} still running`)}` : "";
+	component.setText(`${headline}${metrics}\n${agentRows(agents, theme, false, 12, false)}${agents.length > 12 ? `\n${theme.fg("dim", `… ${agents.length - 12} more`)}` : ""}${pending}\n${theme.fg("dim", keyHint("app.tools.expand", anyMode ? "first result details" : "full batch results"))}`);
 	return component;
 }
 
@@ -1490,7 +1526,7 @@ function buildMainInstructions(profiles: Map<string, SubagentProfile>): string {
 - A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
 - Reuse an existing subagent with ${SEND_TOOL_NAME} only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
 - Use ${STATUS_TOOL_NAME} only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
-- Launch every member of a logical batch before waiting. Then call ${WAIT_TOOL_NAME} once with the complete ID set. It waits for all selected agents and returns their combined final answers and execution summary.
+- Launch every member of a logical batch before waiting. Then call ${WAIT_TOOL_NAME} once with the complete ID set and required wait_mode. Use wait_mode "all" for the complete batch; use wait_mode "any" when the first settled result is sufficient. An "any" wait returns the settled subset and leaves the remaining agents running.
 - Cancelling or timing out ${WAIT_TOOL_NAME} leaves unfinished subagents running.
 - Use ${RESULT_TOOL_NAME} for unattended, historical, or specific completed runs when their answer is needed outside the original batch wait.
 - ${STOP_TOOL_NAME} stops current work but preserves the child Pi session for later continuation.
@@ -1580,7 +1616,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		if (shuttingDown) throw new Error("Subagent extension is shutting down");
 		if (manager) return manager;
 		manager = new SubagentManager(ctx.cwd);
-		manager.restore(scanSerializedAgents(ctx));
+		manager.restore(scanSerializedAgents(ctx).map((item) => item.contextWindow
+			? item
+			: { ...item, contextWindow: modelContextWindow(ctx, item.modelRef) }));
 		unsubscribe = manager.subscribe((event) => {
 			refreshWidget();
 			if (event.kind === "settled") scheduleCompletionFlush();
@@ -1753,15 +1791,18 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: WAIT_TOOL_NAME,
 		label: "Wait for Subagents",
-		description: "Wait for the complete selected subagent batch to become cold, then return one integrated execution summary and all final answers. Cancellation or timeout leaves unfinished subagents running.",
+		description: "Wait for selected subagents using required wait_mode: \"all\" waits for every selected agent and returns their integrated results; \"any\" returns when at least one selected agent settles and leaves the rest running. Cancellation or timeout leaves unfinished subagents running.",
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
 			input_file: Type.Optional(Type.String()),
+			wait_mode: StringEnum(["all", "any"] as const, { description: "Required: all waits for every selected agent; any returns after at least one selected agent settles." }),
 			timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400 })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			try {
 				const ids = await resolveIds(params, ctx.cwd);
+				if (params.wait_mode !== "all" && params.wait_mode !== "any") throw new Error("wait_mode is required and must be \"all\" or \"any\"");
+				const waitMode = params.wait_mode as WaitMode;
 				const activeManager = ensureManager(ctx);
 				const waitController = new AbortController();
 				let timedOut = false;
@@ -1776,13 +1817,31 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 					onUpdate?.(result(formatList(records), { agents: records.map(compactRecord) }));
 				}, 1_000);
 				try {
-					const records = await activeManager.wait(ids, waitController.signal, true);
-					const snapshots = records.map((record) => record.latestCompletion ?? completionSnapshot(record));
-					return await buildCompletionResult(snapshots, "pi-subagent-batch");
+					const waited = await activeManager.wait(ids, waitController.signal, true, waitMode);
+					const snapshots = waited.settled.map((record) => record.latestCompletion ?? completionSnapshot(record));
+					const completion = await buildCompletionResult(
+						snapshots,
+						waitMode === "any" ? "pi-subagent-any" : "pi-subagent-batch",
+						waitMode === "any" ? "# First Available Subagent Results" : undefined,
+					);
+					const pendingText = waited.pending.length > 0
+						? `\n\nStill running (${waited.pending.length}):\n${formatList(waited.pending)}`
+						: "";
+					return result(`${resultText(completion)}${pendingText}`, {
+						...completion.details,
+						waitMode,
+						pendingAgents: waited.pending.map(compactRecord),
+					});
 				} catch (error) {
 					if (!timedOut) throw error;
 					const records = ids.map((id) => activeManager.get(id));
-					return result(`Wait timed out; unfinished subagents are still running:\n${formatList(records)}`, { agents: records.map(compactRecord), timedOut: true });
+					const pending = records.filter((record) => record.state !== "cold");
+					return result(`Wait timed out; unfinished subagents are still running:\n${formatList(pending.length > 0 ? pending : records)}`, {
+						agents: records.map(compactRecord),
+						pendingAgents: pending.map(compactRecord),
+						timedOut: true,
+						waitMode,
+					});
 				} finally {
 					clearInterval(heartbeat);
 					if (timeout) clearTimeout(timeout);
@@ -1797,8 +1856,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			const input = args as any;
 			const count = Array.isArray(input?.ids) ? input.ids.length : undefined;
 			const selected = count !== undefined ? "" : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "";
+			const waitMode = input?.wait_mode === "any" || input?.wait_mode === "all" ? input.wait_mode : "";
 			const timeout = input?.timeout_seconds ? `· timeout ${formatDuration(input.timeout_seconds * 1_000)}` : "";
-			return toolHeader("Wait for subagents", [selected, timeout].filter(Boolean).join(" "), theme, context.lastComponent);
+			return toolHeader("Wait for subagents", [selected, waitMode ? `· ${waitMode}` : "", timeout].filter(Boolean).join(" "), theme, context.lastComponent);
 		},
 		renderResult(resultValue, options, theme, context) {
 			if (resultValue?.details?.timedOut) {

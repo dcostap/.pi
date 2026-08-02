@@ -48,11 +48,11 @@ export function completionDuration(ms: number): string {
 	return `${hours}h ${minutes % 60}m`;
 }
 
-export function formatCompletionBatch(snapshots: CompletionSnapshot[]): string {
+export function formatCompletionBatch(snapshots: CompletionSnapshot[], heading = "# Subagent Batch Results"): string {
 	const failures = snapshots.filter((snapshot) => snapshot.outcome !== "completed").length;
 	const totalCost = snapshots.reduce((sum, snapshot) => sum + snapshot.usage.cost, 0);
 	const totalTokens = snapshots.reduce((sum, snapshot) => sum + completionTokens(snapshot.usage), 0);
-	const header = `# Subagent Batch Results\n\nAgents: ${snapshots.length} · failures: ${failures}\nTokens: ${totalTokens.toLocaleString("en-US")} · total cost: ${completionCost(totalCost)}`;
+	const header = `${heading}\n\nAgents: ${snapshots.length} · failures: ${failures}\nTokens: ${totalTokens.toLocaleString("en-US")} · total cost: ${completionCost(totalCost)}`;
 	const answers = snapshots.map((snapshot, index) => {
 		const duration = snapshot.durationMs === undefined ? "unknown" : completionDuration(snapshot.durationMs);
 		const answer = snapshot.outcome === "completed"
