@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
+import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
 
 function snapshot(id: string, outcome: CompletionSnapshot["outcome"], answer: string): CompletionSnapshot {
 	return {
@@ -17,7 +17,7 @@ function snapshot(id: string, outcome: CompletionSnapshot["outcome"], answer: st
 		settledAt: 2000,
 		durationMs: 2000,
 		attempts: 1,
-		usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 0, cost: 0.01, turns: 2 },
+		usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 0, latestCacheHitRate: 99.2, cost: 0.01, turns: 2 },
 		finalAnswer: answer,
 		error: outcome === "failed" ? "provider failed" : undefined,
 		sessionFile: `C:/sessions/${id}.jsonl`,
@@ -35,6 +35,14 @@ describe("completion batches", () => {
 		expect(text).toContain("First answer");
 		expect(text).toContain("Second answer");
 		expect(text).toContain("provider/model-id [high]");
+		expect(text).toContain("CH99.2%");
+		expect(text).toContain("2.0s");
+	});
+
+	test("matches Pi's cache-hit rate formula and formatting", () => {
+		expect(cacheHitRate({ input: 8, cacheRead: 91, cacheWrite: 1 })).toBeCloseTo(91, 10);
+		expect(formatCacheHitRate(99.2, true)).toBe("CH99.2%");
+		expect(formatCacheHitRate(0, false)).toBe("");
 	});
 
 	test("uses a failed agent's error in the integrated result", () => {

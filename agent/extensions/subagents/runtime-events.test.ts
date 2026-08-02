@@ -8,6 +8,10 @@ function assistant(stopReason: string, errorMessage?: string) {
 	};
 }
 
+function assistantMessage(stopReason: string, errorMessage?: string) {
+	return { role: "assistant", stopReason, errorMessage };
+}
+
 describe("managed subagent runtime events", () => {
 	test("clears a context overflow after compaction and a successful retry", () => {
 		const status: RuntimeStatusTarget = {};
@@ -64,9 +68,9 @@ describe("managed subagent runtime events", () => {
 	});
 
 	test("preserves aborted runs and token-limit failures as failures", () => {
-		const status: RuntimeStatusTarget = { error: "earlier error" };
+		const status: RuntimeStatusTarget = {};
 		applyRuntimeStatusEvent(status, assistant("aborted"));
-		expect(status.error).toBe("earlier error");
+		expect(status.error).toBe("Assistant run aborted");
 
 		applyRuntimeStatusEvent(status, assistant("length"));
 		expect(status.error).toBe("Assistant response stopped at the token limit");
@@ -89,5 +93,46 @@ describe("managed subagent runtime events", () => {
 
 		applyRuntimeStatusEvent(status, assistant("stop"));
 		expect(status.error).toBeUndefined();
+	});
+
+	test("uses agent_end to recognize recovery when message_end is missing", () => {
+		const status: RuntimeStatusTarget = {};
+		applyRuntimeStatusEvent(status, assistant("error", "WebSocket closed 1006 Connection ended"));
+		expect(status.error).toContain("WebSocket closed");
+
+		applyRuntimeStatusEvent(status, {
+			type: "agent_end",
+			willRetry: false,
+			messages: [assistantMessage("stop")],
+		});
+
+		expect(status.lastAssistantStopReason).toBe("stop");
+		expect(status.error).toBeUndefined();
+	});
+
+	test("lets a successful stop reason supersede a stale error field", () => {
+		const status: RuntimeStatusTarget = { error: "historical provider error" };
+		applyRuntimeStatusEvent(status, assistant("stop", "stale error field"));
+
+		expect(status.error).toBeUndefined();
+	});
+
+	test("does not carry a prior low-level stop reason into a retry", () => {
+		const status: RuntimeStatusTarget = { lastAssistantStopReason: "stop" };
+		applyRuntimeStatusEvent(status, { type: "agent_start" });
+
+		expect(status.lastAssistantStopReason).toBeUndefined();
+	});
+
+	test("keeps a terminal agent_end error", () => {
+		const status: RuntimeStatusTarget = {};
+		applyRuntimeStatusEvent(status, {
+			type: "agent_end",
+			willRetry: false,
+			messages: [assistantMessage("error", "provider unavailable")],
+		});
+
+		expect(status.lastAssistantStopReason).toBe("error");
+		expect(status.error).toBe("provider unavailable");
 	});
 });

@@ -18,7 +18,7 @@ import { StringEnum, type Model } from "@earendil-works/pi-ai";
 import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "../_shared/conversation-transcript.ts";
-import { formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
+import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
 import { loadSubagentProfiles, type SubagentProfile } from "./profiles.ts";
 import { applyRuntimeStatusEvent } from "./runtime-events.ts";
 import { buildVisibleTree } from "./tree.ts";
@@ -62,6 +62,7 @@ type UsageStats = {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	latestCacheHitRate?: number;
 	cost: number;
 	turns: number;
 };
@@ -135,6 +136,7 @@ type AgentRecord = SerializedAgent & {
 	contextTokens?: number;
 	finalAnswer: string;
 	error?: string;
+	lastAssistantStopReason?: string;
 	attempt: number;
 	stopRequested: boolean;
 	client?: RpcClient;
@@ -293,6 +295,7 @@ function updateUsage(record: AgentRecord, message: any): void {
 	record.usage.output += output;
 	record.usage.cacheRead += cacheRead;
 	record.usage.cacheWrite += cacheWrite;
+	record.usage.latestCacheHitRate = cacheHitRate({ input, cacheRead, cacheWrite });
 	record.usage.cost += Number(usage.cost?.total || 0);
 	record.usage.turns++;
 	const contextTokens = Number(usage.totalTokens || input + output + cacheRead + cacheWrite);
@@ -321,6 +324,11 @@ function currentActivity(record: AgentRecord): string {
 		return [...record.activeTools.values()].map((tool) => tool.description).join("; ");
 	}
 	return record.recent.at(-1)?.text ?? (record.state === "cold" ? `last run ${record.lastOutcome}` : record.state);
+}
+
+function settledDuration(record: AgentRecord): number | undefined {
+	if (record.startedAt === undefined || record.settledAt === undefined) return undefined;
+	return Math.max(0, record.settledAt - record.startedAt);
 }
 
 function serializeAgent(record: AgentRecord): SerializedAgent {
@@ -446,18 +454,23 @@ function inspectPersistedRecord(record: AgentRecord): void {
 			? messages.slice(latestRunIndex + 1).reverse().find((message) => message?.role === "assistant")
 			: [...messages].reverse().find((message) => message?.role === "assistant");
 		if (lastAssistant) {
-			if (lastAssistant.stopReason === "error" || lastAssistant.errorMessage) {
-				record.lastOutcome = "failed";
-				record.error = lastAssistant.errorMessage || "assistant error";
+			record.lastAssistantStopReason = lastAssistant.stopReason;
+			if (lastAssistant.stopReason === "stop") {
+				record.lastOutcome = "completed";
+				record.error = undefined;
+				record.finalAnswer = assistantText(lastAssistant);
 			} else if (lastAssistant.stopReason === "length") {
 				record.lastOutcome = "failed";
 				record.error = "Assistant response stopped at the token limit";
+			} else if (lastAssistant.stopReason === "aborted") {
+				record.lastOutcome = "interrupted";
+				record.error = lastAssistant.errorMessage || "Assistant run aborted";
+			} else if (lastAssistant.stopReason === "error" || lastAssistant.errorMessage) {
+				record.lastOutcome = "failed";
+				record.error = lastAssistant.errorMessage || "assistant error";
 			} else if (lastAssistant.stopReason !== "stop") {
 				record.lastOutcome = "interrupted";
 				record.error = undefined;
-			} else {
-				record.lastOutcome = "completed";
-				record.finalAnswer = assistantText(lastAssistant);
 			}
 		} else if (latestRunIndex >= 0) {
 			record.lastOutcome = "interrupted";
@@ -690,6 +703,7 @@ class SubagentManager {
 		record.state = "queued";
 		record.lastOutcome = "none";
 		record.error = undefined;
+		record.lastAssistantStopReason = undefined;
 		record.finalAnswer = "";
 		record.startedAt = undefined;
 		record.settledAt = undefined;
@@ -851,6 +865,13 @@ class SubagentManager {
 				const winner = await Promise.race([settledPromise.then(() => "settled" as const), exitPromise.then(() => "exit" as const)]);
 				if (winner === "settled") {
 					await client.terminate();
+					// agent_settled is the session-level terminal boundary. If the
+					// final assistant message succeeded, any earlier provider error
+					// was recovered even if that success was only visible via
+					// agent_end rather than message_end.
+					if (record.lastAssistantStopReason === "stop" || record.lastAssistantStopReason === "toolUse") {
+						record.error = undefined;
+					}
 					if (!record.stopRequested && !attemptUsedTool && isTransientFailure(record.error) && attempt <= MAX_RETRIES) {
 						terminalError = record.error;
 						record.error = undefined;
@@ -882,6 +903,10 @@ class SubagentManager {
 			record.lastOutcome = "failed";
 			record.error = terminalError;
 			addActivity(record, `failed: ${oneLine(terminalError, 120)}`);
+		} else if (record.lastAssistantStopReason === "aborted") {
+			record.lastOutcome = "interrupted";
+			record.error = record.error || "Assistant run aborted";
+			addActivity(record, `interrupted: ${oneLine(record.error, 120)}`);
 		} else if (record.error) {
 			record.lastOutcome = "failed";
 			addActivity(record, `failed: ${oneLine(record.error, 120)}`);
@@ -1169,9 +1194,12 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		startedAt: record.startedAt,
 		updatedAt: record.updatedAt,
 		settledAt: record.settledAt,
+		durationMs: settledDuration(record),
 		cost: record.usage.cost,
 		turns: record.usage.turns,
 		tokens: totalUsageTokens(record.usage),
+		cacheHitRate: record.usage.latestCacheHitRate,
+		hasCacheUsage: record.usage.cacheRead > 0 || record.usage.cacheWrite > 0,
 		contextWindow: record.contextWindow,
 		contextTokens: record.contextTokens,
 		sessionFile: record.sessionFile,
@@ -1182,7 +1210,10 @@ function formatList(records: AgentRecord[]): string {
 	if (records.length === 0) return "No subagents are known in this parent session.";
 	return records.map((record) => {
 		const state = record.state === "cold" ? `cold; last run ${record.lastOutcome}` : record.state;
-		return `${record.id} · ${state} · ${record.modelRef} [${record.thinking}] · ${record.title} · ${oneLine(currentActivity(record), 100)}`;
+		const duration = settledDuration(record);
+		const cache = formatCacheHitRate(record.usage.latestCacheHitRate, record.usage.cacheRead > 0 || record.usage.cacheWrite > 0);
+		const metrics = [duration === undefined ? "" : formatDuration(duration), cache].filter(Boolean).join(" · ");
+		return `${record.id} · ${state} · ${record.modelRef} [${record.thinking}]${metrics ? ` · ${metrics}` : ""} · ${record.title} · ${oneLine(currentActivity(record), 100)}`;
 	}).join("\n");
 }
 
@@ -1208,7 +1239,9 @@ function formatStatus(record: AgentRecord): string {
 		lines.push("Recently:", ...record.recent.slice(-MAX_RECENT_ACTIVITIES).map((activity) => `  - ${activity.text}`));
 	}
 	const context = record.contextWindow ? ` · ${record.contextTokens === undefined ? "?" : formatTokens(record.contextTokens)}/${formatTokens(record.contextWindow)} context` : "";
-	lines.push(`Usage: ${formatCost(record.usage.cost)} · ${record.usage.turns} model turn${record.usage.turns === 1 ? "" : "s"}${context}`);
+	const duration = settledDuration(record);
+	const cache = formatCacheHitRate(record.usage.latestCacheHitRate, record.usage.cacheRead > 0 || record.usage.cacheWrite > 0);
+	lines.push(`Usage: ${formatCost(record.usage.cost)} · ${record.usage.turns} model turn${record.usage.turns === 1 ? "" : "s"}${duration === undefined ? "" : ` · ${formatDuration(duration)}`}${cache ? ` · ${cache}` : ""}${context}`);
 	if (record.error) lines.push(`Error: ${oneLine(record.error, 300)}`);
 	lines.push(`Session: ${record.sessionFile}`);
 	return lines.filter(Boolean).join("\n");
@@ -1299,6 +1332,9 @@ type DisplayAgent = {
 	cost: number;
 	turns: number;
 	tokens: number;
+	cacheHitRate?: number;
+	hasCacheUsage: boolean;
+	durationMs?: number;
 	contextWindow?: number;
 	contextTokens?: number;
 };
@@ -1324,6 +1360,11 @@ function displayAgent(value: unknown, fallbackCreatedAt = 0): DisplayAgent | und
 		cost: typeof value.cost === "number" ? value.cost : 0,
 		turns: typeof value.turns === "number" ? value.turns : isRecord(value.usage) && typeof value.usage.turns === "number" ? value.usage.turns : 0,
 		tokens: typeof value.tokens === "number" ? value.tokens : isRecord(value.usage) ? ["input", "output", "cacheRead", "cacheWrite"].reduce((sum, key) => sum + (typeof value.usage[key] === "number" ? value.usage[key] as number : 0), 0) : 0,
+		cacheHitRate: typeof value.cacheHitRate === "number" ? value.cacheHitRate : isRecord(value.usage) && typeof value.usage.latestCacheHitRate === "number" ? value.usage.latestCacheHitRate : undefined,
+		hasCacheUsage: typeof value.hasCacheUsage === "boolean"
+			? value.hasCacheUsage
+			: isRecord(value.usage) && (Number(value.usage.cacheRead) > 0 || Number(value.usage.cacheWrite) > 0),
+		durationMs: typeof value.durationMs === "number" ? value.durationMs : undefined,
 		contextWindow: typeof value.contextWindow === "number" ? value.contextWindow : undefined,
 		contextTokens: typeof value.contextTokens === "number" ? value.contextTokens : undefined,
 	};
@@ -1422,8 +1463,10 @@ function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): st
 		const context = contextMeter(record, theme);
 		const contextText = context ? ` · ${context}` : "";
 		const cost = record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : "";
+		const cache = formatCacheHitRate(record.usage.latestCacheHitRate, record.usage.cacheRead > 0 || record.usage.cacheWrite > 0);
+		const cacheText = cache ? ` · ${cache}` : "";
 		// Activity changes frequently; keep it last so duration and cost do not jump.
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}${contextText}${elapsed}${cost} · ${theme.fg("muted", activity)}`;
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}${contextText}${elapsed}${cost}${cacheText} · ${theme.fg("muted", activity)}`;
 	});
 	if (tree.omitted > 0) rows.push(theme.fg("dim", `… ${tree.omitted} more active/ancestor node${tree.omitted === 1 ? "" : "s"}`));
 	return [header, ...rows];
@@ -1461,7 +1504,10 @@ function agentRows(agents: DisplayAgent[], theme: Theme, expanded: boolean, maxC
 		const profile = expanded && agent.profile ? ` · ${theme.fg("dim", `profile ${agent.profile}`)}` : "";
 		const context = contextMeterValues(agent.contextWindow, agent.contextTokens, theme);
 		const contextText = context ? ` · ${context}` : "";
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${contextText}${cost}${activity}`;
+		const cache = formatCacheHitRate(agent.cacheHitRate, agent.hasCacheUsage);
+		const cacheText = cache ? ` · ${theme.fg("dim", cache)}` : "";
+		const durationText = agent.durationMs === undefined ? "" : ` · ${theme.fg("dim", formatDuration(agent.durationMs))}`;
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${contextText}${cost}${cacheText}${durationText}${activity}`;
 	});
 	if (tree.omitted > 0 && showMoreHint) rows.push(theme.fg("dim", `… ${tree.omitted} more (${keyHint("app.tools.expand", "details")})`));
 	return rows.join("\n");

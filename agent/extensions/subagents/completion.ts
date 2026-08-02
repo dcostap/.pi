@@ -3,6 +3,8 @@ export type CompletionUsage = {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/** Cache-hit rate of the latest assistant prompt, matching Pi's CH footer metric. */
+	latestCacheHitRate?: number;
 	cost: number;
 	turns: number;
 };
@@ -39,6 +41,15 @@ export function completionCost(value: number): string {
 	return value === 0 ? "$0.000" : `$${value.toFixed(value < 0.01 ? 5 : 3)}`;
 }
 
+export function cacheHitRate(usage: Pick<CompletionUsage, "input" | "cacheRead" | "cacheWrite">): number | undefined {
+	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	return promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : undefined;
+}
+
+export function formatCacheHitRate(value: number | undefined, hasCacheUsage = true): string {
+	return hasCacheUsage && typeof value === "number" && Number.isFinite(value) ? `CH${value.toFixed(1)}%` : "";
+}
+
 export function completionDuration(ms: number): string {
 	const seconds = Math.max(0, ms) / 1000;
 	if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
@@ -58,7 +69,8 @@ export function formatCompletionBatch(snapshots: CompletionSnapshot[], heading =
 		const answer = snapshot.outcome === "completed"
 			? snapshot.finalAnswer || "(No final answer.)"
 			: snapshot.error || snapshot.finalAnswer || "(No final answer.)";
-		return `---\n\n## Agent ${index + 1} — ${snapshot.title}\n\n> ${snapshot.id}${snapshot.runId ? ` · ${snapshot.runId}` : ""} · ${snapshot.model} [${snapshot.thinking}] · ${snapshot.outcome}${snapshot.profile ? ` · profile ${snapshot.profile}` : ""}\n\n- **Attempts / model turns / duration:** ${snapshot.attempts} · ${snapshot.usage.turns} · ${duration}\n- **Tokens:** ${completionTokens(snapshot.usage).toLocaleString("en-US")} total (input ${snapshot.usage.input.toLocaleString("en-US")} · output ${snapshot.usage.output.toLocaleString("en-US")} · cache read ${snapshot.usage.cacheRead.toLocaleString("en-US")} · cache write ${snapshot.usage.cacheWrite.toLocaleString("en-US")})\n- **Exact cost:** ${completionCost(snapshot.usage.cost)}\n- **Session:** ${snapshot.sessionFile}\n\n${answer}`;
+		const cache = formatCacheHitRate(snapshot.usage.latestCacheHitRate, snapshot.usage.cacheRead > 0 || snapshot.usage.cacheWrite > 0);
+		return `---\n\n## Agent ${index + 1} — ${snapshot.title}\n\n> ${snapshot.id}${snapshot.runId ? ` · ${snapshot.runId}` : ""} · ${snapshot.model} [${snapshot.thinking}] · ${snapshot.outcome}${snapshot.profile ? ` · profile ${snapshot.profile}` : ""}\n\n- **Attempts / model turns / duration:** ${snapshot.attempts} · ${snapshot.usage.turns} · ${duration}${cache ? ` · ${cache}` : ""}\n- **Tokens:** ${completionTokens(snapshot.usage).toLocaleString("en-US")} total (input ${snapshot.usage.input.toLocaleString("en-US")} · output ${snapshot.usage.output.toLocaleString("en-US")} · cache read ${snapshot.usage.cacheRead.toLocaleString("en-US")} · cache write ${snapshot.usage.cacheWrite.toLocaleString("en-US")})\n- **Exact cost:** ${completionCost(snapshot.usage.cost)}\n- **Session:** ${snapshot.sessionFile}\n\n${answer}`;
 	});
 	return [header, ...answers].join("\n\n");
 }

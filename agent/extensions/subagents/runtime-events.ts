@@ -1,11 +1,40 @@
 export type RuntimeStatusTarget = {
 	error?: string;
+	/** The stop reason of the most recent assistant message in this run. */
+	lastAssistantStopReason?: string;
 };
 
 function compactionReason(event: any): string {
 	return event?.reason === "manual" || event?.reason === "threshold" || event?.reason === "overflow"
 		? event.reason
 		: "unknown";
+}
+
+function latestAssistantMessage(messages: unknown): any | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	return [...messages].reverse().find((message) => message?.role === "assistant");
+}
+
+function applyAssistantStatus(target: RuntimeStatusTarget, message: any): void {
+	if (message?.role !== "assistant") return;
+	target.lastAssistantStopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+	if (message.stopReason === "stop" || message.stopReason === "toolUse") {
+		// Successful output after an automatic retry/compaction recovery makes
+		// the previous provider error historical rather than terminal.
+		target.error = undefined;
+		return;
+	}
+	if (message.stopReason === "length") {
+		target.error = "Assistant response stopped at the token limit";
+		return;
+	}
+	if (message.stopReason === "aborted") {
+		target.error = message.errorMessage || target.error || "Assistant run aborted";
+		return;
+	}
+	if (message.stopReason === "error" || message.errorMessage) {
+		target.error = message.errorMessage || "assistant error";
+	}
 }
 
 /**
@@ -18,21 +47,27 @@ function compactionReason(event: any): string {
  * failed merely because it observed the initial provider error.
  */
 export function applyRuntimeStatusEvent(target: RuntimeStatusTarget, event: any): string | undefined {
+	if (event?.type === "agent_start") {
+		// A new low-level run (including an automatic retry) must not inherit
+		// the previous run's successful stop reason when deciding whether a
+		// later error is terminal.
+		target.lastAssistantStopReason = undefined;
+		return;
+	}
+
 	if (event?.type === "message_end" && event.message?.role === "assistant") {
-		const message = event.message;
-		if (message.stopReason === "error" || message.errorMessage) {
-			target.error = message.errorMessage || "assistant error";
-			return;
-		}
-		if (message.stopReason === "length") {
-			target.error = "Assistant response stopped at the token limit";
-			return;
-		}
-		if (message.stopReason === "stop" || message.stopReason === "toolUse") {
-			// Successful output after an automatic retry/compaction recovery makes
-			// the previous provider error historical rather than terminal.
-			target.error = undefined;
-		}
+		applyAssistantStatus(target, event.message);
+		return;
+	}
+
+	if (event?.type === "agent_end") {
+		// A recovered low-level run is not guaranteed to expose a normal
+		// message_end event to the RPC client. agent_end contains the finalized
+		// messages, so use its last assistant message as the authoritative
+		// outcome for this low-level run. A later agent_end can therefore
+		// supersede an earlier provider error before agent_settled.
+		const message = latestAssistantMessage(event.messages);
+		if (message) applyAssistantStatus(target, message);
 		return;
 	}
 
