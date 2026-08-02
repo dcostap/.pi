@@ -1289,6 +1289,7 @@ type DisplayAgent = {
 	title: string;
 	parentAgentId?: string;
 	profile?: string;
+	createdAt: number;
 	state: string;
 	outcome: string;
 	model: string;
@@ -1297,6 +1298,8 @@ type DisplayAgent = {
 	cost: number;
 	turns: number;
 	tokens: number;
+	contextWindow?: number;
+	contextTokens?: number;
 };
 
 function resultText(value: any): string {
@@ -1304,13 +1307,14 @@ function resultText(value: any): string {
 	return value.content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n");
 }
 
-function displayAgent(value: unknown): DisplayAgent | undefined {
+function displayAgent(value: unknown, fallbackCreatedAt = 0): DisplayAgent | undefined {
 	if (!isRecord(value) || typeof value.id !== "string") return undefined;
 	return {
 		id: value.id,
 		title: typeof value.title === "string" ? value.title : "subagent",
 		parentAgentId: typeof value.parentAgentId === "string" ? value.parentAgentId : undefined,
 		profile: typeof value.profile === "string" ? value.profile : undefined,
+		createdAt: typeof value.createdAt === "number" ? value.createdAt : fallbackCreatedAt,
 		state: typeof value.state === "string" ? value.state : typeof value.outcome === "string" ? "cold" : "accepted",
 		outcome: typeof value.lastOutcome === "string" ? value.lastOutcome : typeof value.outcome === "string" ? value.outcome : "none",
 		model: typeof value.model === "string" ? value.model : typeof value.modelRef === "string" ? value.modelRef : "",
@@ -1319,12 +1323,14 @@ function displayAgent(value: unknown): DisplayAgent | undefined {
 		cost: typeof value.cost === "number" ? value.cost : 0,
 		turns: typeof value.turns === "number" ? value.turns : isRecord(value.usage) && typeof value.usage.turns === "number" ? value.usage.turns : 0,
 		tokens: typeof value.tokens === "number" ? value.tokens : isRecord(value.usage) ? ["input", "output", "cacheRead", "cacheWrite"].reduce((sum, key) => sum + (typeof value.usage[key] === "number" ? value.usage[key] as number : 0), 0) : 0,
+		contextWindow: typeof value.contextWindow === "number" ? value.contextWindow : undefined,
+		contextTokens: typeof value.contextTokens === "number" ? value.contextTokens : undefined,
 	};
 }
 
 function displayAgents(details: any): DisplayAgent[] {
 	const source = Array.isArray(details?.completionSnapshots) ? details.completionSnapshots : Array.isArray(details?.displayAgents) ? details.displayAgents : Array.isArray(details?.agents) ? details.agents : details?.agent ? [details.agent] : [];
-	return source.map(displayAgent).filter((agent): agent is DisplayAgent => agent !== undefined);
+	return source.map((value: unknown, index: number) => displayAgent(value, index)).filter((agent): agent is DisplayAgent => agent !== undefined);
 }
 
 function displayState(agent: DisplayAgent): string {
@@ -1355,10 +1361,14 @@ function isActive(record: AgentRecord): boolean {
 }
 
 function contextMeter(record: AgentRecord, theme: Theme): string {
-	if (!record.contextWindow || record.contextWindow <= 0) return "";
-	if (record.contextTokens === undefined) return theme.fg("muted", `?/${formatTokens(record.contextWindow)}`);
-	const percent = Math.max(0, (record.contextTokens / record.contextWindow) * 100);
-	const display = `${percent.toFixed(1)}%/${formatTokens(record.contextWindow)}`;
+	return contextMeterValues(record.contextWindow, record.contextTokens, theme);
+}
+
+function contextMeterValues(contextWindow: number | undefined, contextTokens: number | undefined, theme: Theme): string {
+	if (!contextWindow || contextWindow <= 0) return "";
+	if (contextTokens === undefined) return theme.fg("muted", `?/${formatTokens(contextWindow)}`);
+	const percent = Math.max(0, (contextTokens / contextWindow) * 100);
+	const display = `${percent.toFixed(1)}%/${formatTokens(contextWindow)}`;
 	if (percent > 90) return theme.fg("error", display);
 	if (percent > 70) return theme.fg("warning", display);
 	return theme.fg("muted", display);
@@ -1370,13 +1380,16 @@ function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): st
 	const completed = inactive.filter((record) => record.lastOutcome === "completed").length;
 	const failed = inactive.filter((record) => record.lastOutcome === "failed").length;
 	const stopped = inactive.filter((record) => record.lastOutcome === "stopped" || record.lastOutcome === "interrupted").length;
+	const activeCost = active.reduce((sum, record) => sum + record.usage.cost, 0);
+	const totalCost = records.reduce((sum, record) => sum + record.usage.cost, 0);
+	const costSummary = ` · active ${formatCost(activeCost)} · total ${formatCost(totalCost)}`;
 	const inactiveParts = [completed ? `${completed} completed` : "", failed ? `${failed} failed` : "", stopped ? `${stopped} stopped` : ""].filter(Boolean).join(" · ");
 	if (active.length === 0) {
 		const known = records.length === 0 ? "none known" : `${records.length} total${inactiveParts ? ` · ${inactiveParts}` : ""}`;
-		return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}`)];
+		return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
-		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}`);
+		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${costSummary}`);
 	const tree = buildVisibleTree(records.map((record) => ({ ...record, parentId: record.parentAgentId, active: isActive(record) })), MAX_WIDGET_NODES);
 	const rows = tree.rows.map(({ item: record, prefix, isLast }) => {
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
@@ -1414,16 +1427,21 @@ function agentCounts(agents: DisplayAgent[]): string {
 }
 
 function agentRows(agents: DisplayAgent[], theme: Theme, expanded: boolean, maxCollapsed = 4, showMoreHint = true): string {
-	const shown = expanded ? agents : agents.slice(0, maxCollapsed);
-	const rows = shown.map((agent) => {
+	// Keep tool results aligned with the persistent widget: every agent is a
+	// node, and parentAgentId determines the connector/indentation.
+	const tree = buildVisibleTree(agents.map((agent) => ({ ...agent, active: true })), expanded ? Math.max(agents.length, 1) : maxCollapsed);
+	const rows = tree.rows.map(({ item: agent, prefix, isLast }) => {
 		const state = displayState(agent);
+		const connector = `${prefix}${isLast ? "└─" : "├─"} `;
 		const activity = agent.activity && agent.activity !== state ? ` · ${theme.fg("dim", oneLine(agent.activity, 80))}` : "";
 		const cost = agent.cost > 0 ? ` · ${theme.fg("dim", formatCost(agent.cost))}` : "";
 		const model = agent.model ? ` · ${theme.fg("dim", `${agent.model}${agent.thinking ? ` [${agent.thinking}]` : ""}`)}` : "";
 		const profile = expanded && agent.profile ? ` · ${theme.fg("dim", `profile ${agent.profile}`)}` : "";
-		return `${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${activity}${cost}`;
+		const context = contextMeterValues(agent.contextWindow, agent.contextTokens, theme);
+		const contextText = context ? ` · ${context}` : "";
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${contextText}${activity}${cost}`;
 	});
-	if (!expanded && agents.length > shown.length && showMoreHint) rows.push(theme.fg("dim", `… ${agents.length - shown.length} more (${keyHint("app.tools.expand", "details")})`));
+	if (tree.omitted > 0 && showMoreHint) rows.push(theme.fg("dim", `… ${tree.omitted} more (${keyHint("app.tools.expand", "details")})`));
 	return rows.join("\n");
 }
 
@@ -1462,13 +1480,18 @@ function completionSummaryResult(resultValue: any, options: { expanded: boolean;
 	if (options.isPartial) return agentSummaryResult(resultValue, options, theme, lastComponent, "Waiting");
 	if (options.expanded) return new Markdown(resultText(resultValue), 0, 0, getMarkdownTheme());
 	const agents = displayAgents(resultValue?.details);
+	const pendingAgents = displayAgents({ agents: resultValue?.details?.pendingAgents })
+		.filter((pending) => !agents.some((agent) => agent.id === pending.id));
+	const displayedAgents = [...agents, ...pendingAgents];
 	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
-	if (agents.length === 0) {
+	if (displayedAgents.length === 0) {
 		component.setText(theme.fg("muted", oneLine(resultText(resultValue), 500)));
 		return component;
 	}
 	const anyMode = resultValue?.details?.waitMode === "any";
-	const pendingCount = Array.isArray(resultValue?.details?.pendingAgents) ? resultValue.details.pendingAgents.length : 0;
+	const pendingCount = pendingAgents.length > 0
+		? pendingAgents.length
+		: Array.isArray(resultValue?.details?.pendingAgents) ? resultValue.details.pendingAgents.length : 0;
 	const failures = Number(resultValue?.details?.failures ?? agents.filter((agent) => displayState(agent) !== "completed").length);
 	const totalCost = Number(resultValue?.details?.totalCost ?? agents.reduce((sum, agent) => sum + agent.cost, 0));
 	const totalTokens = Number(resultValue?.details?.totalTokens ?? agents.reduce((sum, agent) => sum + agent.tokens, 0));
@@ -1479,7 +1502,7 @@ function completionSummaryResult(resultValue: any, options: { expanded: boolean;
 		: theme.fg("success", `✓ ${resultLabel} · ${countLabel}`);
 	const metrics = `${totalTokens > 0 ? ` · ${totalTokens.toLocaleString("en-US")} tokens` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
 	const pending = pendingCount > 0 ? `\n${theme.fg("dim", `${pendingCount} still running`)}` : "";
-	component.setText(`${headline}${metrics}\n${agentRows(agents, theme, false, 12, false)}${agents.length > 12 ? `\n${theme.fg("dim", `… ${agents.length - 12} more`)}` : ""}${pending}\n${theme.fg("dim", keyHint("app.tools.expand", anyMode ? "first result details" : "full batch results"))}`);
+	component.setText(`${headline}${metrics}\n${agentRows(displayedAgents, theme, false, 12, false)}${displayedAgents.length > 12 ? `\n${theme.fg("dim", `… ${displayedAgents.length - 12} more`)}` : ""}${pending}\n${theme.fg("dim", keyHint("app.tools.expand", anyMode ? "first result details" : "full batch results"))}`);
 	return component;
 }
 
