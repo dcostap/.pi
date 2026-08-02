@@ -48,7 +48,7 @@ const NESTED_SUBAGENTS_ENABLED = false;
 const RECENT_FINISHED_WIDGET_MS = 60_000;
 
 const WIDGET_ID = "subagents-tree";
-const MAX_WIDGET_NODES = 12;
+const MAX_WIDGET_NODES = 25;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type ContextMode = (typeof CONTEXT_MODES)[number];
