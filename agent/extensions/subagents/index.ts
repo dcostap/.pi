@@ -40,7 +40,6 @@ const CONTEXT_MODES = ["fresh", "transcript", "clone"] as const;
 const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES = 1024 * 1024;
 const NORMAL_LAUNCH_DETAIL_LIMIT = 10;
-const MAX_CONCURRENT_SUBAGENTS = 8;
 const MAX_RECENT_ACTIVITIES = 5;
 const MAX_RETRIES = 4;
 const RETRY_DELAY_MS = 1_000;
@@ -640,10 +639,9 @@ class SubagentManager {
 	private readonly records = new Map<string, AgentRecord>();
 	private readonly queue: AgentRecord[] = [];
 	private readonly listeners = new Set<(event: ManagerEvent) => void>();
-	private activeCount = 0;
 	private disposed = false;
 
-	constructor(private readonly cwd: string, private readonly maxConcurrent = MAX_CONCURRENT_SUBAGENTS) {}
+	constructor(private readonly cwd: string) {}
 
 	restore(items: SerializedAgent[]): void {
 		for (const item of items) {
@@ -819,12 +817,10 @@ class SubagentManager {
 
 	private pump(): void {
 		queueMicrotask(() => {
-			while (!this.disposed && this.activeCount < this.maxConcurrent && this.queue.length > 0) {
+			while (!this.disposed && this.queue.length > 0) {
 				const record = this.queue.shift()!;
 				if (record.stopRequested || record.state !== "queued") continue;
-				this.activeCount++;
 				void this.run(record).finally(() => {
-					this.activeCount--;
 					this.pump();
 				});
 			}
@@ -1781,13 +1777,13 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 					text = `Started ${records.length} subagent${records.length === 1 ? "" : "s"}:\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.profile ? ` · profile ${record.profile}` : ""}\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
 				} else {
 					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-					const running = Math.min(records.length, MAX_CONCURRENT_SUBAGENTS);
+					const running = records.length;
 					try {
 						await writeFile(handlesFile, `${JSON.stringify(serialized, null, 2)}\n`, "utf8");
-						text = `Accepted ${records.length} subagents.\nStarting/running: ${running}\nQueued internally: ${Math.max(0, records.length - running)}\nHandle list saved to: ${handlesFile}`;
+						text = `Accepted ${records.length} subagents.\nStarting/running: ${running}\nQueued internally: 0\nHandle list saved to: ${handlesFile}`;
 					} catch (error) {
 						handlesFile = undefined;
-						text = `Accepted ${records.length} subagents.\nStarting/running: ${running}\nQueued internally: ${Math.max(0, records.length - running)}\nWarning: the compact handle file could not be written (${error instanceof Error ? error.message : String(error)}). Handles remain preserved in this tool result's details.`;
+						text = `Accepted ${records.length} subagents.\nStarting/running: ${running}\nQueued internally: 0\nWarning: the compact handle file could not be written (${error instanceof Error ? error.message : String(error)}). Handles remain preserved in this tool result's details.`;
 					}
 				}
 				if (resolved.manifest) text += `\nInput: ${resolved.manifest.path} · ${resolved.manifest.bytes.toLocaleString("en-US")} bytes · SHA-256 ${resolved.manifest.sha256}`;
