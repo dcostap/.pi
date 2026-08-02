@@ -581,7 +581,7 @@ class RpcClient {
 		});
 	}
 
-	async send(type: string, payload: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<any> {
+	async send(type: string, payload: Record<string, unknown> = {}, timeoutMs = 60_000): Promise<any> {
 		const child = this.child;
 		if (!child?.stdin || child.stdin.destroyed || child.stdin.writableEnded || child.exitCode !== null) {
 			throw new Error("Subagent RPC process is not running");
