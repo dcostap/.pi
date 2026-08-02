@@ -15,11 +15,12 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "../_shared/conversation-transcript.ts";
 import { formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
 import { loadSubagentProfiles, type SubagentProfile } from "./profiles.ts";
+import { applyRuntimeStatusEvent } from "./runtime-events.ts";
 import { buildVisibleTree } from "./tree.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
@@ -898,6 +899,8 @@ class SubagentManager {
 		const now = Date.now();
 		record.updatedAt = now;
 		record.lastObservedAt = now;
+		const runtimeActivity = applyRuntimeStatusEvent(record, event);
+		if (runtimeActivity) addActivity(record, runtimeActivity, now);
 		if (event.type === "agent_start") {
 			record.state = "running";
 			addActivity(record, "agent running", now);
@@ -925,8 +928,6 @@ class SubagentManager {
 			updateUsage(record, event.message);
 			const text = assistantText(event.message);
 			if (text) record.finalAnswer = text;
-			if (event.message.stopReason === "error" || event.message.errorMessage) record.error = event.message.errorMessage || "assistant error";
-			else if (event.message.stopReason === "length") record.error = "Assistant response stopped at the token limit";
 			return;
 		}
 		if (event.type === "agent_end") {
@@ -1482,6 +1483,12 @@ function completionSummaryResult(resultValue: any, options: { expanded: boolean;
 	return component;
 }
 
+function completionMessageResult(resultValue: any, expanded: boolean, theme: Theme): Box {
+	const box = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
+	box.addChild(completionSummaryResult(resultValue, { expanded, isPartial: false }, theme));
+	return box;
+}
+
 function textOrMarkdownResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown, preview = 260) {
 	const text = resultText(resultValue);
 	if (options.isError) {
@@ -1935,7 +1942,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerMessageRenderer("subagent-completions", (message, options, theme) => {
-		return completionSummaryResult({ content: [{ type: "text", text: String(message.content) }], details: message.details }, { expanded: options.expanded, isPartial: false }, theme);
+		return completionMessageResult({ content: [{ type: "text", text: String(message.content) }], details: message.details }, options.expanded, theme);
 	});
 
 	pi.registerCommand("subagents", {
