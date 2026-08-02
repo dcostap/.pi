@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	getMarkdownTheme,
 	keyHint,
@@ -14,11 +15,14 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Markdown, Text } from "@earendil-works/pi-tui";
+import { Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { buildConversationTranscript } from "./_shared/conversation-transcript.ts";
+import { buildConversationTranscript } from "../_shared/conversation-transcript.ts";
+import { formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
+import { loadSubagentProfiles, type SubagentProfile } from "./profiles.ts";
+import { buildVisibleTree } from "./tree.ts";
 
-const REVIEW_TOOL_NAME = "launch_review_subagents";
+const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
 const START_TOOL_NAME = "subagent_start";
 const LIST_TOOL_NAME = "subagent_list";
 const STATUS_TOOL_NAME = "subagent_status";
@@ -39,8 +43,10 @@ const MAX_RECENT_ACTIVITIES = 5;
 const MAX_RETRIES = 4;
 const RETRY_DELAY_MS = 1_000;
 const MAX_RPC_STDERR_CHARS = 128 * 1024;
+const NESTED_SUBAGENTS_ENABLED = false;
 
-const FINAL_RESULT_DISCLAIMER = "Reminder: Don't blindly trust the reviewers' conclusions. Synthesize their evidence and make your own judgment.";
+const WIDGET_ID = "subagents-tree";
+const MAX_WIDGET_NODES = 12;
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type ContextMode = (typeof CONTEXT_MODES)[number];
@@ -73,6 +79,7 @@ type StartSpec = {
 	task: string;
 	model: string;
 	thinking: ThinkingLevel;
+	profile?: string;
 	context?: ContextMode;
 	system_prompt?: string;
 	system_prompt_file?: string;
@@ -82,31 +89,14 @@ type StartToolParams = Partial<StartSpec> & {
 	input_file?: string;
 };
 
-type ReviewerSpec = {
-	description: string;
-	focus?: string;
-	model: string;
-	thinking: ThinkingLevel;
-};
-
-type ReviewParams = {
-	what_to_review: string;
-	context?: ContextMode;
-	system_prompt?: string;
-	system_prompt_file?: string;
-	reviewers: ReviewerSpec[];
-};
-
-type ReviewToolParams = Partial<ReviewParams> & {
-	input_file?: string;
-};
-
 type SerializedAgent = {
 	id: string;
 	title: string;
 	task: string;
 	modelRef: string;
 	thinking: ThinkingLevel;
+	profile?: string;
+	parentAgentId?: string;
 	contextMode: ContextMode;
 	sessionFile: string;
 	sandboxDir: string;
@@ -114,6 +104,14 @@ type SerializedAgent = {
 	promptCacheKey?: string;
 	createdAt: number;
 	runNumber: number;
+	// Runtime fields recovered from later parent-session tool results. Older
+	// launch records do not contain these fields.
+	restoredOutcome?: RunOutcome;
+	restoredRunId?: string;
+	restoredStartedAt?: number;
+	restoredSettledAt?: number;
+	restoredAttempt?: number;
+	restoredUsage?: UsageStats;
 };
 
 type AgentRecord = SerializedAgent & {
@@ -141,6 +139,7 @@ type AgentRecord = SerializedAgent & {
 	waiters: number;
 	deliveryPending: boolean;
 	deliveryConsumed: boolean;
+	latestCompletion?: CompletionSnapshot;
 };
 
 type PreparedAgent = {
@@ -312,6 +311,8 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 		task: record.task,
 		modelRef: record.modelRef,
 		thinking: record.thinking,
+		profile: record.profile,
+		parentAgentId: record.parentAgentId,
 		contextMode: record.contextMode,
 		sessionFile: record.sessionFile,
 		sandboxDir: record.sandboxDir,
@@ -322,17 +323,47 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 	};
 }
 
+function completionSnapshot(record: AgentRecord): CompletionSnapshot {
+	const settledAt = record.settledAt ?? Date.now();
+	return {
+		id: record.id,
+		title: record.title,
+		parentAgentId: record.parentAgentId,
+		profile: record.profile,
+		outcome: record.lastOutcome,
+		model: record.modelRef,
+		thinking: record.thinking,
+		runId: record.currentRunId,
+		task: record.currentTaskSummary ?? record.task,
+		activity: currentActivity(record),
+		createdAt: record.createdAt,
+		startedAt: record.startedAt,
+		settledAt,
+		durationMs: record.startedAt ? Math.max(0, settledAt - record.startedAt) : undefined,
+		attempts: record.attempt,
+		usage: { ...record.usage },
+		contextWindow: record.contextWindow,
+		contextTokens: record.contextTokens,
+		finalAnswer: record.finalAnswer,
+		error: record.error,
+		sessionFile: record.sessionFile,
+	};
+}
+
 function newRecord(serialized: SerializedAgent): AgentRecord {
 	return {
 		...serialized,
 		state: "cold",
-		lastOutcome: "none",
-		updatedAt: serialized.createdAt,
+		lastOutcome: serialized.restoredOutcome ?? "none",
+		currentRunId: serialized.restoredRunId,
+		startedAt: serialized.restoredStartedAt,
+		settledAt: serialized.restoredSettledAt,
+		updatedAt: serialized.restoredSettledAt ?? serialized.createdAt,
 		activeTools: new Map(),
 		recent: [],
-		usage: emptyUsage(),
+		usage: serialized.restoredUsage ? { ...emptyUsage(), ...serialized.restoredUsage } : emptyUsage(),
 		finalAnswer: "",
-		attempt: 0,
+		attempt: serialized.restoredAttempt ?? 0,
 		stopRequested: false,
 		waiters: 0,
 		deliveryPending: false,
@@ -373,7 +404,7 @@ function inspectPersistedRecord(record: AgentRecord): void {
 		const entries = manager.getBranch();
 		const messages = entries.filter((entry: any) => entry?.type === "message").map((entry: any) => entry.message);
 		let maxRun = record.runNumber;
-		let latestRunId: string | undefined;
+		let latestRunId: string | undefined = record.currentRunId;
 		let latestRunIndex = -1;
 		for (let index = 0; index < messages.length; index++) {
 			const message = messages[index];
@@ -412,8 +443,19 @@ function inspectPersistedRecord(record: AgentRecord): void {
 			record.lastOutcome = "interrupted";
 		}
 	} catch (error) {
-		record.lastOutcome = "failed";
-		record.error = `Could not open child session: ${error instanceof Error ? error.message : String(error)}`;
+		if (record.lastOutcome === "none") {
+			record.lastOutcome = "failed";
+			record.error = `Could not open child session: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+	const stoppedRunStillLatest = record.restoredOutcome === "stopped"
+		&& (!record.restoredRunId || !record.currentRunId || record.restoredRunId === record.currentRunId);
+	if (stoppedRunStillLatest) {
+		record.lastOutcome = "stopped";
+		record.error = undefined;
+	} else if (record.restoredOutcome === "stopped") {
+		// A later continuation supersedes the historical stop marker.
+		record.restoredOutcome = undefined;
 	}
 	record.state = "cold";
 }
@@ -629,6 +671,9 @@ class SubagentManager {
 		record.lastOutcome = "none";
 		record.error = undefined;
 		record.finalAnswer = "";
+		record.startedAt = undefined;
+		record.settledAt = undefined;
+		record.latestCompletion = undefined;
 		record.stopRequested = false;
 		record.attempt = 0;
 		record.activeTools.clear();
@@ -691,6 +736,7 @@ class SubagentManager {
 				record.lastOutcome = "stopped";
 				record.settledAt = Date.now();
 				addActivity(record, "stopped before launch");
+				record.latestCompletion = completionSnapshot(record);
 				record.resolveCompletion?.();
 				record.resolveCompletion = undefined;
 				this.emit({ kind: "settled", id: record.id });
@@ -702,7 +748,7 @@ class SubagentManager {
 			this.emit({ kind: "changed", id: record.id });
 			try { await record.client?.send("abort", {}, 3_000); } catch {}
 			await Promise.race([record.completion ?? Promise.resolve(), new Promise((resolve) => setTimeout(resolve, 3_000))]);
-			if (record.state !== "cold") await record.client?.terminate();
+			if (this.get(record.id).state !== "cold") await record.client?.terminate();
 		}));
 		return records;
 	}
@@ -822,6 +868,7 @@ class SubagentManager {
 			addActivity(record, "completed");
 		}
 		record.deliveryPending = record.waiters === 0 && !record.deliveryConsumed;
+		record.latestCompletion = completionSnapshot(record);
 		record.resolveCompletion?.();
 		record.resolveCompletion = undefined;
 		this.emit({ kind: "settled", id: record.id });
@@ -887,12 +934,13 @@ function isTransientFailure(message: string | undefined): boolean {
 function validateStartSpec(value: unknown, location: string): string[] {
 	const errors: string[] = [];
 	if (!isRecord(value)) return [`${location}: expected object`];
-	const allowed = new Set(["title", "task", "model", "thinking", "context", "system_prompt", "system_prompt_file"]);
+	const allowed = new Set(["title", "task", "model", "thinking", "profile", "context", "system_prompt", "system_prompt_file"]);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
 	for (const key of ["title", "task", "model"] as const) {
 		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
 	}
 	if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) errors.push(`${location}.thinking: required; expected one of ${THINKING_LEVELS.join(", ")}`);
+	if (value.profile !== undefined && (typeof value.profile !== "string" || !cleanText(value.profile))) errors.push(`${location}.profile: expected non-empty string`);
 	if (value.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(value.context)) errors.push(`${location}.context: expected one of ${CONTEXT_MODES.join(", ")}`);
 	if (value.system_prompt !== undefined && (typeof value.system_prompt !== "string" || !cleanText(value.system_prompt))) errors.push(`${location}.system_prompt: expected non-empty string`);
 	if (value.system_prompt_file !== undefined && (typeof value.system_prompt_file !== "string" || !cleanText(value.system_prompt_file))) errors.push(`${location}.system_prompt_file: expected non-empty string`);
@@ -950,6 +998,14 @@ async function readSystemPrompt(spec: Pick<StartSpec, "system_prompt" | "system_
 	return bytes;
 }
 
+function exactProfile(profiles: Map<string, SubagentProfile>, raw: string | undefined): SubagentProfile | undefined {
+	if (raw === undefined) return undefined;
+	const name = cleanText(raw);
+	const profile = profiles.get(name);
+	if (!profile) throw new Error(`Unknown subagent profile ${JSON.stringify(name)}. Available: ${[...profiles.keys()].join(", ") || "none"}`);
+	return profile;
+}
+
 function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): string {
 	const sourceSessionFile = ctx.sessionManager.getSessionFile();
 	if (!ctx.sessionManager.isPersisted() || !sourceSessionFile) throw new Error("clone context requires a persisted parent session");
@@ -1002,6 +1058,7 @@ async function prepareAgent(
 			task: cleanText(spec.task),
 			modelRef: modelRef(model),
 			thinking: spec.thinking,
+			profile: spec.profile,
 			contextMode,
 			sessionFile,
 			sandboxDir,
@@ -1027,7 +1084,7 @@ async function cleanupPreparedAgents(prepared: PreparedAgent[]): Promise<void> {
 	]));
 }
 
-function genericPrompt(task: string, sandboxDir: string, transcript?: string): string {
+function genericPrompt(task: string, sandboxDir: string, transcript?: string, profile?: SubagentProfile): string {
 	return [
 		transcript ? `<main_session_transcript>\n${transcript}\n</main_session_transcript>\n` : "",
 		"You are a managed Pi subagent. Complete the assigned task independently.",
@@ -1035,6 +1092,7 @@ function genericPrompt(task: string, sandboxDir: string, transcript?: string): s
 		"Use the sandbox for temporary files. Do not treat the project cwd as scratch space.",
 		"Do not make durable project changes unless the task explicitly asks for them.",
 		"Return a concise, self-contained final answer. The parent can continue this same session later if follow-up context is useful.",
+		profile ? `\n<subagent_profile name="${profile.name}">\n${profile.prompt}\n</subagent_profile>` : "",
 		"",
 		"<task>",
 		task,
@@ -1042,140 +1100,31 @@ function genericPrompt(task: string, sandboxDir: string, transcript?: string): s
 	].filter(Boolean).join("\n");
 }
 
-const REVIEW_RUBRIC = `# Review Guidelines
-
-You are acting as an independent code reviewer. The caller will provide the code review target separately.
-
-## What to flag
-
-Flag issues that:
-1. Meaningfully affect correctness, robustness, data safety, security, performance, maintainability, or user-visible behavior.
-2. Are discrete, actionable, and specific.
-3. Are within the reviewed scope and not unrelated pre-existing issues.
-4. The author would likely fix if they understood the issue.
-5. Are supported by concrete code evidence, not speculation.
-6. Do not demand rigor inconsistent with the rest of the codebase.
-7. Are not merely style preferences unless they obscure meaning or violate explicit project standards.
-
-Do not report unrelated pre-existing issues. Do not assume a bug exists; prove the failing path from code.
-
-## Review method
-
-1. Inspect the full relevant file/diff set before drawing conclusions.
-2. Read enough surrounding code to understand intent, call flow, data ownership, and lifecycle boundaries.
-3. Treat tests as supporting evidence only; passing tests do not prove correctness.
-4. Pay special attention to:
-   - error handling and recovery paths
-   - persistence, migration, cleanup, and destructive operations
-   - stale state, race/order problems, duplicate execution, and idempotence
-   - security boundaries and untrusted input
-   - performance, backpressure, and resource usage
-   - compatibility with project conventions and documented policies
-5. Prefer concrete bugs over broad rewrites.
-6. Do not implement fixes unless explicitly asked; this is review only.
-
-## Priority tags
-
-Use exactly one priority tag for each finding title:
-
-- [P0] Critical. Blocks release/use immediately; broad data loss, security compromise, or total breakage.
-- [P1] High. Should be fixed before merge/use; likely bug, data-loss risk, serious lifecycle issue, or major regression.
-- [P2] Medium. Real issue that should be fixed, but not necessarily blocking all use.
-- [P3] Low. Minor but actionable issue, maintainability concern, or useful test gap.
-
-Use [P0] sparingly.
-
-## Finding format
-
-Each finding should be concise and structured like this:
-
-### [P1] Short problem title
-
-Location: \`path/to/file.ext:line\` or \`path/to/file.ext:line-line\`
-
-Explain what changed, why it is wrong or risky, the concrete scenario where it fails, and the likely fix direction. Keep each finding focused on one issue. Prefer short line ranges. If a code snippet is useful, keep it under 3 lines.
-
-## Output format
-
-Structure the final review exactly like this:
-
-## Review Scope
-
-Briefly state what you reviewed and any neutral focus provided by the caller.
-
-## Summary
-
-Short overall assessment.
-
-## Findings
-
-List findings in descending severity order.
-
-If there are no qualifying findings, write:
-
-- No blocking findings.
-
-## Verification Notes
-
-Mention commands or checks you ran. If you did not run tests, say so.
-
-## Verdict
-
-Choose one:
-
-- \`correct\` — no blocking findings.
-- \`needs attention\` — one or more findings should be addressed.
-
-## Human Reviewer Callouts (Non-Blocking)
-
-Include only applicable informational callouts. If none apply, write \`- (none)\`.
-
-Possible callouts:
-- **This change adds or changes persistence/storage format:** <details>
-- **This change adds or changes migration/recovery behavior:** <details>
-- **This change introduces a new dependency:** <details>
-- **This change changes public API/config/schema/contract:** <details>
-- **This change modifies auth/permission/security behavior:** <details>
-- **This change includes destructive or irreversible operations:** <details>
-- **This change has notable performance/backpressure implications:** <details>
-
-## Tone and constraints
-
-- Be direct, specific, and matter-of-fact.
-- Avoid praise filler.
-- Avoid nitpicks.
-- Do not include speculative issues without a concrete failing path.
-- Do not produce a full patch.
-- Do not stop at the first issue; report every qualifying finding.
-`;
-
-function reviewPrompt(target: string, focus: string | undefined, sandboxDir: string, transcript?: string): string {
-	return [
-		transcript ? `<main_session_transcript>\n${transcript}\n</main_session_transcript>\n` : "",
-		"You are a managed Pi code review subagent.",
-		`Your scratch sandbox is: ${sandboxDir}`,
-		"Do not make durable project changes. This is review only.",
-		"Inspect the complete relevant code before reaching conclusions.",
-		"",
-		"<review_rubric>", REVIEW_RUBRIC, "</review_rubric>",
-		"",
-		"<review_target>", target, "</review_target>",
-		focus ? `\n<neutral_focus>\n${focus}\n</neutral_focus>` : "",
-	].filter(Boolean).join("\n");
-}
-
 function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
 	const byId = new Map<string, SerializedAgent>();
 	for (const entry of ctx.sessionManager.getBranch() as any[]) {
 		if (entry?.type !== "message" || entry.message?.role !== "toolResult") continue;
-		if (entry.message.toolName !== START_TOOL_NAME && entry.message.toolName !== REVIEW_TOOL_NAME) continue;
+		const toolName = entry.message.toolName;
 		const agents = entry.message.details?.agents;
 		if (!Array.isArray(agents)) continue;
+		const isLaunch = toolName === START_TOOL_NAME || toolName === LEGACY_REVIEW_TOOL_NAME;
 		for (const value of agents) {
 			if (!isRecord(value)) continue;
-			if (typeof value.id !== "string" || typeof value.sessionFile !== "string" || typeof value.modelRef !== "string") continue;
-			if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) continue;
-			byId.set(value.id, value as unknown as SerializedAgent);
+			if (typeof value.id !== "string") continue;
+			if (isLaunch) {
+				if (typeof value.sessionFile !== "string" || typeof value.modelRef !== "string") continue;
+				if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) continue;
+				byId.set(value.id, value as unknown as SerializedAgent);
+				continue;
+			}
+			const existing = byId.get(value.id);
+			if (!existing || toolName !== STOP_TOOL_NAME || value.lastOutcome !== "stopped") continue;
+			byId.set(value.id, {
+				...existing,
+				restoredOutcome: "stopped",
+				restoredRunId: typeof value.currentRunId === "string" ? value.currentRunId : existing.restoredRunId,
+				restoredSettledAt: typeof value.settledAt === "number" ? value.settledAt : existing.restoredSettledAt,
+			});
 		}
 	}
 	return [...byId.values()];
@@ -1189,6 +1138,8 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		lastOutcome: record.lastOutcome,
 		model: record.modelRef,
 		thinking: record.thinking,
+		profile: record.profile,
+		parentAgentId: record.parentAgentId,
 		currentRunId: record.currentRunId,
 		activity: currentActivity(record),
 		createdAt: record.createdAt,
@@ -1197,6 +1148,7 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		settledAt: record.settledAt,
 		cost: record.usage.cost,
 		turns: record.usage.turns,
+		tokens: totalUsageTokens(record.usage),
 		sessionFile: record.sessionFile,
 	};
 }
@@ -1216,6 +1168,8 @@ function formatStatus(record: AgentRecord): string {
 		`State: ${record.state}${record.state === "cold" ? `; last run ${record.lastOutcome}` : ""}`,
 		`Model: ${record.modelRef}`,
 		`Thinking: ${record.thinking}`,
+		record.profile ? `Profile: ${record.profile}` : "",
+		record.parentAgentId ? `Parent subagent: ${record.parentAgentId}` : "",
 		`Context: ${record.contextMode}`,
 		record.currentRunId ? `Current/latest run: ${record.currentRunId}` : "",
 		`Task: ${oneLine(record.currentTaskSummary ?? record.task, 180)}`,
@@ -1235,16 +1189,26 @@ function formatStatus(record: AgentRecord): string {
 	return lines.filter(Boolean).join("\n");
 }
 
-function formatCompletion(records: AgentRecord[]): string {
-	return records.map((record) => {
-		const duration = record.startedAt && record.settledAt ? formatDuration(record.settledAt - record.startedAt) : "unknown time";
-		const completed = record.lastOutcome === "completed";
-		const preview = oneLine(completed ? (record.finalAnswer || "No final answer") : (record.error || "No final answer"), 220);
-		const next = completed
-			? `Use ${RESULT_TOOL_NAME} with id ${record.id} for the complete final answer.`
-			: `Use ${STATUS_TOOL_NAME} with id ${record.id} for details; the child session is preserved.`;
-		return `${record.id} · ${record.title}\n${record.lastOutcome} · ${record.modelRef} [${record.thinking}] · ${duration} · ${formatCost(record.usage.cost)}\nPreview: ${preview}\n${next}`;
-	}).join("\n\n");
+async function buildCompletionResult(snapshots: CompletionSnapshot[], artifactPrefix: string) {
+	const fullText = formatCompletionBatch(snapshots);
+	const truncated = truncateHead(fullText);
+	let text = truncated.content;
+	let outputFile: string | undefined;
+	if (truncated.truncated) {
+		outputFile = path.join(tmpdir(), `${artifactPrefix}-${Date.now()}-${randomUUID().slice(0, 8)}.md`);
+		try {
+			await writeFile(outputFile, fullText, "utf8");
+			text += `\n\n[Combined subagent output truncated. Full output saved to: ${outputFile}]`;
+		} catch (error) {
+			outputFile = undefined;
+			text += `\n\n[Combined subagent output truncated. Complete answers remain in child sessions. Could not write combined artifact: ${error instanceof Error ? error.message : String(error)}]`;
+		}
+	}
+	const failures = snapshots.filter((snapshot) => snapshot.outcome !== "completed").length;
+	const totalCost = snapshots.reduce((sum, snapshot) => sum + snapshot.usage.cost, 0);
+	const totalTokens = snapshots.reduce((sum, snapshot) => sum + totalUsageTokens(snapshot.usage), 0);
+	const displaySnapshots = snapshots.map((snapshot) => ({ ...snapshot, finalAnswer: undefined }));
+	return result(text, { completionSnapshots: displaySnapshots, failures, totalCost, totalTokens, outputFile, truncated: truncated.truncated });
 }
 
 function findRunResult(record: AgentRecord, requestedRunId?: string): { runId?: string; text: string } {
@@ -1299,6 +1263,8 @@ function result(text: string, details: Record<string, unknown> = {}) {
 type DisplayAgent = {
 	id: string;
 	title: string;
+	parentAgentId?: string;
+	profile?: string;
 	state: string;
 	outcome: string;
 	model: string;
@@ -1306,6 +1272,7 @@ type DisplayAgent = {
 	activity: string;
 	cost: number;
 	turns: number;
+	tokens: number;
 };
 
 function resultText(value: any): string {
@@ -1318,18 +1285,21 @@ function displayAgent(value: unknown): DisplayAgent | undefined {
 	return {
 		id: value.id,
 		title: typeof value.title === "string" ? value.title : "subagent",
-		state: typeof value.state === "string" ? value.state : "accepted",
-		outcome: typeof value.lastOutcome === "string" ? value.lastOutcome : "none",
+		parentAgentId: typeof value.parentAgentId === "string" ? value.parentAgentId : undefined,
+		profile: typeof value.profile === "string" ? value.profile : undefined,
+		state: typeof value.state === "string" ? value.state : typeof value.outcome === "string" ? "cold" : "accepted",
+		outcome: typeof value.lastOutcome === "string" ? value.lastOutcome : typeof value.outcome === "string" ? value.outcome : "none",
 		model: typeof value.model === "string" ? value.model : typeof value.modelRef === "string" ? value.modelRef : "",
 		thinking: typeof value.thinking === "string" ? value.thinking : "",
 		activity: typeof value.activity === "string" ? value.activity : "",
 		cost: typeof value.cost === "number" ? value.cost : 0,
-		turns: typeof value.turns === "number" ? value.turns : 0,
+		turns: typeof value.turns === "number" ? value.turns : isRecord(value.usage) && typeof value.usage.turns === "number" ? value.usage.turns : 0,
+		tokens: typeof value.tokens === "number" ? value.tokens : isRecord(value.usage) ? ["input", "output", "cacheRead", "cacheWrite"].reduce((sum, key) => sum + (typeof value.usage[key] === "number" ? value.usage[key] as number : 0), 0) : 0,
 	};
 }
 
 function displayAgents(details: any): DisplayAgent[] {
-	const source = Array.isArray(details?.displayAgents) ? details.displayAgents : Array.isArray(details?.agents) ? details.agents : details?.agent ? [details.agent] : [];
+	const source = Array.isArray(details?.completionSnapshots) ? details.completionSnapshots : Array.isArray(details?.displayAgents) ? details.displayAgents : Array.isArray(details?.agents) ? details.agents : details?.agent ? [details.agent] : [];
 	return source.map(displayAgent).filter((agent): agent is DisplayAgent => agent !== undefined);
 }
 
@@ -1356,6 +1326,51 @@ function styledState(state: string, theme: Theme): string {
 	return theme.fg("muted", text);
 }
 
+function isActive(record: AgentRecord): boolean {
+	return record.state !== "cold";
+}
+
+function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): string[] {
+	const active = records.filter(isActive);
+	const inactive = records.filter((record) => !isActive(record));
+	const completed = inactive.filter((record) => record.lastOutcome === "completed").length;
+	const failed = inactive.filter((record) => record.lastOutcome === "failed").length;
+	const stopped = inactive.filter((record) => record.lastOutcome === "stopped" || record.lastOutcome === "interrupted").length;
+	const turns = records.reduce((sum, record) => sum + record.usage.turns, 0);
+	const tokens = records.reduce((sum, record) => sum + totalUsageTokens(record.usage), 0);
+	const cost = records.reduce((sum, record) => sum + record.usage.cost, 0);
+	const inactiveParts = [completed ? `${completed} completed` : "", failed ? `${failed} failed` : "", stopped ? `${stopped} stopped` : ""].filter(Boolean).join(" · ");
+	const totals = `${turns ? ` · ${turns} turns` : ""}${tokens ? ` · ${formatTokens(tokens)} tokens` : ""}${cost ? ` · ${formatCost(cost)}` : ""}`;
+	if (active.length === 0) {
+		const known = records.length === 0 ? "none known" : `${records.length} total${inactiveParts ? ` · ${inactiveParts}` : ""}`;
+		return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${totals}`)];
+	}
+	const header = theme.fg("toolTitle", theme.bold("Subagents"))
+		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${totals}`);
+	const tree = buildVisibleTree(records.map((record) => ({ ...record, parentId: record.parentAgentId, active: isActive(record) })), MAX_WIDGET_NODES);
+	const rows = tree.rows.map(({ item: record, prefix, isLast }) => {
+		const state = record.state === "cold" ? record.lastOutcome : record.state;
+		const connector = `${prefix}${isLast ? "└─" : "├─"} `;
+		const elapsedFrom = record.activeTools.size > 0
+			? Math.min(...[...record.activeTools.values()].map((tool) => tool.startedAt))
+			: record.startedAt;
+		const elapsed = elapsedFrom ? ` · ${formatDuration(now - elapsedFrom)}` : "";
+		const activity = oneLine(currentActivity(record), 70);
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)} · ${theme.fg("muted", activity)}${elapsed}${record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : ""}`;
+	});
+	if (tree.omitted > 0) rows.push(theme.fg("dim", `… ${tree.omitted} more active/ancestor node${tree.omitted === 1 ? "" : "s"}`));
+	return [header, ...rows];
+}
+
+function widgetComponent(records: AgentRecord[], theme: Theme) {
+	return {
+		render(width: number): string[] {
+			return widgetLines(records, theme).map((line) => truncateToWidth(` ${line}`, width));
+		},
+		invalidate() {},
+	};
+}
+
 function agentCounts(agents: DisplayAgent[]): string {
 	const counts = new Map<string, number>();
 	for (const agent of agents) {
@@ -1372,8 +1387,9 @@ function agentRows(agents: DisplayAgent[], theme: Theme, expanded: boolean, maxC
 		const state = displayState(agent);
 		const activity = agent.activity && agent.activity !== state ? ` · ${theme.fg("dim", oneLine(agent.activity, 80))}` : "";
 		const cost = agent.cost > 0 ? ` · ${theme.fg("dim", formatCost(agent.cost))}` : "";
-		const model = expanded && agent.model ? `\n    ${theme.fg("dim", `${agent.model}${agent.thinking ? ` [${agent.thinking}]` : ""}`)}` : "";
-		return `${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${activity}${cost}${model}`;
+		const model = agent.model ? ` · ${theme.fg("dim", `${agent.model}${agent.thinking ? ` [${agent.thinking}]` : ""}`)}` : "";
+		const profile = expanded && agent.profile ? ` · ${theme.fg("dim", `profile ${agent.profile}`)}` : "";
+		return `${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${activity}${cost}`;
 	});
 	if (!expanded && agents.length > shown.length && showMoreHint) rows.push(theme.fg("dim", `… ${agents.length - shown.length} more (${keyHint("app.tools.expand", "details")})`));
 	return rows.join("\n");
@@ -1409,6 +1425,27 @@ function agentSummaryResult(resultValue: any, options: { expanded: boolean; isPa
 	return component;
 }
 
+function completionSummaryResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown) {
+	if (options.isError) return textOrMarkdownResult(resultValue, options, theme, lastComponent);
+	if (options.isPartial) return agentSummaryResult(resultValue, options, theme, lastComponent, "Waiting");
+	if (options.expanded) return new Markdown(resultText(resultValue), 0, 0, getMarkdownTheme());
+	const agents = displayAgents(resultValue?.details);
+	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
+	if (agents.length === 0) {
+		component.setText(theme.fg("muted", oneLine(resultText(resultValue), 500)));
+		return component;
+	}
+	const failures = Number(resultValue?.details?.failures ?? agents.filter((agent) => displayState(agent) !== "completed").length);
+	const totalCost = Number(resultValue?.details?.totalCost ?? agents.reduce((sum, agent) => sum + agent.cost, 0));
+	const totalTokens = Number(resultValue?.details?.totalTokens ?? agents.reduce((sum, agent) => sum + agent.tokens, 0));
+	const headline = failures > 0
+		? theme.fg("warning", `◆ Batch complete · ${agents.length} agent${agents.length === 1 ? "" : "s"} · ${failures} exceptional`)
+		: theme.fg("success", `✓ Batch complete · ${agents.length} agent${agents.length === 1 ? "" : "s"}`);
+	const metrics = `${totalTokens > 0 ? ` · ${totalTokens.toLocaleString("en-US")} tokens` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
+	component.setText(`${headline}${metrics}\n${agentRows(agents, theme, false, 12, false)}${agents.length > 12 ? `\n${theme.fg("dim", `… ${agents.length - 12} more`)}` : ""}\n${theme.fg("dim", keyHint("app.tools.expand", "full batch results"))}`);
+	return component;
+}
+
 function textOrMarkdownResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown, preview = 260) {
 	const text = resultText(resultValue);
 	if (options.isError) {
@@ -1440,30 +1477,31 @@ async function resolveIds(params: { ids?: string[]; input_file?: string }, cwd: 
 	return [...new Set(params.ids.map((id) => cleanText(id)).filter(Boolean))];
 }
 
-function buildMainInstructions(): string {
+function buildMainInstructions(profiles: Map<string, SubagentProfile>): string {
+	const profileText = [...profiles.values()].map((profile) => [
+		`- ${profile.name}: ${profile.description}`,
+		...profile.coordinatorGuidelines.map((guideline) => `  - ${guideline}`),
+	].join("\n")).join("\n");
 	return `Managed subagents:
 - Do not launch subagents unless the user explicitly asks for delegated/subagent work or has already established that subagents should be used for the current task.
 - Use ${START_TOOL_NAME} for ordinary delegated work. ${START_TOOL_NAME} returns immediately; continue useful work instead of polling.
 - Every new subagent requires an exact provider/model-id and an explicit thinking level. Never inherit or guess either value from the main session.
-- Before launching, the user must have established a clear contract for which exact model and thinking level to use for that task or class of tasks. If no such contract exists, ask the user before launching.
+- Before launching, the user must have established a clear contract for which exact model and thinking level to use for that task or class of tasks. If no such contract exists, ask the user before launching. Use \`pi --list-models <query>\` to search exact IDs as needed.
 - A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
 - Reuse an existing subagent with ${SEND_TOOL_NAME} only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
 - Use ${STATUS_TOOL_NAME} only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
-- Use ${WAIT_TOOL_NAME} only when further work truly depends on completion. Cancelling a wait leaves unfinished subagents running.
-- Use ${RESULT_TOOL_NAME} only for completed runs whose final answer is needed.
+- Launch every member of a logical batch before waiting. Then call ${WAIT_TOOL_NAME} once with the complete ID set. It waits for all selected agents and returns their combined final answers and execution summary.
+- Cancelling or timing out ${WAIT_TOOL_NAME} leaves unfinished subagents running.
+- Use ${RESULT_TOOL_NAME} for unattended, historical, or specific completed runs when their answer is needed outside the original batch wait.
 - ${STOP_TOOL_NAME} stops current work but preserves the child Pi session for later continuation.
 - Multiple ${START_TOOL_NAME} calls in one assistant turn may run in parallel. For large programmatic launches, ${START_TOOL_NAME} accepts input_file by itself containing a JSON array of complete normal start requests.
 
-Code review subagents:
-- Use ${REVIEW_TOOL_NAME} for code reviews. It is intentionally blocking and injects the standard review rubric, which lets them know to not edit anything, among other things.
-- Only launch review subagents when the user explicitly asks for them.
-- If user specifies "non-blocking review subagents", then you must use the more generic subagents.
-- Every reviewer entry requires an exact provider/model-id and explicit thinking level covered by the user's established model contract.
-- Supply only a neutral review target and optional neutral focus. Do not bias reviewers with suspected findings unless the user explicitly asks to verify one.
-- Synthesize reviewer answers, deduplicate findings, and call out disagreement or uncertainty.`;
+Available profiles${profileText ? ":" : ": none"}
+${profileText}`;
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
+export default async function subagentsExtension(pi: ExtensionAPI) {
+	const profiles = await loadSubagentProfiles(path.join(path.dirname(fileURLToPath(import.meta.url)), "profiles"));
 	pi.on("before_provider_request", (event) => {
 		const promptCacheKey = process.env[PROMPT_CACHE_ENV];
 		if (!promptCacheKey || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
@@ -1472,27 +1510,60 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (Object.hasOwn(payload, "promptCacheKey")) return { ...payload, promptCacheKey };
 	});
 
-	// Managed children are workers, not orchestrators. Their prompts are supplied by the parent.
-	if (process.env[MANAGED_CHILD_ENV] === "1") return;
+	// Temporary gate: the data model and UI support parentAgentId, but managed children remain workers only.
+	if (process.env[MANAGED_CHILD_ENV] === "1" && !NESTED_SUBAGENTS_ENABLED) return;
 
 	let manager: SubagentManager | undefined;
 	let latestCtx: ExtensionContext | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let completionFlushScheduled = false;
+	let completionFlushRunning = false;
+	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 	let shuttingDown = false;
 
-	const flushCompletions = () => {
-		if (shuttingDown || !latestCtx?.isIdle() || !manager) return;
+	const refreshWidget = () => {
+		if (!latestCtx || latestCtx.mode !== "tui" || shuttingDown) return;
+		const records = manager?.list() ?? [];
+		if (records.length === 0) {
+			latestCtx.ui.setWidget(WIDGET_ID, undefined);
+			if (widgetTimer) {
+				clearInterval(widgetTimer);
+				widgetTimer = undefined;
+			}
+			return;
+		}
+		latestCtx.ui.setWidget(WIDGET_ID, (_tui, theme) => widgetComponent(records, theme));
+		const hasActive = records.some(isActive);
+		if (hasActive && !widgetTimer) widgetTimer = setInterval(refreshWidget, 1_000);
+		else if (!hasActive && widgetTimer) {
+			clearInterval(widgetTimer);
+			widgetTimer = undefined;
+		}
+	};
+
+	const flushCompletions = async () => {
+		if (completionFlushRunning || shuttingDown || !latestCtx?.isIdle() || !manager) return;
 		const deliverable = manager.getDeliverable();
 		if (deliverable.length === 0) return;
+		completionFlushRunning = true;
 		const ids = deliverable.map((record) => record.id);
-		pi.sendMessage({
-			customType: "subagent-completions",
-			content: `Background subagent completion${deliverable.length === 1 ? "" : "s"}:\n\n${formatCompletion(deliverable)}`,
-			display: true,
-			details: { agents: deliverable.map(compactRecord) },
-		}, { deliverAs: "followUp", triggerTurn: true });
-		manager.markDelivered(ids);
+		let flushed = false;
+		try {
+			const completion = await buildCompletionResult(deliverable.map((record) => record.latestCompletion ?? completionSnapshot(record)), "pi-subagent-completions");
+			pi.sendMessage({
+				customType: "subagent-completions",
+				content: resultText(completion),
+				display: true,
+				details: completion.details,
+			}, { deliverAs: "followUp", triggerTurn: true });
+			manager.markDelivered(ids);
+			flushed = true;
+		} catch (error) {
+			if (latestCtx?.hasUI) latestCtx.ui.notify(`Could not deliver subagent completion: ${error instanceof Error ? error.message : String(error)}`, "error");
+		} finally {
+			completionFlushRunning = false;
+			if (flushed && manager?.getDeliverable().length) scheduleCompletionFlush();
+		}
 	};
 
 	const scheduleCompletionFlush = () => {
@@ -1500,7 +1571,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		completionFlushScheduled = true;
 		queueMicrotask(() => {
 			completionFlushScheduled = false;
-			flushCompletions();
+			void flushCompletions();
 		});
 	};
 
@@ -1511,23 +1582,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		manager = new SubagentManager(ctx.cwd);
 		manager.restore(scanSerializedAgents(ctx));
 		unsubscribe = manager.subscribe((event) => {
+			refreshWidget();
 			if (event.kind === "settled") scheduleCompletionFlush();
 		});
+		refreshWidget();
 		return manager;
 	};
 
-	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions()}` }));
+	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions(profiles)}` }));
 
 	pi.registerTool({
 		name: START_TOOL_NAME,
 		label: "Start Subagent",
-		description: "Start one managed same-cwd Pi subagent and return immediately. Exact provider/model-id and thinking are required. Alternatively supply input_file by itself containing a non-empty JSON array of complete normal start requests. Small launches return normal per-agent output; large handle lists spill to a file.",
+		description: `Start one managed same-cwd Pi subagent and return immediately. Exact provider/model-id and thinking are required. Optional profile loads external instructions (${[...profiles.keys()].join(", ") || "none available"}). Alternatively supply input_file by itself containing a non-empty JSON array of complete normal start requests.`,
 		parameters: Type.Object({
 			input_file: Type.Optional(Type.String({ description: "Alternative to inline fields. JSON file containing an array of complete subagent_start requests. Must be supplied by itself." })),
 			title: Type.Optional(Type.String({ description: "Short human-readable subagent title. Required inline." })),
 			task: Type.Optional(Type.String({ description: "Complete task for this subagent. Required inline." })),
 			model: Type.Optional(Type.String({ description: "Required exact provider/model-id. Never inherited or loosely matched." })),
 			thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Required explicit Pi thinking level." })),
+			profile: Type.Optional(Type.String({ description: `Optional instruction profile loaded from Markdown. Available: ${[...profiles.keys()].join(", ") || "none"}.` })),
 			context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 			system_prompt: Type.Optional(Type.String({ description: "Optional additional system prompt; fresh context only." })),
 			system_prompt_file: Type.Optional(Type.String({ description: "Optional UTF-8 additional system prompt file; fresh context only." })),
@@ -1542,11 +1616,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				for (const spec of resolved.specs) {
 					const model = exactModel(ctx, spec.model);
 					validateThinking(model, spec.thinking);
+					exactProfile(profiles, spec.profile);
 					await readSystemPrompt(spec, ctx.cwd);
 				}
 				for (const spec of resolved.specs) {
 					if (signal?.aborted) throw new Error("Subagent start aborted during preparation");
-					prepared.push(await prepareAgent(spec, ctx, genericPrompt));
+					const profile = exactProfile(profiles, spec.profile);
+					if (profile) spec.profile = profile.name;
+					prepared.push(await prepareAgent(spec, ctx, (task, sandbox, transcript) => genericPrompt(task, sandbox, transcript, profile), profile?.idPrefix ?? "sa"));
 				}
 				if (signal?.aborted) throw new Error("Subagent start aborted during preparation");
 				const activeManager = ensureManager(ctx);
@@ -1559,7 +1636,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				let text: string;
 				let handlesFile: string | undefined;
 				if (records.length <= NORMAL_LAUNCH_DETAIL_LIMIT) {
-					text = `Started ${records.length} subagent${records.length === 1 ? "" : "s"}:\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
+					text = `Started ${records.length} subagent${records.length === 1 ? "" : "s"}:\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.profile ? ` · profile ${record.profile}` : ""}\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
 				} else {
 					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
 					const running = Math.min(records.length, MAX_CONCURRENT_SUBAGENTS);
@@ -1582,7 +1659,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const input = args as any;
 			const detail = typeof input?.input_file === "string"
 				? `manifest ${path.basename(input.input_file)}`
-				: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}`;
+				: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}${input?.profile ? ` · ${input.profile}` : ""}`;
 			return toolHeader("Start subagent", detail, theme, context.lastComponent);
 		},
 		renderResult(resultValue, options, theme, context) {
@@ -1616,7 +1693,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({ ids: Type.Array(Type.String(), { minItems: 1, maxItems: 32 }) }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
-				const records = [...new Set(params.ids)].map((id) => ensureManager(ctx).get(id));
+				const records = [...new Set<string>(params.ids)].map((id) => ensureManager(ctx).get(id));
 				return result(records.map(formatStatus).join("\n\n---\n\n"), { agents: records.map(compactRecord) });
 			} catch (error) {
 				throw error instanceof Error ? error : new Error(String(error));
@@ -1676,7 +1753,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: WAIT_TOOL_NAME,
 		label: "Wait for Subagents",
-		description: "Wait for selected subagents to become cold. Cancellation leaves unfinished subagents running. Returns compact outcomes, not final answers.",
+		description: "Wait for the complete selected subagent batch to become cold, then return one integrated execution summary and all final answers. Cancellation or timeout leaves unfinished subagents running.",
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
 			input_file: Type.Optional(Type.String()),
@@ -1700,7 +1777,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				}, 1_000);
 				try {
 					const records = await activeManager.wait(ids, waitController.signal, true);
-					return result(`Selected subagents settled:\n${formatList(records)}\n\nUse ${RESULT_TOOL_NAME} only for answers you need.`, { agents: records.map(compactRecord) });
+					const snapshots = records.map((record) => record.latestCompletion ?? completionSnapshot(record));
+					return await buildCompletionResult(snapshots, "pi-subagent-batch");
 				} catch (error) {
 					if (!timedOut) throw error;
 					const records = ids.map((id) => activeManager.get(id));
@@ -1715,21 +1793,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				throw new Error(message);
 			}
 		},
-		renderCall(args, theme, context) {
+			renderCall(args, theme, context) {
 			const input = args as any;
 			const count = Array.isArray(input?.ids) ? input.ids.length : undefined;
-			const selected = count !== undefined ? `${count} agent${count === 1 ? "" : "s"}` : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "agents";
-			const timeout = input?.timeout_seconds ? ` · timeout ${formatDuration(input.timeout_seconds * 1_000)}` : "";
-			return toolHeader("Wait for subagents", `${selected}${timeout}`, theme, context.lastComponent);
+			const selected = count !== undefined ? "" : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "";
+			const timeout = input?.timeout_seconds ? `· timeout ${formatDuration(input.timeout_seconds * 1_000)}` : "";
+			return toolHeader("Wait for subagents", [selected, timeout].filter(Boolean).join(" "), theme, context.lastComponent);
 		},
 		renderResult(resultValue, options, theme, context) {
-			const verb = resultValue?.details?.timedOut ? "Wait timed out" : options.isPartial ? "Waiting" : "Settled";
-			const rendered = agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, verb);
 			if (resultValue?.details?.timedOut) {
 				const agents = displayAgents(resultValue?.details);
+				const rendered = agentSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent, "Wait timed out");
 				rendered.setText(`${theme.fg("warning", `◷ Wait timed out · ${agentCounts(agents)}`)}\n${agentRows(agents, theme, options.expanded)}`);
+				return rendered;
 			}
-			return rendered;
+			return completionSummaryResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent);
 		},
 	});
 
@@ -1796,147 +1874,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: REVIEW_TOOL_NAME,
-		label: "Launch Code Review Subagents",
-		description: "Launch independent code review subagents through the shared manager, wait for all reviewers, and return their structured answers. This operation is intentionally blocking. Every reviewer requires an exact provider/model-id and explicit thinking level.",
-		parameters: Type.Object({
-			input_file: Type.Optional(Type.String({ description: "Alternative to inline fields. Existing review manifest object. Must be supplied by itself." })),
-			what_to_review: Type.Optional(Type.String({ description: "Neutral code review target. Required inline." })),
-			context: Type.Optional(StringEnum(CONTEXT_MODES)),
-			system_prompt: Type.Optional(Type.String()),
-			system_prompt_file: Type.Optional(Type.String()),
-			reviewers: Type.Optional(Type.Array(Type.Object({
-				description: Type.String({ minLength: 1 }),
-				focus: Type.Optional(Type.String()),
-				model: Type.String({ minLength: 1, description: "Required exact provider/model-id." }),
-				thinking: StringEnum(THINKING_LEVELS, { description: "Required explicit thinking level." }),
-			}, { additionalProperties: false }), { minItems: 1 })),
-		}, { additionalProperties: false }),
-		async execute(_id, rawParams: ReviewToolParams, signal, onUpdate, ctx) {
-			const prepared: PreparedAgent[] = [];
-			let addedCount = 0;
-			try {
-				let params: ReviewParams;
-				let manifest: LaunchManifestMetadata | undefined;
-				if (rawParams.input_file !== undefined) {
-					if (Object.keys(rawParams).some((key) => key !== "input_file")) throw new Error("input_file must be supplied by itself");
-					const loaded = await readJsonFile(rawParams.input_file, ctx.cwd);
-					if (!isRecord(loaded.value)) throw new Error("Review manifest must be an object");
-					params = loaded.value as unknown as ReviewParams;
-					manifest = { ...loaded.metadata, entries: Array.isArray((loaded.value as any).reviewers) ? (loaded.value as any).reviewers.length : 0 };
-				} else params = rawParams as ReviewParams;
-				if (typeof params.what_to_review !== "string" || !cleanText(params.what_to_review)) throw new Error("what_to_review is required");
-				if (!Array.isArray(params.reviewers) || params.reviewers.length === 0) throw new Error("reviewers is required and must not be empty");
-				if (params.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(params.context)) throw new Error(`Invalid context: ${String(params.context)}`);
-				if (params.system_prompt !== undefined && params.system_prompt_file !== undefined) throw new Error("system_prompt and system_prompt_file are mutually exclusive");
-				if ((params.system_prompt !== undefined || params.system_prompt_file !== undefined) && params.context !== undefined && params.context !== "fresh") throw new Error("custom system prompts require fresh context");
-				const target = cleanText(params.what_to_review);
-				// Validate every reviewer before creating any child session files.
-				for (const [index, reviewer] of params.reviewers.entries()) {
-					if (signal?.aborted) throw new Error("Code review launch aborted during preparation");
-					if (!isRecord(reviewer) || typeof reviewer.description !== "string" || !cleanText(reviewer.description)) throw new Error(`reviewers[${index}].description is required`);
-					if (typeof reviewer.model !== "string" || !cleanText(reviewer.model)) throw new Error(`reviewers[${index}].model is required and must be exact provider/model-id`);
-					if (!(THINKING_LEVELS as readonly unknown[]).includes(reviewer.thinking)) throw new Error(`reviewers[${index}].thinking is required`);
-					const model = exactModel(ctx, reviewer.model);
-					validateThinking(model, reviewer.thinking);
-				}
-				await readSystemPrompt({ system_prompt: params.system_prompt, system_prompt_file: params.system_prompt_file }, ctx.cwd);
-				for (const [index, reviewer] of params.reviewers.entries()) {
-					if (signal?.aborted) throw new Error("Code review launch aborted during preparation");
-					if (!isRecord(reviewer) || typeof reviewer.description !== "string" || !cleanText(reviewer.description)) throw new Error(`reviewers[${index}].description is required`);
-					if (typeof reviewer.model !== "string" || !cleanText(reviewer.model)) throw new Error(`reviewers[${index}].model is required and must be exact provider/model-id`);
-					if (!(THINKING_LEVELS as readonly unknown[]).includes(reviewer.thinking)) throw new Error(`reviewers[${index}].thinking is required`);
-					const spec: StartSpec = {
-						title: `[Review] ${reviewer.description}`,
-						task: target,
-						model: reviewer.model,
-						thinking: reviewer.thinking,
-						context: params.context,
-						system_prompt: params.system_prompt,
-						system_prompt_file: params.system_prompt_file,
-					};
-					prepared.push(await prepareAgent(spec, ctx, (_task, sandbox, transcript) => reviewPrompt(target, cleanText(reviewer.focus || "") || undefined, sandbox, transcript), "review"));
-				}
-				if (signal?.aborted) throw new Error("Code review launch aborted during preparation");
-				const activeManager = ensureManager(ctx);
-				const records: AgentRecord[] = [];
-				for (const item of prepared) {
-					records.push(activeManager.add(item));
-					addedCount++;
-				}
-				const heartbeat = setInterval(() => onUpdate?.(result(formatList(records), { agents: records.map(compactRecord) })), 500);
-				try {
-					await activeManager.wait(records.map((record) => record.id), signal, true);
-				} catch (error) {
-					if (signal?.aborted) await activeManager.stop(records.map((record) => record.id));
-					throw error;
-				} finally { clearInterval(heartbeat); }
-				const answers = records.map((record, index) => {
-					let answer = record.finalAnswer || record.error || "(No final answer.)";
-					try { answer = findRunResult(record).text || answer; } catch {}
-					const duration = record.startedAt && record.settledAt ? formatDuration(record.settledAt - record.startedAt) : "unknown";
-					return `---\n\n## Reviewer ${index + 1} — ${record.title}\n\n> ${record.id} · ${record.modelRef} [${record.thinking}] · ${record.lastOutcome}\n\n- **Attempts / model turns / duration:** ${record.attempt} · ${record.usage.turns} · ${duration}\n- **Tokens:** ${totalUsageTokens(record.usage).toLocaleString("en-US")} total (input ${record.usage.input.toLocaleString("en-US")} · output ${record.usage.output.toLocaleString("en-US")} · cache read ${record.usage.cacheRead.toLocaleString("en-US")} · cache write ${record.usage.cacheWrite.toLocaleString("en-US")})\n- **Exact cost:** ${formatCost(record.usage.cost)}\n- **Session:** ${record.sessionFile}\n\n${answer}`;
-				});
-				const failures = records.filter((record) => record.lastOutcome !== "completed").length;
-				const totalCost = records.reduce((sum, record) => sum + record.usage.cost, 0);
-				const totalTokens = records.reduce((sum, record) => sum + totalUsageTokens(record.usage), 0);
-				const header = `# Review Subagent Results\n\nReviewers: ${records.length} · failures: ${failures}\nTokens: ${totalTokens.toLocaleString("en-US")} · total cost: ${formatCost(totalCost)}${manifest ? `\nManifest: ${manifest.path}` : ""}`;
-				const fullReview = [header, ...answers, "---", FINAL_RESULT_DISCLAIMER].join("\n\n");
-				const truncated = truncateHead(fullReview);
-				let reviewFile: string | undefined;
-				let reviewText = truncated.content;
-				if (truncated.truncated) {
-					reviewFile = path.join(tmpdir(), `pi-review-subagents-${Date.now()}-${randomUUID().slice(0, 8)}.md`);
-					try {
-						await writeFile(reviewFile, fullReview, "utf8");
-						reviewText += `\n\n[Combined review output truncated. Full output saved to: ${reviewFile}]`;
-					} catch (error) {
-						reviewFile = undefined;
-						reviewText += `\n\n[Combined review output truncated. The complete reviewer answers remain in their child sessions. Could not write a combined artifact: ${error instanceof Error ? error.message : String(error)}]`;
-					}
-				}
-				return result(reviewText, { agents: records.map(serializeAgent), displayAgents: records.map(compactRecord), failures, totalCost, totalTokens, manifest, reviewFile, truncated: truncated.truncated });
-			} catch (error) {
-				await cleanupPreparedAgents(prepared.slice(addedCount));
-				throw new Error(`Code review subagents failed: ${error instanceof Error ? error.message : String(error)}`);
-			}
-		},
-		renderCall(args, theme, context) {
-			const input = args as any;
-			const count = Array.isArray(input?.reviewers) ? input.reviewers.length : 0;
-			const detail = input?.input_file ? `manifest ${path.basename(input.input_file)}` : `${count} reviewer${count === 1 ? "" : "s"} · ${oneLine(input?.what_to_review ?? "code review", 80)}`;
-			return toolHeader("Code review", detail, theme, context.lastComponent);
-		},
-		renderResult(resultValue, options, theme, context) {
-			if (context.isError) return textOrMarkdownResult(resultValue, { ...options, isError: true }, theme, context.lastComponent);
-			if (options.expanded && !options.isPartial) return new Markdown(resultText(resultValue), 0, 0, getMarkdownTheme());
-			const agents = displayAgents(resultValue?.details);
-			const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
-			const failures = Number(resultValue?.details?.failures ?? agents.filter((agent) => displayState(agent) === "failed").length);
-			const totalCost = Number(resultValue?.details?.totalCost ?? agents.reduce((sum, agent) => sum + agent.cost, 0));
-			const totalTokens = Number(resultValue?.details?.totalTokens ?? 0);
-			const headline = options.isPartial
-				? theme.fg("accent", `◐ Reviewing · ${agentCounts(agents)}`)
-				: failures > 0
-					? theme.fg("warning", `◆ Review complete · ${failures} failed`)
-					: theme.fg("success", `✓ Review complete · ${agents.length} reviewer${agents.length === 1 ? "" : "s"}`);
-			const metrics = `${totalTokens > 0 ? ` · ${totalTokens.toLocaleString("en-US")} tokens` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
-			component.setText(`${headline}${metrics}${agents.length ? `\n${agentRows(agents, theme, false, 5, false)}` : ""}${agents.length > 5 ? `\n${theme.fg("dim", `… ${agents.length - 5} more`)}` : ""}${!options.isPartial ? `\n${theme.fg("dim", keyHint("app.tools.expand", "full review"))}` : ""}`);
-			return component;
-		},
-	});
-
 	pi.registerMessageRenderer("subagent-completions", (message, options, theme) => {
-		const agents = displayAgents(message.details);
-		if (options.expanded || agents.length === 0) return new Text(theme.fg("accent", theme.bold(agents.length === 1 ? "Subagent completion" : "Subagent completions")) + `\n${String(message.content)}`, 0, 0);
-		const completed = agents.filter((agent) => displayState(agent) === "completed").length;
-		const exceptional = agents.length - completed;
-		const totalCost = agents.reduce((sum, agent) => sum + agent.cost, 0);
-		const title = completed === agents.length
-			? theme.fg("success", `✓ ${agents.length} subagent${agents.length === 1 ? "" : "s"} completed`)
-			: theme.fg("warning", `◆ ${agents.length} subagent update${agents.length === 1 ? "" : "s"} · ${exceptional} exceptional`);
-		return new Text(`${title}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}\n${agentRows(agents, theme, false, 4)}`, 0, 0);
+		return completionSummaryResult({ content: [{ type: "text", text: String(message.content) }], details: message.details }, { expanded: options.expanded, isPartial: false }, theme);
 	});
 
 	pi.registerCommand("subagents", {
@@ -1982,11 +1921,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		latestCtx = ctx;
-		flushCompletions();
+		await flushCompletions();
 	});
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		if (widgetTimer) clearInterval(widgetTimer);
+		widgetTimer = undefined;
+		if (latestCtx?.mode === "tui") latestCtx.ui.setWidget(WIDGET_ID, undefined);
 		unsubscribe?.();
 		unsubscribe = undefined;
 		const active = manager;
