@@ -21,6 +21,7 @@ import { buildConversationTranscript } from "../_shared/conversation-transcript.
 import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
 import { loadSubagentProfiles, type SubagentProfile } from "./profiles.ts";
 import { applyRuntimeStatusEvent } from "./runtime-events.ts";
+import { materializeSessionFile } from "./session-file.ts";
 import { buildVisibleTree } from "./tree.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
@@ -1053,7 +1054,7 @@ function exactProfile(profiles: Map<string, SubagentProfile>, raw: string | unde
 	return profile;
 }
 
-function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): string {
+function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): SessionManager {
 	const sourceSessionFile = ctx.sessionManager.getSessionFile();
 	if (!ctx.sessionManager.isPersisted() || !sourceSessionFile) throw new Error("clone context requires a persisted parent session");
 	const branch = ctx.sessionManager.getBranch();
@@ -1066,12 +1067,14 @@ function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): string {
 	const cloneLeafId = (branch[latestUserIndex - 1] as any)?.id;
 	const source = SessionManager.open(sourceSessionFile, ctx.sessionManager.getSessionDir());
 	if (!cloneLeafId) {
-		const manager = (SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession: sourceSessionFile }) as SessionManager;
-		return manager.getSessionFile()!;
+		return (SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession: sourceSessionFile }) as SessionManager;
 	}
 	const cloned = source.createBranchedSession(cloneLeafId);
 	if (!cloned) throw new Error("failed to create cloned subagent session");
-	return cloned;
+	// createBranchedSession rebinds the source manager to the extracted session.
+	// Keep that manager so a branch without an assistant message can still be
+	// materialized with its parentSession header below.
+	return source;
 }
 
 async function prepareAgent(
@@ -1092,11 +1095,13 @@ async function prepareAgent(
 		const systemPromptPath = systemPromptBytes ? path.join(sandboxDir, "SUBAGENT_SYSTEM_PROMPT.md") : undefined;
 		if (systemPromptPath) await writeFile(systemPromptPath, systemPromptBytes!);
 		const parentSession = ctx.sessionManager.isPersisted() ? ctx.sessionManager.getSessionFile() : undefined;
-		sessionFile = contextMode === "clone"
+		const childSession = contextMode === "clone"
 			? createClonedSessionBeforeLatestUser(ctx)
-			: ((SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession }) as SessionManager).getSessionFile()!;
-		const childSession = SessionManager.open(sessionFile, ctx.sessionManager.getSessionDir());
+			: ((SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession }) as SessionManager);
+		sessionFile = childSession.getSessionFile();
+		if (!sessionFile) throw new Error("failed to create a persisted subagent session");
 		childSession.appendSessionInfo(`[Subagent ${id}] ${sanitizeTitle(spec.title)}`);
+		await materializeSessionFile(childSession);
 		const transcript = contextMode === "transcript" ? buildConversationTranscript(ctx.sessionManager.getBranch(), true).text : undefined;
 		if (contextMode === "transcript" && !transcript) throw new Error("transcript context was requested, but there is no completed parent conversation before the current turn");
 		const serialized: SerializedAgent = {
