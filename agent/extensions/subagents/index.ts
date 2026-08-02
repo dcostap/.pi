@@ -45,6 +45,7 @@ const MAX_RETRIES = 4;
 const RETRY_DELAY_MS = 1_000;
 const MAX_RPC_STDERR_CHARS = 128 * 1024;
 const NESTED_SUBAGENTS_ENABLED = false;
+const RECENT_FINISHED_WIDGET_MS = 60_000;
 
 const WIDGET_ID = "subagents-tree";
 const MAX_WIDGET_NODES = 12;
@@ -1360,6 +1361,19 @@ function isActive(record: AgentRecord): boolean {
 	return record.state !== "cold";
 }
 
+function isRecentlyFinished(record: AgentRecord, now: number): boolean {
+	if (isActive(record) || record.lastOutcome === "none" || record.settledAt === undefined) return false;
+	return Math.max(0, now - record.settledAt) < RECENT_FINISHED_WIDGET_MS;
+}
+
+function finishedActivity(record: AgentRecord, now: number): string | undefined {
+	if (!isRecentlyFinished(record, now)) return undefined;
+	const label = record.lastOutcome === "completed"
+		? "Finished"
+		: record.lastOutcome[0]!.toUpperCase() + record.lastOutcome.slice(1);
+	return `${label} <1 min ago`;
+}
+
 function contextMeter(record: AgentRecord, theme: Theme): string {
 	return contextMeterValues(record.contextWindow, record.contextTokens, theme);
 }
@@ -1377,6 +1391,7 @@ function contextMeterValues(contextWindow: number | undefined, contextTokens: nu
 function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): string[] {
 	const active = records.filter(isActive);
 	const inactive = records.filter((record) => !isActive(record));
+	const recentFinished = records.filter((record) => isRecentlyFinished(record, now));
 	const completed = inactive.filter((record) => record.lastOutcome === "completed").length;
 	const failed = inactive.filter((record) => record.lastOutcome === "failed").length;
 	const stopped = inactive.filter((record) => record.lastOutcome === "stopped" || record.lastOutcome === "interrupted").length;
@@ -1386,22 +1401,29 @@ function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now()): st
 	const inactiveParts = [completed ? `${completed} completed` : "", failed ? `${failed} failed` : "", stopped ? `${stopped} stopped` : ""].filter(Boolean).join(" · ");
 	if (active.length === 0) {
 		const known = records.length === 0 ? "none known" : `${records.length} total${inactiveParts ? ` · ${inactiveParts}` : ""}`;
-		return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
+		if (recentFinished.length === 0) return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
 		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${costSummary}`);
-	const tree = buildVisibleTree(records.map((record) => ({ ...record, parentId: record.parentAgentId, active: isActive(record) })), MAX_WIDGET_NODES);
+	const tree = buildVisibleTree(records.map((record) => ({
+		...record,
+		parentId: record.parentAgentId,
+		active: isActive(record) || isRecentlyFinished(record, now),
+	})), MAX_WIDGET_NODES);
 	const rows = tree.rows.map(({ item: record, prefix, isLast }) => {
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
 		const connector = `${prefix}${isLast ? "└─" : "├─"} `;
 		const elapsedFrom = record.activeTools.size > 0
 			? Math.min(...[...record.activeTools.values()].map((tool) => tool.startedAt))
 			: record.startedAt;
-		const elapsed = elapsedFrom ? ` · ${formatDuration(now - elapsedFrom)}` : "";
-		const activity = oneLine(currentActivity(record), 70);
+		const elapsedUntil = isActive(record) ? now : (record.settledAt ?? now);
+		const elapsed = elapsedFrom ? ` · ${formatDuration(Math.max(0, elapsedUntil - elapsedFrom))}` : "";
+		const activity = oneLine(finishedActivity(record, now) ?? currentActivity(record), 70);
 		const context = contextMeter(record, theme);
 		const contextText = context ? ` · ${context}` : "";
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}${contextText} · ${theme.fg("muted", activity)}${elapsed}${record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : ""}`;
+		const cost = record.usage.cost ? ` · ${formatCost(record.usage.cost)}` : "";
+		// Activity changes frequently; keep it last so duration and cost do not jump.
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", record.id)}  ${theme.fg("muted", record.title)} · ${theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}${contextText}${elapsed}${cost} · ${theme.fg("muted", activity)}`;
 	});
 	if (tree.omitted > 0) rows.push(theme.fg("dim", `… ${tree.omitted} more active/ancestor node${tree.omitted === 1 ? "" : "s"}`));
 	return [header, ...rows];
@@ -1439,7 +1461,7 @@ function agentRows(agents: DisplayAgent[], theme: Theme, expanded: boolean, maxC
 		const profile = expanded && agent.profile ? ` · ${theme.fg("dim", `profile ${agent.profile}`)}` : "";
 		const context = contextMeterValues(agent.contextWindow, agent.contextTokens, theme);
 		const contextText = context ? ` · ${context}` : "";
-		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${contextText}${activity}${cost}`;
+		return `${theme.fg("dim", connector)}${styledState(state, theme)}  ${theme.fg("accent", agent.id)}  ${theme.fg("muted", oneLine(agent.title, 70))}${model}${profile}${contextText}${cost}${activity}`;
 	});
 	if (tree.omitted > 0 && showMoreHint) rows.push(theme.fg("dim", `… ${tree.omitted} more (${keyHint("app.tools.expand", "details")})`));
 	return rows.join("\n");
@@ -1600,8 +1622,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		}
 		latestCtx.ui.setWidget(WIDGET_ID, (_tui, theme) => widgetComponent(records, theme));
 		const hasActive = records.some(isActive);
-		if (hasActive && !widgetTimer) widgetTimer = setInterval(refreshWidget, 1_000);
-		else if (!hasActive && widgetTimer) {
+		const hasRecentFinished = records.some((record) => isRecentlyFinished(record, Date.now()));
+		if ((hasActive || hasRecentFinished) && !widgetTimer) widgetTimer = setInterval(refreshWidget, 1_000);
+		else if (!hasActive && !hasRecentFinished && widgetTimer) {
 			clearInterval(widgetTimer);
 			widgetTimer = undefined;
 		}
