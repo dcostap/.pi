@@ -1,8 +1,6 @@
 ---
 name: review
 description: Independent read-only code review using the standard review rubric.
-id-prefix: review
-coordinator-guidelines: ["Use the review profile only when the user explicitly asks for review subagents.", "Launch all reviewers first, then call subagent_wait once with the complete reviewer ID set.", "Give each reviewer a neutral review target and optional neutral focus; do not bias reviewers with suspected findings unless the user explicitly asks to verify one.", "After the batch wait returns, synthesize the reviewer answers, deduplicate findings, and call out disagreement or uncertainty."]
 ---
 # Review Guidelines
 

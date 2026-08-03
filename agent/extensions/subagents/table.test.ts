@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { renderAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
+import { renderAlignedTable, renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 
 const visibleWidth = (value: string): number => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").length;
 const truncate = (value: string, width: number): string => {
@@ -42,5 +42,24 @@ describe("aligned subagent tables", () => {
 
 		expect(rows.every((row) => visibleWidth(row) <= 28)).toBe(true);
 		expect(rows[0]!.includes("$0.031")).toBe(false);
+	});
+
+	test("indents an entire child row instead of only its connector cell", () => {
+		type Key = "indent" | "connector" | "state" | "id";
+		const treeColumns: readonly AlignedColumn<Key>[] = [
+			{ key: "connector", minWidth: 3 },
+			{ key: "state" },
+			{ key: "id" },
+		];
+		const rows = renderIndentedAlignedTable<Key>([
+			{ indent: "", connector: "└─ ", state: "running", id: "batch-1" },
+			{ indent: "   ", connector: "├─ ", state: "running", id: "sa-1" },
+			{ indent: "   ", connector: "└─ ", state: "running", id: "sa-2" },
+		], 80, treeColumns, { visibleWidth, truncate }, (row) => row.indent);
+
+		expect(rows[0]!.startsWith("└─ ")).toBe(true);
+		expect(rows[1]!.startsWith("   ├─ ")).toBe(true);
+		expect(rows[2]!.startsWith("   └─ ")).toBe(true);
+		expect(rows[1]!.indexOf("sa-1")).toBe(rows[0]!.indexOf("batch-1") + 3);
 	});
 });

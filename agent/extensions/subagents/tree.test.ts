@@ -16,6 +16,16 @@ describe("subagent hierarchy", () => {
 		expect(tree.rows[1]?.prefix).toBe("   ");
 	});
 
+	test("renders agents beneath a synthetic batch node", () => {
+		const tree = buildVisibleTree([
+			item("batch-1", undefined, false, 1),
+			item("sa-1", "batch-1", true, 2),
+			item("standalone", undefined, true, 3),
+		], 12);
+		expect(tree.rows.map((row) => row.item.id)).toEqual(["batch-1", "sa-1", "standalone"]);
+		expect(tree.rows[1]?.prefix).toBe("│  ");
+	});
+
 	test("bounds visible nodes and reports overflow", () => {
 		const tree = buildVisibleTree(Array.from({ length: 15 }, (_, index) => item(`node-${index}`, undefined, true, index)), 12);
 		expect(tree.rows).toHaveLength(12);

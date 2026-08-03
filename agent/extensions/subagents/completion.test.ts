@@ -5,7 +5,7 @@ function snapshot(id: string, outcome: CompletionSnapshot["outcome"], answer: st
 	return {
 		id,
 		title: `Agent ${id}`,
-		profile: "review",
+		role: "review",
 		outcome,
 		model: "provider/model-id",
 		thinking: "high",
@@ -37,6 +37,7 @@ describe("completion batches", () => {
 		expect(text).toContain("provider/model-id [high]");
 		expect(text).toContain("CH99.2%");
 		expect(text).toContain("2.0s");
+		expect(text).toContain("role review");
 	});
 
 	test("matches Pi's cache-hit rate formula and formatting", () => {
@@ -49,5 +50,20 @@ describe("completion batches", () => {
 		const text = formatCompletionBatch([snapshot("sa-1", "failed", "partial")]);
 		expect(text).toContain("failures: 1");
 		expect(text).toContain("provider failed");
+	});
+
+	test("groups formal batch results under their persisted identity", () => {
+		const first = { ...snapshot("sa-1", "completed", "First"), batchId: "batch-123" };
+		const second = { ...snapshot("sa-2", "completed", "Second"), batchId: "batch-123" };
+		const text = formatCompletionBatch([first, second], undefined, [{
+			id: "batch-123",
+			title: "Review changes",
+			role: "review",
+			memberIds: ["sa-1", "sa-2"],
+		}]);
+		expect(text).toContain("## Batch — Review changes");
+		expect(text).toContain("> batch-123 · 2 results · role review");
+		expect(text).toContain("### Agent 1");
+		expect(text).toContain("batch batch-123");
 	});
 });
