@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { buildSessionFamily, type SessionFamilyNode } from "../startup-frontpage";
+import {
+	buildSessionFamily,
+	rootedHierarchyLines,
+	type SessionFamilyNode,
+} from "../startup-frontpage";
 
 function node(path: string, parentPath?: string, day = 1): SessionFamilyNode {
 	return {
@@ -49,5 +53,17 @@ describe("buildSessionFamily", () => {
 		const family = buildSessionFamily([first, second], first.path);
 
 		expect(family).toBeDefined();
+	});
+
+	test("indents the session tree beneath a synthetic cwd root", () => {
+		const root = node("/sessions/root");
+		const first = node("/sessions/first", root.path, 2);
+		const second = node("/sessions/second", root.path, 3);
+		buildSessionFamily([root, first, second], second.path);
+
+		const rows = rootedHierarchyLines(root);
+
+		expect(rows.map(({ prefix }) => prefix)).toEqual(["└─ ", "   ├─ ", "   └─ "]);
+		expect(rows.map(({ node: rowNode }) => rowNode)).toEqual([root, first, second]);
 	});
 });

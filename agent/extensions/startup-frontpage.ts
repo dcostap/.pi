@@ -45,8 +45,9 @@ interface SessionLabel {
 
 interface LineageRow {
 	content: string;
-	count: string;
-	age: string;
+	count?: string;
+	age?: string;
+	cwd?: string;
 }
 
 const TRAILING_LABEL_GAP = 4;
@@ -211,6 +212,7 @@ export function buildSessionFamily(
 async function loadSessionFamily(ctx: ExtensionContext): Promise<{
 	root: SessionFamilyNode;
 	currentPath: string;
+	cwd: string;
 } | undefined> {
 	const currentPath = ctx.sessionManager.getSessionFile();
 	if (!currentPath) return undefined;
@@ -263,7 +265,7 @@ async function loadSessionFamily(ctx: ExtensionContext): Promise<{
 	const current = family.find((node) => canonicalPath(node.path) === canonicalPath(currentPath));
 	if (current) current.name = ctx.sessionManager.getSessionName();
 
-	return { root, currentPath };
+	return { root, currentPath, cwd: ctx.sessionManager.getCwd() };
 }
 
 function sessionDisplayName(node: SessionFamilyNode): string {
@@ -300,12 +302,70 @@ function hierarchyLines(root: SessionFamilyNode): Array<{ prefix: string; node: 
 	return lines;
 }
 
+/** Indent the session family beneath a synthetic cwd root node. */
+export function rootedHierarchyLines(root: SessionFamilyNode): Array<{ prefix: string; node: SessionFamilyNode }> {
+	return hierarchyLines(root).map(({ prefix, node }) => ({
+		prefix: prefix ? `   ${prefix}` : "└─ ",
+		node,
+	}));
+}
+
+function takeVisibleStart(value: string, width: number): string {
+	let result = "";
+	let used = 0;
+	for (const character of value) {
+		const characterWidth = visibleWidth(character);
+		if (used + characterWidth > width) break;
+		result += character;
+		used += characterWidth;
+	}
+	return result;
+}
+
+function takeVisibleEnd(value: string, width: number): string {
+	let result = "";
+	let used = 0;
+	const characters = Array.from(value);
+	for (let index = characters.length - 1; index >= 0; index--) {
+		const character = characters[index]!;
+		const characterWidth = visibleWidth(character);
+		if (used + characterWidth > width) break;
+		result = character + result;
+		used += characterWidth;
+	}
+	return result;
+}
+
+function middleTruncatePath(path: string, width: number): string {
+	if (visibleWidth(path) <= width) return path;
+	if (width <= 1) return width === 1 ? "…" : "";
+
+	const remainingWidth = width - 1;
+	// Preserve more of the path tail so the project folder normally remains visible.
+	const startWidth = Math.floor(remainingWidth / 3);
+	const endWidth = remainingWidth - startWidth;
+	return `${takeVisibleStart(path, startWidth)}…${takeVisibleEnd(path, endWidth)}`;
+}
+
+function styledCwdPath(cwd: string, width: number, theme: Theme): string {
+	const path = middleTruncatePath(cwd, width);
+	const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+	if (separatorIndex < 0 || separatorIndex === path.length - 1) {
+		return theme.bold(theme.fg("accent", path));
+	}
+
+	return `${theme.fg("dim", path.slice(0, separatorIndex + 1))}${theme.bold(
+		theme.fg("accent", path.slice(separatorIndex + 1)),
+	)}`;
+}
+
 function styledHierarchyLines(
 	root: SessionFamilyNode,
 	currentPath: string,
+	cwd: string,
 	theme: Theme,
 ): LineageRow[] {
-	return hierarchyLines(root).map(({ prefix, node }) => {
+	const sessionRows = rootedHierarchyLines(root).map(({ prefix, node }) => {
 		const current = canonicalPath(node.path) === canonicalPath(currentPath);
 		const label = sessionDisplayName(node);
 		const styledLabel = current
@@ -320,17 +380,24 @@ function styledHierarchyLines(
 			age,
 		};
 	});
+
+	return [
+		{ content: cwd, cwd },
+		...sessionRows,
+	];
 }
 
 function formatLineageRows(rows: LineageRow[], width: number, theme: Theme): string[] {
-	const countWidth = Math.max(...rows.map((row) => visibleWidth(row.count)));
-	const ageWidth = Math.max(...rows.map((row) => visibleWidth(row.age)));
-	const metadata = rows.map((row) => theme.fg(
+	const sessionRows = rows.filter((row) => row.cwd === undefined);
+	const countWidth = Math.max(0, ...sessionRows.map((row) => visibleWidth(row.count ?? "")));
+	const ageWidth = Math.max(0, ...sessionRows.map((row) => visibleWidth(row.age ?? "")));
+	const metadata = sessionRows.map((row) => theme.fg(
 		"dim",
-		`${row.count.padStart(countWidth)} ${row.age.padStart(ageWidth)}`,
+		`${(row.count ?? "").padStart(countWidth)} ${(row.age ?? "").padStart(ageWidth)}`,
 	));
-	const metadataWidth = Math.max(...metadata.map(visibleWidth));
-	const widestContent = Math.max(...rows.map((row) => visibleWidth(row.content)));
+	const metadataByRow = new Map(sessionRows.map((row, index) => [row, metadata[index]!]));
+	const metadataWidth = Math.max(0, ...metadata.map(visibleWidth));
+	const widestContent = Math.max(1, ...sessionRows.map((row) => visibleWidth(row.content)));
 	// Keep the trailing labels close to the widest session line instead of
 	// pinning them to the far edge of a wide terminal.
 	const contentWidth = Math.max(
@@ -338,12 +405,14 @@ function formatLineageRows(rows: LineageRow[], width: number, theme: Theme): str
 		Math.min(widestContent, width - metadataWidth - TRAILING_LABEL_GAP),
 	);
 
-	return rows.map((row, index) => {
+	return rows.map((row) => {
+		if (row.cwd !== undefined) return styledCwdPath(row.cwd, width, theme);
+
 		const content = truncateToWidth(row.content, contentWidth, "…");
 		const spacing = " ".repeat(
 			Math.max(TRAILING_LABEL_GAP, contentWidth - visibleWidth(content) + TRAILING_LABEL_GAP),
 		);
-		return `${content}${spacing}${metadata[index]!}`;
+		return `${content}${spacing}${metadataByRow.get(row)!}`;
 	});
 }
 
@@ -364,11 +433,12 @@ function brandLines(theme: Theme): string[] {
 function sideBySideFrontpage(
 	root: SessionFamilyNode,
 	currentPath: string,
+	cwd: string,
 	width: number,
 	theme: Theme,
 ): string[] {
 	const logo = brandLines(theme);
-	const lineageRows = styledHierarchyLines(root, currentPath, theme);
+	const lineageRows = styledHierarchyLines(root, currentPath, cwd, theme);
 	const logoWidth = Math.max(...logo.map(visibleWidth));
 	const separatorWidth = 5; // two spaces, the rule, then two spaces
 	const lineageWidth = width - 1 - logoWidth - separatorWidth;
@@ -405,16 +475,17 @@ function setSessionHeader(
 	ctx: ExtensionContext,
 	root: SessionFamilyNode | undefined,
 	currentPath: string | undefined,
+	cwd: string | undefined,
 ): void {
 	ctx.ui.setHeader((_tui, theme) => {
 		return {
-				render(width: number): string[] {
-					const lines = root && currentPath
-						? sideBySideFrontpage(root, currentPath, width, theme)
-						: brandLines(theme);
-					lines.push("");
+			render(width: number): string[] {
+				const lines = root && currentPath && cwd
+					? sideBySideFrontpage(root, currentPath, cwd, width, theme)
+					: brandLines(theme);
+				lines.push("");
 
-					return lines.map((line) => truncateToWidth(` ${line}`, width, "…"));
+				return lines.map((line) => truncateToWidth(` ${line}`, width, "…"));
 			},
 			invalidate() {},
 		};
@@ -423,7 +494,7 @@ function setSessionHeader(
 
 export default function (pi: ExtensionAPI) {
 	let headerGeneration = 0;
-	let loadedFamily: { root: SessionFamilyNode; currentPath: string } | undefined;
+	let loadedFamily: { root: SessionFamilyNode; currentPath: string; cwd: string } | undefined;
 
 	const setLoadedSessionName = (ctx: ExtensionContext): boolean => {
 		if (!loadedFamily) return false;
@@ -443,11 +514,11 @@ export default function (pi: ExtensionAPI) {
 		const generation = ++headerGeneration;
 
 		// Show the brand immediately, then add the disk-backed family tree.
-		setSessionHeader(ctx, undefined, undefined);
+		setSessionHeader(ctx, undefined, undefined, undefined);
 		const family = await loadSessionFamily(ctx);
 		if (generation !== headerGeneration) return;
 		loadedFamily = family;
-		setSessionHeader(ctx, family?.root, family?.currentPath);
+		setSessionHeader(ctx, family?.root, family?.currentPath, family?.cwd);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -461,7 +532,7 @@ export default function (pi: ExtensionAPI) {
 		// the startup header change once per minute. Only the current session's
 		// display name can have changed for this event.
 		if (setLoadedSessionName(ctx)) {
-			setSessionHeader(ctx, loadedFamily?.root, loadedFamily?.currentPath);
+			setSessionHeader(ctx, loadedFamily?.root, loadedFamily?.currentPath, loadedFamily?.cwd);
 		}
 	});
 
