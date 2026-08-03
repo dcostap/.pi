@@ -45,8 +45,11 @@ interface SessionLabel {
 
 interface LineageRow {
 	content: string;
-	metadata: string;
+	count: string;
+	age: string;
 }
+
+const TRAILING_LABEL_GAP = 4;
 
 function canonicalPath(path: string): string {
 	const normalized = resolve(path).replace(/\\/g, "/");
@@ -309,21 +312,39 @@ function styledHierarchyLines(
 			? theme.bold(theme.fg("accent", label))
 			: node.name ? theme.fg("warning", label) : label;
 		const guid = theme.fg("toolDiffAdded", node.id.slice(-6));
+		const currentMarker = current ? theme.fg("dim", " <- you are here") : "";
 		const age = node.ageLabel ?? "?";
 		return {
-			content: `${theme.fg("dim", prefix)}${guid}  ${styledLabel}`,
-			metadata: `${node.messageCount ?? 0} ${age}`,
+			content: `${theme.fg("dim", prefix)}${guid}  ${styledLabel}${currentMarker}`,
+			count: String(node.messageCount ?? 0),
+			age,
 		};
 	});
 }
 
-function formatLineageRow(row: LineageRow, width: number, theme: Theme): string {
-	const metadata = theme.fg("dim", row.metadata);
-	const metadataWidth = visibleWidth(metadata);
-	const contentWidth = Math.max(1, width - metadataWidth - 1);
-	const content = truncateToWidth(row.content, contentWidth, "…");
-	const spacing = " ".repeat(Math.max(1, width - visibleWidth(content) - metadataWidth));
-	return `${content}${spacing}${metadata}`;
+function formatLineageRows(rows: LineageRow[], width: number, theme: Theme): string[] {
+	const countWidth = Math.max(...rows.map((row) => visibleWidth(row.count)));
+	const ageWidth = Math.max(...rows.map((row) => visibleWidth(row.age)));
+	const metadata = rows.map((row) => theme.fg(
+		"dim",
+		`${row.count.padStart(countWidth)} ${row.age.padStart(ageWidth)}`,
+	));
+	const metadataWidth = Math.max(...metadata.map(visibleWidth));
+	const widestContent = Math.max(...rows.map((row) => visibleWidth(row.content)));
+	// Keep the trailing labels close to the widest session line instead of
+	// pinning them to the far edge of a wide terminal.
+	const contentWidth = Math.max(
+		1,
+		Math.min(widestContent, width - metadataWidth - TRAILING_LABEL_GAP),
+	);
+
+	return rows.map((row, index) => {
+		const content = truncateToWidth(row.content, contentWidth, "…");
+		const spacing = " ".repeat(
+			Math.max(TRAILING_LABEL_GAP, contentWidth - visibleWidth(content) + TRAILING_LABEL_GAP),
+		);
+		return `${content}${spacing}${metadata[index]!}`;
+	});
 }
 
 function brandLines(theme: Theme): string[] {
@@ -358,11 +379,11 @@ function sideBySideFrontpage(
 		return [
 			...logo,
 			theme.fg("dim", "─".repeat(stackedWidth)),
-			...lineageRows.map((row) => formatLineageRow(row, stackedWidth, theme)),
+			...formatLineageRows(lineageRows, stackedWidth, theme),
 		];
 	}
 
-	const lineage = lineageRows.map((row) => formatLineageRow(row, lineageWidth, theme));
+	const lineage = formatLineageRows(lineageRows, lineageWidth, theme);
 	const height = Math.max(logo.length, lineage.length);
 	const logoTop = Math.floor((height - logo.length) / 2);
 	const lineageTop = Math.floor((height - lineage.length) / 2);
