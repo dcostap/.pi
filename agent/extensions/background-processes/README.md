@@ -15,6 +15,10 @@ It reuses Pi's public `createLocalBashOperations()` backend—the same local bac
   summaries, adaptive process columns, selected-process previews, scrollable output, and a
   two-key confirmation before stopping a process.
 
+While jobs are running, a permanent TUI widget above the editor shows every active background
+terminal with its state, ID, title, elapsed time, captured-output size, and latest output line.
+The widget adapts to narrow terminals, refreshes live, and disappears when no jobs remain.
+
 Background tool rows show the readable process title beside IDs (for example,
 `bg-2 (Dev server)`) wherever that title is available.
 

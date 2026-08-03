@@ -22,7 +22,7 @@ import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type Completio
 import { loadSubagentProfiles, type SubagentProfile } from "./profiles.ts";
 import { applyRuntimeStatusEvent } from "./runtime-events.ts";
 import { materializeSessionFile } from "./session-file.ts";
-import { renderAlignedTable, type AlignedColumn } from "./table.ts";
+import { renderAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 import { buildVisibleTree } from "./tree.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";

@@ -16,6 +16,7 @@ import { BackgroundProcessManager, WaitAbortedError } from "./manager.ts";
 import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
 import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
+import { processWidgetComponent } from "./ui/process-widget.ts";
 import { renderBackgroundToolCall, renderBackgroundToolResult } from "./ui/tool-call.ts";
 
 const StartParameters = Type.Object({
@@ -42,19 +43,33 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	let delivery: ResultDeliveryCoordinator | undefined;
 	let managerWidgetSubscription: (() => void) | undefined;
 	let latestContext: ExtensionContext | undefined;
-	let widgetRunningCount = -1;
+	let widgetTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+	let widgetLastRefreshAt = 0;
 	let shuttingDown = false;
 
 	const updateWidget = () => {
 		const ctx = latestContext;
-		if (!ctx?.hasUI) return;
-		const running = manager?.runningCount ?? 0;
-		if (running === widgetRunningCount) return;
-		widgetRunningCount = running;
-		ctx.ui.setWidget(
-			"background-processes",
-			running > 0 ? [`■ ${running} background process${running === 1 ? "" : "es"} running • /ps to view`] : undefined,
-		);
+		if (!ctx || ctx.mode !== "tui" || shuttingDown) return;
+		const running = manager?.list().filter((snapshot) => !snapshot.settled) ?? [];
+		ctx.ui.setWidget("background-processes", running.length > 0
+			? (_tui, theme) => processWidgetComponent(running, theme)
+			: undefined);
+		widgetLastRefreshAt = Date.now();
+		if (running.length > 0 && !widgetTimer) widgetTimer = setInterval(updateWidget, 1_000);
+		else if (running.length === 0 && widgetTimer) {
+			clearInterval(widgetTimer);
+			widgetTimer = undefined;
+		}
+	};
+
+	const scheduleWidgetUpdate = () => {
+		if (widgetRefreshTimer || shuttingDown) return;
+		const delay = Math.max(0, 250 - (Date.now() - widgetLastRefreshAt));
+		widgetRefreshTimer = setTimeout(() => {
+			widgetRefreshTimer = undefined;
+			updateWidget();
+		}, delay);
 	};
 
 	const ensureManager = (ctx: ExtensionContext): BackgroundProcessManager => {
@@ -70,7 +85,8 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 			},
 		});
 		managerWidgetSubscription = manager.subscribe((event) => {
-			if (event.kind === "started" || event.kind === "settled" || event.kind === "pruned") updateWidget();
+			if (event.kind === "output") scheduleWidgetUpdate();
+			else if (event.kind === "started" || event.kind === "settled" || event.kind === "pruned") updateWidget();
 		});
 		updateWidget();
 		return manager;
@@ -283,10 +299,14 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		delivery = undefined;
 		managerWidgetSubscription?.();
 		managerWidgetSubscription = undefined;
+		if (widgetTimer) clearInterval(widgetTimer);
+		widgetTimer = undefined;
+		if (widgetRefreshTimer) clearTimeout(widgetRefreshTimer);
+		widgetRefreshTimer = undefined;
 		if (ctx.hasUI) ctx.ui.setWidget("background-processes", undefined);
 		const activeManager = manager;
 		manager = undefined;
-		widgetRunningCount = -1;
+		widgetLastRefreshAt = 0;
 		if (activeManager) await activeManager.dispose(5000);
 	});
 }

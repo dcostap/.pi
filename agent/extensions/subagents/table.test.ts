@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { renderAlignedTable, type AlignedColumn } from "./table.ts";
+import { renderAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 
 const visibleWidth = (value: string): number => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").length;
 const truncate = (value: string, width: number): string => {
