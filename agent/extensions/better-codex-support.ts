@@ -1,7 +1,7 @@
 /**
  * Better Codex Support for pi.
  *
- * Codex-only usage indicator plus Codex fast mode.
+ * Codex-only usage indicator.
  */
 
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -21,17 +21,12 @@ import * as path from "node:path";
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
 const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STATUS_KEY = "better-codex-support-usage";
-const FAST_WIDGET_KEY = "better-codex-support-fast";
 const SHOW_THRESHOLD = 80;
 const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
 const AUTH_FILE = path.join(AGENT_DIR, "auth.json");
 const OBSERVATIONS_FILE = path.join(AGENT_DIR, "codex-usage-observations.jsonl");
-const CODEX_FAST_CONFIG_FILE = path.join(AGENT_DIR, "extensions", "codex-fast-mode.json");
-const CODEX_FAST_FLAG = "codex-fast";
-const CODEX_FAST_SERVICE_TIER = "priority";
-const DEFAULT_CODEX_FAST_SUPPORTED_MODELS = ["gpt-5.4", "gpt-5.5"];
 
 type ProviderKey = "codex";
 type OAuthProviderId = "openai-codex";
@@ -146,12 +141,6 @@ interface SubscriptionItem {
   isActive: boolean;
 }
 
-interface CodexFastConfig {
-  persistState: boolean;
-  desiredActive: boolean;
-  supportedModels: string[];
-}
-
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     if (error.name === "AbortError") return "request timeout";
@@ -164,73 +153,6 @@ function asObject(value: unknown): Record<string, any> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, any>;
 }
-
-function normalizeCodexFastModel(value: string): string | undefined {
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  const prefix = "openai-codex/";
-  if (trimmed.startsWith(prefix)) return trimmed.slice(prefix.length).trim() || undefined;
-  if (trimmed.includes("/")) return undefined;
-  return trimmed;
-}
-
-function readCodexFastConfig(configFile = CODEX_FAST_CONFIG_FILE): CodexFastConfig {
-  let raw: Record<string, any> = {};
-  try {
-    raw = asObject(JSON.parse(fs.readFileSync(configFile, "utf-8"))) ?? {};
-  } catch {
-    raw = {};
-  }
-
-  const supportedModels = Array.isArray(raw.supportedModels)
-    ? raw.supportedModels
-        .filter((entry: unknown): entry is string => typeof entry === "string")
-        .map(normalizeCodexFastModel)
-        .filter((entry): entry is string => entry !== undefined)
-    : DEFAULT_CODEX_FAST_SUPPORTED_MODELS;
-
-  return {
-    persistState: typeof raw.persistState === "boolean" ? raw.persistState : true,
-    desiredActive: typeof raw.desiredActive === "boolean" ? raw.desiredActive : false,
-    supportedModels: Array.from(new Set(supportedModels)),
-  };
-}
-
-function writeCodexFastConfig(config: CodexFastConfig, configFile = CODEX_FAST_CONFIG_FILE): boolean {
-  try {
-    const dir = path.dirname(configFile);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-    const tmpPath = `${configFile}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
-    fs.renameSync(tmpPath, configFile);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function currentModelKey(ctx: ExtensionContext): string {
-  return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
-}
-
-function codexFastModelList(models: string[]): string {
-  return models.length > 0 ? models.map((model) => `openai-codex/${model}`).join(", ") : "none configured";
-}
-
-function supportsCodexFast(ctx: ExtensionContext, config: CodexFastConfig): boolean {
-  return ctx.model?.provider === "openai-codex" && config.supportedModels.includes(ctx.model.id);
-}
-
-function codexFastStateText(ctx: ExtensionContext, desiredActive: boolean, active: boolean, config: CodexFastConfig): string {
-  const model = currentModelKey(ctx);
-  if (active) return `Codex fast mode is on for ${model}.`;
-  if (desiredActive) {
-    return `Codex fast mode is requested, but inactive for unsupported model ${model}. Supported models: ${codexFastModelList(config.supportedModels)}.`;
-  }
-  return `Codex fast mode is off. Current model: ${model}.`;
-}
-
 
 async function requestJson(url: string, init: RequestInit, config: RequestConfig = {}): Promise<JsonRequestResult> {
   const fetchFn = config.fetchFn ?? ((fetch as unknown) as FetchLike);
@@ -908,19 +830,8 @@ export default function (pi: ExtensionAPI) {
   let lastLoggedSnapshotKey: string | null = null;
   let lastRollupFlushAt = 0;
   const rollups = new Map<string, UsageRollup>();
-  let fastConfig = readCodexFastConfig();
-  let fastDesiredActive = fastConfig.desiredActive;
-  let fastActive = false;
-  let lastFastInjectedAt: number | undefined;
-  let lastFastInjectedModel: string | undefined;
   let resetInFlight = false;
   let pendingResetRedeemRequestId: string | undefined;
-
-  pi.registerFlag(CODEX_FAST_FLAG, {
-    description: "Start with Codex fast mode enabled (service_tier=priority)",
-    type: "boolean",
-    default: false,
-  });
 
   function renderPercent(theme: any, value: number): string {
     const v = clampPercent(value);
@@ -1055,94 +966,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     return false;
-  }
-
-  function applyFastState(_ctx: ExtensionContext): boolean {
-    const previous = fastActive;
-    fastActive = fastDesiredActive && supportsCodexFast(_ctx, fastConfig);
-    return previous !== fastActive;
-  }
-
-  function persistFastState(): void {
-    if (!fastConfig.persistState) return;
-    fastConfig = { ...fastConfig, desiredActive: fastDesiredActive };
-    writeCodexFastConfig(fastConfig);
-  }
-
-  function updateFastStatus(_ctx: ExtensionContext): void {
-    if (!_ctx.hasUI) return;
-    _ctx.ui.setStatus("codex-fast-mode", undefined);
-
-    if (fastActive) {
-      _ctx.ui.setWidget(
-        FAST_WIDGET_KEY,
-        [_ctx.ui.theme.fg("success", "⚡ Codex fast mode")],
-        { placement: "belowEditor" },
-      );
-      return;
-    }
-
-    if (fastDesiredActive && _ctx.model?.provider === "openai-codex") {
-      _ctx.ui.setWidget(
-        FAST_WIDGET_KEY,
-        [_ctx.ui.theme.fg("success", "⚡ Codex fast pending for this model")],
-        { placement: "belowEditor" },
-      );
-      return;
-    }
-
-    _ctx.ui.setWidget(FAST_WIDGET_KEY, undefined);
-  }
-
-  function formatFastStatus(_ctx: ExtensionContext): string {
-    return [
-      codexFastStateText(_ctx, fastDesiredActive, fastActive, fastConfig),
-      `Configured service_tier: ${CODEX_FAST_SERVICE_TIER}`,
-      `Supported models: ${codexFastModelList(fastConfig.supportedModels)}`,
-      `Persist state: ${fastConfig.persistState}`,
-      `Last injected: ${lastFastInjectedAt ? `${new Date(lastFastInjectedAt).toLocaleTimeString()} (${lastFastInjectedModel})` : "never"}`,
-      `Config: ${CODEX_FAST_CONFIG_FILE}`,
-    ].join("\n");
-  }
-
-  function setFastDesired(_ctx: ExtensionContext, next: boolean): void {
-    fastConfig = readCodexFastConfig();
-    fastDesiredActive = next;
-    applyFastState(_ctx);
-    persistFastState();
-    updateFastStatus(_ctx);
-    if (!_ctx.hasUI) return;
-    _ctx.ui.notify(
-      codexFastStateText(_ctx, fastDesiredActive, fastActive, fastConfig),
-      fastDesiredActive && !fastActive ? "warning" : "info",
-    );
-  }
-
-  async function handleFastCommand(args: string, _ctx: ExtensionContext): Promise<void> {
-    ctx = _ctx;
-    fastConfig = readCodexFastConfig();
-    applyFastState(_ctx);
-    updateFastStatus(_ctx);
-
-    const arg = args.trim().toLowerCase();
-    if (!arg || arg === "toggle") {
-      setFastDesired(_ctx, !fastDesiredActive);
-      return;
-    }
-    if (["on", "enable", "enabled", "true", "1"].includes(arg)) {
-      setFastDesired(_ctx, true);
-      return;
-    }
-    if (["off", "disable", "disabled", "false", "0"].includes(arg)) {
-      setFastDesired(_ctx, false);
-      return;
-    }
-    if (["status", "debug", "?"].includes(arg)) {
-      if (_ctx.hasUI) _ctx.ui.notify(formatFastStatus(_ctx), "info");
-      return;
-    }
-
-    if (_ctx.hasUI) _ctx.ui.notify("Usage: /fast [on|off|status]", "error");
   }
 
   function getSessionFile(): string | undefined {
@@ -1311,16 +1134,6 @@ export default function (pi: ExtensionAPI) {
     ctx = _ctx;
     updateProviderFrom(_ctx.model);
 
-    fastConfig = readCodexFastConfig();
-    fastDesiredActive = fastConfig.persistState ? fastConfig.desiredActive : false;
-    if (pi.getFlag(CODEX_FAST_FLAG) === true) fastDesiredActive = true;
-    applyFastState(_ctx);
-    persistFastState();
-    updateFastStatus(_ctx);
-    if (fastDesiredActive && !fastActive && _ctx.hasUI && _ctx.model?.provider === "openai-codex") {
-      _ctx.ui.notify(codexFastStateText(_ctx, fastDesiredActive, fastActive, fastConfig), "warning");
-    }
-
     await poll("session_start", true);
 
     if (pollTimer) clearInterval(pollTimer);
@@ -1340,27 +1153,18 @@ export default function (pi: ExtensionAPI) {
     if (_ctx?.hasUI) {
       _ctx.ui.setStatus(STATUS_KEY, undefined);
       _ctx.ui.setStatus("codex-usage-threshold", undefined);
-      _ctx.ui.setStatus("codex-fast-mode", undefined);
-      _ctx.ui.setWidget(FAST_WIDGET_KEY, undefined);
     }
   });
 
   pi.on("turn_start", async (_event, _ctx) => {
     ctx = _ctx;
     const changed = updateProviderFrom(_ctx.model);
-    applyFastState(_ctx);
-    updateFastStatus(_ctx);
     if (changed && state.activeProvider === "codex") await poll("turn_start_model_changed", true);
   });
 
   pi.on("model_select", async (event, _ctx) => {
     ctx = _ctx;
     const changed = updateProviderFrom(event.model ?? _ctx.model);
-    const fastChanged = applyFastState(_ctx);
-    updateFastStatus(_ctx);
-    if (fastChanged && fastDesiredActive && _ctx.hasUI) {
-      _ctx.ui.notify(codexFastStateText(_ctx, fastDesiredActive, fastActive, fastConfig), fastActive ? "info" : "warning");
-    }
     if (changed && state.activeProvider === "codex") await poll("model_select", true);
   });
 
@@ -1368,23 +1172,6 @@ export default function (pi: ExtensionAPI) {
     ctx = _ctx;
     aggregatePiUsage(event.messages);
     flushPiUsageRollups("agent_end");
-  });
-
-  pi.on("before_provider_request", (event, _ctx) => {
-    ctx = _ctx;
-    applyFastState(_ctx);
-    updateFastStatus(_ctx);
-    const payload = asObject(event.payload);
-    if (!fastActive || !payload) return;
-
-    lastFastInjectedAt = Date.now();
-    lastFastInjectedModel = currentModelKey(_ctx);
-    return { ...payload, service_tier: CODEX_FAST_SERVICE_TIER };
-  });
-
-  pi.registerCommand("fast", {
-    description: "Toggle Codex fast mode",
-    handler: handleFastCommand,
   });
 
   pi.registerCommand("codex-reset-usages", {
