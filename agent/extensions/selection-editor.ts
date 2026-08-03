@@ -879,7 +879,9 @@ class SelectionEditor extends CustomEditor {
 			return true;
 		}
 		if (matchesKey(data, "enter")) {
-			this.acceptInlinePromptCompletion();
+			// Enter submits only what the user actually typed. The inline candidate is
+			// still a preview at this point, so discard it rather than accepting it.
+			this.cancelInlinePromptCompletion();
 			super.handleInput(data);
 			return true;
 		}
