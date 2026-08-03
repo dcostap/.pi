@@ -402,6 +402,20 @@ function setSessionHeader(
 
 export default function (pi: ExtensionAPI) {
 	let headerGeneration = 0;
+	let loadedFamily: { root: SessionFamilyNode; currentPath: string } | undefined;
+
+	const setLoadedSessionName = (ctx: ExtensionContext): boolean => {
+		if (!loadedFamily) return false;
+		const current = hierarchyLines(loadedFamily.root)
+			.map(({ node }) => node)
+			.find((node) => canonicalPath(node.path) === canonicalPath(loadedFamily!.currentPath));
+		if (!current) return false;
+
+		const nextName = ctx.sessionManager.getSessionName();
+		if (current.name === nextName) return false;
+		current.name = nextName;
+		return true;
+	};
 
 	const refreshHeader = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui") return;
@@ -411,6 +425,7 @@ export default function (pi: ExtensionAPI) {
 		setSessionHeader(ctx, undefined, undefined);
 		const family = await loadSessionFamily(ctx);
 		if (generation !== headerGeneration) return;
+		loadedFamily = family;
 		setSessionHeader(ctx, family?.root, family?.currentPath);
 	};
 
@@ -419,10 +434,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_info_changed", async (_event, ctx) => {
-		await refreshHeader(ctx);
+		// Session-info changes are also emitted by some session-manager paths
+		// while the transcript is being updated. Do not reload the whole family
+		// here: doing so recomputes every relative age from Date.now() and makes
+		// the startup header change once per minute. Only the current session's
+		// display name can have changed for this event.
+		if (setLoadedSessionName(ctx)) {
+			setSessionHeader(ctx, loadedFamily?.root, loadedFamily?.currentPath);
+		}
 	});
 
 	pi.on("session_shutdown", () => {
 		headerGeneration++;
+		loadedFamily = undefined;
 	});
 }
