@@ -43,7 +43,6 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	let delivery: ResultDeliveryCoordinator | undefined;
 	let managerWidgetSubscription: (() => void) | undefined;
 	let latestContext: ExtensionContext | undefined;
-	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 	let widgetRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	let widgetLastRefreshAt = 0;
 	let shuttingDown = false;
@@ -52,15 +51,13 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		const ctx = latestContext;
 		if (!ctx || ctx.mode !== "tui" || shuttingDown) return;
 		const running = manager?.list().filter((snapshot) => !snapshot.settled) ?? [];
+		const renderedAt = Date.now();
 		ctx.ui.setWidget("background-processes", running.length > 0
-			? (_tui, theme) => processWidgetComponent(running, theme)
+			? (_tui, theme) => processWidgetComponent(running, theme, renderedAt)
 			: undefined);
-		widgetLastRefreshAt = Date.now();
-		if (running.length > 0 && !widgetTimer) widgetTimer = setInterval(updateWidget, 1_000);
-		else if (running.length === 0 && widgetTimer) {
-			clearInterval(widgetTimer);
-			widgetTimer = undefined;
-		}
+		widgetLastRefreshAt = renderedAt;
+		// Do not add an elapsed-time heartbeat here. Replacing a persistent
+		// widget on a clock tick disturbs terminal scrollback while Pi is idle.
 	};
 
 	const scheduleWidgetUpdate = () => {
@@ -299,8 +296,6 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		delivery = undefined;
 		managerWidgetSubscription?.();
 		managerWidgetSubscription = undefined;
-		if (widgetTimer) clearInterval(widgetTimer);
-		widgetTimer = undefined;
 		if (widgetRefreshTimer) clearTimeout(widgetRefreshTimer);
 		widgetRefreshTimer = undefined;
 		if (ctx.hasUI) ctx.ui.setWidget("background-processes", undefined);

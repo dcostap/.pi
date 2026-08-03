@@ -66,8 +66,12 @@ describe("background process widget", () => {
 				title: "A deliberately very long background process title",
 				output: { ...snapshot("x").output, text: "A very long latest output line that should be safely truncated" },
 			}),
-		], theme);
+		], theme, 13_000);
 
-		for (const line of component.render(42)) expect(line.length).toBeLessThanOrEqual(42);
+		const firstRender = component.render(42);
+		const secondRender = component.render(42);
+		for (const line of firstRender) expect(line.length).toBeLessThanOrEqual(42);
+		expect(secondRender).toEqual(firstRender);
+		expect(firstRender.join("\n")).toContain("12s");
 	});
 });

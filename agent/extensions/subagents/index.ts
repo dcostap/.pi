@@ -1522,11 +1522,11 @@ function widgetLines(records: AgentRecord[], theme: Theme, now = Date.now(), wid
 	return [header, ...renderedRows];
 }
 
-function widgetComponent(records: AgentRecord[], theme: Theme) {
+function widgetComponent(records: AgentRecord[], theme: Theme, renderedAt = Date.now()) {
 	return {
 		render(width: number): string[] {
 			const contentWidth = Math.max(0, width - 1);
-			return widgetLines(records, theme, Date.now(), contentWidth).map((line) => truncateToWidth(` ${line}`, width));
+			return widgetLines(records, theme, renderedAt, contentWidth).map((line) => truncateToWidth(` ${line}`, width));
 		},
 		invalidate() {},
 	};
@@ -1718,27 +1718,35 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let unsubscribe: (() => void) | undefined;
 	let completionFlushScheduled = false;
 	let completionFlushRunning = false;
-	let widgetTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 	let shuttingDown = false;
 
 	const refreshWidget = () => {
 		if (!latestCtx || latestCtx.mode !== "tui" || shuttingDown) return;
+		if (widgetExpiryTimer) {
+			clearTimeout(widgetExpiryTimer);
+			widgetExpiryTimer = undefined;
+		}
 		const records = manager?.list() ?? [];
 		if (records.length === 0) {
 			latestCtx.ui.setWidget(WIDGET_ID, undefined);
-			if (widgetTimer) {
-				clearInterval(widgetTimer);
-				widgetTimer = undefined;
-			}
 			return;
 		}
-		latestCtx.ui.setWidget(WIDGET_ID, (_tui, theme) => widgetComponent(records, theme));
-		const hasActive = records.some(isActive);
-		const hasRecentFinished = records.some((record) => isRecentlyFinished(record, Date.now()));
-		if ((hasActive || hasRecentFinished) && !widgetTimer) widgetTimer = setInterval(refreshWidget, 1_000);
-		else if (!hasActive && !hasRecentFinished && widgetTimer) {
-			clearInterval(widgetTimer);
-			widgetTimer = undefined;
+		const renderedAt = Date.now();
+		latestCtx.ui.setWidget(WIDGET_ID, (_tui, theme) => widgetComponent(records, theme, renderedAt));
+
+		// Active durations stay fixed until real manager activity refreshes the
+		// widget. The only clock-driven update is the one-shot removal of a
+		// finished row after its recent-result window expires.
+		const nextExpiry = records
+			.filter((record) => !isActive(record) && isRecentlyFinished(record, renderedAt) && record.settledAt !== undefined)
+			.map((record) => record.settledAt! + RECENT_FINISHED_WIDGET_MS)
+			.sort((left, right) => left - right)[0];
+		if (nextExpiry !== undefined) {
+			widgetExpiryTimer = setTimeout(() => {
+				widgetExpiryTimer = undefined;
+				refreshWidget();
+			}, Math.max(1, nextExpiry - renderedAt));
 		}
 	};
 
@@ -2151,8 +2159,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
-		if (widgetTimer) clearInterval(widgetTimer);
-		widgetTimer = undefined;
+		if (widgetExpiryTimer) clearTimeout(widgetExpiryTimer);
+		widgetExpiryTimer = undefined;
 		if (latestCtx?.mode === "tui") latestCtx.ui.setWidget(WIDGET_ID, undefined);
 		unsubscribe?.();
 		unsubscribe = undefined;

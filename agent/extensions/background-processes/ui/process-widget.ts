@@ -78,11 +78,15 @@ export function processWidgetLines(
 	return [header, ...rendered];
 }
 
-export function processWidgetComponent(snapshots: readonly BackgroundProcessSnapshot[], theme: Theme) {
+export function processWidgetComponent(
+	snapshots: readonly BackgroundProcessSnapshot[],
+	theme: Theme,
+	renderedAt = Date.now(),
+) {
 	return {
 		render(width: number): string[] {
 			const contentWidth = Math.max(0, width - 1);
-			return processWidgetLines(snapshots, theme, Date.now(), contentWidth)
+			return processWidgetLines(snapshots, theme, renderedAt, contentWidth)
 				.map((line) => truncateToWidth(` ${line}`, width));
 		},
 		invalidate() {},
