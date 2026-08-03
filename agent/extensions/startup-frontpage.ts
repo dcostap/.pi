@@ -21,6 +21,8 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const HEADER_READ_BYTES = 64 * 1024;
 const FILE_CONCURRENCY = 8;
+/** The cwd is rendered separately, so this caps session and hidden-summary rows. */
+const MAX_SESSION_TREE_ROWS = 15;
 
 export interface SessionFamilyNode {
 	path: string;
@@ -174,6 +176,29 @@ function nodeFromHeader(path: string, header: SessionHeader): SessionFamilyNode 
 	};
 }
 
+function activityTimestamp(node: SessionFamilyNode): number {
+	if (node.modifiedAt !== undefined && Number.isFinite(node.modifiedAt)) return node.modifiedAt;
+	const createdAt = Date.parse(node.timestamp);
+	return Number.isFinite(createdAt) ? createdAt : 0;
+}
+
+function compareByActivity(a: SessionFamilyNode, b: SessionFamilyNode): number {
+	return activityTimestamp(b) - activityTimestamp(a)
+		|| b.timestamp.localeCompare(a.timestamp)
+		|| a.id.localeCompare(b.id);
+}
+
+function sortSessionFamilyByActivity(root: SessionFamilyNode): void {
+	const visited = new Set<SessionFamilyNode>();
+	const walk = (node: SessionFamilyNode) => {
+		if (visited.has(node)) return;
+		visited.add(node);
+		node.children.sort(compareByActivity);
+		for (const child of node.children) walk(child);
+	};
+	walk(root);
+}
+
 /** Build the connected parent/descendant tree containing currentPath. */
 export function buildSessionFamily(
 	nodes: SessionFamilyNode[],
@@ -199,13 +224,7 @@ export function buildSessionFamily(
 		root = parent;
 	}
 
-	const sortChildren = (node: SessionFamilyNode, visited: Set<SessionFamilyNode>) => {
-		if (visited.has(node)) return;
-		visited.add(node);
-		node.children.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
-		for (const child of node.children) sortChildren(child, visited);
-	};
-	sortChildren(root, new Set());
+	sortSessionFamilyByActivity(root);
 	return root;
 }
 
@@ -260,6 +279,9 @@ async function loadSessionFamily(ctx: ExtensionContext): Promise<{
 		const ageTimestamp = labels[i]!.modifiedAt ?? (Number.isFinite(createdAt) ? createdAt : ageReferenceMs);
 		family[i]!.ageLabel = formatSessionAge(ageTimestamp, ageReferenceMs);
 	}
+	// Labels provide the last-message timestamp used by the age column. Re-sort
+	// now that it is available instead of leaving siblings in creation order.
+	sortSessionFamilyByActivity(root);
 
 	// The in-memory manager is authoritative if /name just changed but the file is still flushing.
 	const current = family.find((node) => canonicalPath(node.path) === canonicalPath(currentPath));
@@ -308,6 +330,171 @@ export function rootedHierarchyLines(root: SessionFamilyNode): Array<{ prefix: s
 		prefix: prefix ? `   ${prefix}` : "└─ ",
 		node,
 	}));
+}
+
+export type LimitedHierarchyRow =
+	| { prefix: string; node: SessionFamilyNode; hiddenCount?: never }
+	| { prefix: string; node?: never; hiddenCount: number };
+
+/**
+ * Return an activity-ranked, ancestor-aware projection of a session family.
+ * Hidden-summary rows count against maxRows, so the result always respects the
+ * hard cap while keeping the current session visible.
+ */
+export function limitedRootedHierarchyLines(
+	root: SessionFamilyNode,
+	currentPath: string,
+	maxRows: number,
+): LimitedHierarchyRow[] {
+	if (maxRows <= 0) return [];
+
+	const nodes: SessionFamilyNode[] = [];
+	const parentByNode = new Map<SessionFamilyNode, SessionFamilyNode>();
+	const visited = new Set<SessionFamilyNode>();
+	const collect = (node: SessionFamilyNode) => {
+		if (visited.has(node)) return;
+		visited.add(node);
+		nodes.push(node);
+		for (const child of node.children) {
+			if (!parentByNode.has(child)) parentByNode.set(child, node);
+			collect(child);
+		}
+	};
+	collect(root);
+
+	const current = nodes.find((node) => canonicalPath(node.path) === canonicalPath(currentPath)) ?? root;
+	const lineage: SessionFamilyNode[] = [];
+	const lineageSeen = new Set<SessionFamilyNode>();
+	for (let node: SessionFamilyNode | undefined = current; node && !lineageSeen.has(node); node = parentByNode.get(node)) {
+		lineageSeen.add(node);
+		lineage.unshift(node);
+	}
+
+	type HiddenGroup = { count: number; activity: number };
+	type Projection = {
+		selected: Set<SessionFamilyNode>;
+		projectedRoot: SessionFamilyNode;
+		children: Map<SessionFamilyNode, SessionFamilyNode[]>;
+		hidden: Map<SessionFamilyNode, HiddenGroup>;
+	};
+
+	const project = (realNodeBudget: number): Projection => {
+		const selected = new Set<SessionFamilyNode>();
+		if (lineage.length <= realNodeBudget) {
+			for (const node of lineage) selected.add(node);
+		} else if (realNodeBudget === 1) {
+			selected.add(current);
+		} else {
+			selected.add(lineage[0]!);
+			for (const node of lineage.slice(-(realNodeBudget - 1))) selected.add(node);
+		}
+
+		for (const candidate of [...nodes].sort(compareByActivity)) {
+			if (selected.has(candidate)) continue;
+			const missingChain: SessionFamilyNode[] = [];
+			const chainSeen = new Set<SessionFamilyNode>();
+			let cursor: SessionFamilyNode | undefined = candidate;
+			while (cursor && !selected.has(cursor) && !chainSeen.has(cursor)) {
+				chainSeen.add(cursor);
+				missingChain.unshift(cursor);
+				cursor = parentByNode.get(cursor);
+			}
+			if (selected.size + missingChain.length > realNodeBudget) continue;
+			for (const node of missingChain) selected.add(node);
+			if (selected.size === realNodeBudget) break;
+		}
+
+		// Attach selected descendants to their closest selected ancestor. This is
+		// normally their real parent and only bridges gaps in very deep lineages.
+		const children = new Map<SessionFamilyNode, SessionFamilyNode[]>();
+		for (const node of selected) children.set(node, []);
+		const projectedRoot = selected.has(root) ? root : current;
+		for (const node of selected) {
+			if (node === projectedRoot) continue;
+			let parent = parentByNode.get(node);
+			const seen = new Set<SessionFamilyNode>();
+			while (parent && !selected.has(parent) && !seen.has(parent)) {
+				seen.add(parent);
+				parent = parentByNode.get(parent);
+			}
+			if (parent) children.get(parent)?.push(node);
+		}
+		for (const projectedChildren of children.values()) projectedChildren.sort(compareByActivity);
+
+		// Aggregate every omitted node beneath its closest visible ancestor. One
+		// summary per visible branch conveys exactly how much that branch hides
+		// without allowing placeholders themselves to explode the row count.
+		const hidden = new Map<SessionFamilyNode, HiddenGroup>();
+		for (const node of nodes) {
+			if (selected.has(node)) continue;
+			let parent = parentByNode.get(node);
+			const seen = new Set<SessionFamilyNode>();
+			while (parent && !selected.has(parent) && !seen.has(parent)) {
+				seen.add(parent);
+				parent = parentByNode.get(parent);
+			}
+			const owner = parent ?? projectedRoot;
+			const group = hidden.get(owner) ?? { count: 0, activity: 0 };
+			group.count++;
+			group.activity = Math.max(group.activity, activityTimestamp(node));
+			hidden.set(owner, group);
+		}
+
+		return { selected, projectedRoot, children, hidden };
+	};
+
+	// Summary rows consume the same budget as sessions. Iteratively trade the
+	// least-useful visible slots for summaries until sessions + summaries fit.
+	let realNodeBudget = maxRows;
+	let projection = project(realNodeBudget);
+	while (projection.selected.size + projection.hidden.size > maxRows && realNodeBudget > 1) {
+		const overflow = projection.selected.size + projection.hidden.size - maxRows;
+		realNodeBudget = Math.max(1, realNodeBudget - overflow);
+		projection = project(realNodeBudget);
+	}
+
+	const lines: LimitedHierarchyRow[] = [];
+	const rendered = new Set<SessionFamilyNode>();
+	const walk = (node: SessionFamilyNode, indent: string, isLast: boolean, isRoot: boolean) => {
+		if (rendered.has(node)) return;
+		rendered.add(node);
+		const prefix = isRoot ? "└─ " : `   ${indent}${isLast ? "└─ " : "├─ "}`;
+		lines.push({ prefix, node });
+		const childIndent = isRoot ? "" : `${indent}${isLast ? "   " : "│  "}`;
+		const items: Array<
+			| { type: "node"; node: SessionFamilyNode; activity: number }
+			| { type: "hidden"; count: number; activity: number }
+		> = (projection.children.get(node) ?? []).map((child) => ({
+			type: "node",
+			node: child,
+			activity: activityTimestamp(child),
+		}));
+		const hidden = projection.hidden.get(node);
+		if (hidden) items.push({ type: "hidden", count: hidden.count, activity: hidden.activity });
+		items.sort((a, b) => {
+			const activityOrder = b.activity - a.activity;
+			if (activityOrder !== 0) return activityOrder;
+			if (a.type === "node" && b.type === "node") return compareByActivity(a.node, b.node);
+			if (a.type !== b.type) return a.type === "node" ? -1 : 1;
+			return 0;
+		});
+		items.forEach((item, index) => {
+			const itemIsLast = index === items.length - 1;
+			if (item.type === "node") {
+				walk(item.node, childIndent, itemIsLast, false);
+			} else {
+				lines.push({
+					prefix: `   ${childIndent}${itemIsLast ? "└─ " : "├─ "}`,
+					hiddenCount: item.count,
+				});
+			}
+		});
+	};
+	walk(projection.projectedRoot, "", true, true);
+
+	// A one-row caller cannot show both the current session and a summary. All
+	// normal UI usage has a larger budget, but retain the hard-cap guarantee.
+	return lines.slice(0, maxRows);
 }
 
 function takeVisibleStart(value: string, width: number): string {
@@ -365,7 +552,15 @@ function styledHierarchyLines(
 	cwd: string,
 	theme: Theme,
 ): LineageRow[] {
-	const sessionRows = rootedHierarchyLines(root).map(({ prefix, node }) => {
+	const sessionRows = limitedRootedHierarchyLines(root, currentPath, MAX_SESSION_TREE_ROWS).map((row) => {
+		if (row.node === undefined) {
+			const noun = row.hiddenCount === 1 ? "session" : "sessions";
+			return {
+				content: theme.fg("dim", `${row.prefix}… ${row.hiddenCount} more ${noun} hidden`),
+			};
+		}
+
+		const { prefix, node } = row;
 		const current = canonicalPath(node.path) === canonicalPath(currentPath);
 		const label = sessionDisplayName(node);
 		const styledLabel = current
