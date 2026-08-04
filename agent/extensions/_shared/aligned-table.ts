@@ -151,10 +151,11 @@ export function renderAlignedTable<Key extends string>(
 }
 
 /**
- * Render one aligned table while preserving a variable tree indentation in
- * front of each row. The deepest indent is reserved from the table width, but
- * shallower rows are not padded to it, so descendants visibly shift as whole
- * rows instead of only widening a connector cell.
+ * Render one aligned table with a variable tree prefix in its first column.
+ *
+ * The prefix belongs to the tree/connector column, rather than to the whole
+ * row. This keeps the data columns aligned while still letting connectors move
+ * to the right as the tree gets deeper.
  */
 export function renderIndentedAlignedTable<Key extends string>(
 	rows: readonly Readonly<Record<Key, string>>[],
@@ -163,8 +164,12 @@ export function renderIndentedAlignedTable<Key extends string>(
 	options: TableRenderOptions,
 	indent: (row: Readonly<Record<Key, string>>) => string,
 ): string[] {
-	const maxIndent = rows.reduce((maximum, row) => Math.max(maximum, options.visibleWidth(indent(row))), 0);
-	const tableWidth = Number.isFinite(availableWidth) ? Math.max(0, availableWidth - maxIndent) : availableWidth;
-	const rendered = renderAlignedTable(rows, tableWidth, columns, options);
-	return rendered.map((line, index) => `${indent(rows[index]!)}${line}`);
+	const firstColumn = columns[0]?.key;
+	if (!firstColumn) return rows.map((row) => indent(row));
+
+	const indentedRows = rows.map((row) => ({
+		...row,
+		[firstColumn]: `${indent(row)}${row[firstColumn] ?? ""}`,
+	}));
+	return renderAlignedTable(indentedRows, availableWidth, columns, options);
 }

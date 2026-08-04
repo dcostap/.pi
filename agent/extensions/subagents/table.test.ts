@@ -44,7 +44,7 @@ describe("aligned subagent tables", () => {
 		expect(rows[0]!.includes("$0.031")).toBe(false);
 	});
 
-	test("indents an entire child row instead of only its connector cell", () => {
+	test("keeps data columns aligned while indenting the tree connector", () => {
 		type Key = "indent" | "connector" | "state" | "id";
 		const treeColumns: readonly AlignedColumn<Key>[] = [
 			{ key: "connector", minWidth: 3 },
@@ -60,6 +60,7 @@ describe("aligned subagent tables", () => {
 		expect(rows[0]!.startsWith("└─ ")).toBe(true);
 		expect(rows[1]!.startsWith("   ├─ ")).toBe(true);
 		expect(rows[2]!.startsWith("   └─ ")).toBe(true);
-		expect(rows[1]!.indexOf("sa-1")).toBe(rows[0]!.indexOf("batch-1") + 3);
+		expect(rows[1]!.indexOf("sa-1")).toBe(rows[0]!.indexOf("batch-1"));
+		expect(rows[2]!.indexOf("sa-2")).toBe(rows[0]!.indexOf("batch-1"));
 	});
 });
