@@ -1,116 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { promisify } from "node:util";
+import { collectGitSnapshot } from "./git-status-widget/git.ts";
 
-const execFileAsync = promisify(execFile);
 const WIDGET_ID = "git-status-widget";
 const UPDATE_INTERVAL_MS = 2_000;
-const GIT_COMMAND_TIMEOUT_MS = 30_000;
 const GRAY = "\x1b[90m";
 const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
-
-async function runGit(args: string[], cwd: string) {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd,
-    timeout: GIT_COMMAND_TIMEOUT_MS,
-    maxBuffer: 1024 * 1024,
-  });
-  return stdout.trimEnd();
-}
-
-async function getBranch(cwd: string) {
-  const branch = await runGit(["branch", "--show-current"], cwd);
-  if (branch.length > 0) return branch;
-
-  const head = await runGit(["rev-parse", "--short", "HEAD"], cwd);
-  return head.length > 0 ? `detached@${head}` : "unknown";
-}
-
-function getUntrackedFiles(statusOutput: string) {
-  if (statusOutput.length === 0) return [];
-
-  const files: string[] = [];
-  for (const line of statusOutput.split("\n")) {
-    if (line.startsWith("?? ")) files.push(line.slice(3));
-  }
-  return files;
-}
-
-function countUnstagedFiles(statusOutput: string) {
-  if (statusOutput.length === 0) return 0;
-
-  let count = 0;
-  for (const line of statusOutput.split("\n")) {
-    if (line.startsWith("??") || line[1] !== " ") count += 1;
-  }
-  return count;
-}
-
-async function getStatus(cwd: string) {
-  return runGit(["status", "--porcelain", "--untracked-files=normal"], cwd);
-}
-
-async function countTextFileLines(path: string) {
-  const buffer = await readFile(path);
-  if (buffer.includes(0)) return 0;
-  if (buffer.length === 0) return 0;
-
-  let lines = 0;
-  for (const byte of buffer) {
-    if (byte === 10) lines += 1;
-  }
-  if (buffer[buffer.length - 1] !== 10) lines += 1;
-  return lines;
-}
-
-async function getUntrackedLineStats(cwd: string, statusOutput: string) {
-  const files = getUntrackedFiles(statusOutput);
-  const counts = await Promise.all(
-    files.map(async (file) => {
-      try {
-        return await countTextFileLines(join(cwd, file));
-      } catch {
-        return 0;
-      }
-    }),
-  );
-  return { added: counts.reduce((sum, count) => sum + count, 0), removed: 0 };
-}
-
-function parseNumstat(output: string) {
-  let added = 0;
-  let removed = 0;
-
-  for (const line of output.split("\n")) {
-    if (!line.trim()) continue;
-
-    const [additions, deletions] = line.split("\t");
-    if (additions && additions !== "-") added += Number(additions) || 0;
-    if (deletions && deletions !== "-") removed += Number(deletions) || 0;
-  }
-
-  return { added, removed };
-}
-
-async function getLineStats(cwd: string, statusOutput: string) {
-  const [unstaged, staged, untrackedStats] = await Promise.all([
-    runGit(["diff", "--numstat"], cwd),
-    runGit(["diff", "--cached", "--numstat"], cwd),
-    getUntrackedLineStats(cwd, statusOutput),
-  ]);
-
-  const unstagedStats = parseNumstat(unstaged);
-  const stagedStats = parseNumstat(staged);
-
-  return {
-    added: unstagedStats.added + stagedStats.added + untrackedStats.added,
-    removed: unstagedStats.removed + stagedStats.removed + untrackedStats.removed,
-  };
-}
 
 function isStaleContextError(error: unknown) {
   return (
@@ -124,6 +20,7 @@ type WidgetState = {
   interval: NodeJS.Timeout | undefined;
   updateInFlight: boolean;
   generation: number;
+  abortController: AbortController | undefined;
   widgetInitialized: boolean;
   lastWidgetSignature: string | null;
 };
@@ -151,7 +48,12 @@ function setWidget(ctx: ExtensionContext, state: WidgetState, lines: string[] | 
   }
 }
 
-async function refreshWidget(ctx: ExtensionContext, state: WidgetState, generation: number) {
+async function refreshWidget(
+  ctx: ExtensionContext,
+  state: WidgetState,
+  generation: number,
+  signal: AbortSignal,
+) {
   if (!state.active || state.generation !== generation) return;
 
   let cwd: string;
@@ -164,22 +66,15 @@ async function refreshWidget(ctx: ExtensionContext, state: WidgetState, generati
   }
 
   try {
-    await runGit(["rev-parse", "--is-inside-work-tree"], cwd);
-    const [branch, status] = await Promise.all([
-      getBranch(cwd),
-      getStatus(cwd),
-    ]);
-    const [unstagedCount, lineStats] = await Promise.all([
-      Promise.resolve(countUnstagedFiles(status)),
-      getLineStats(cwd, status),
-    ]);
+    const snapshot = await collectGitSnapshot(cwd, { signal });
 
     if (!state.active || state.generation !== generation) return;
 
-    const fileLabel = unstagedCount === 1 ? "file" : "files";
-    const addedText = `${lineStats.added > 0 ? GREEN : GRAY}+${lineStats.added}`;
-    const removedText = `${lineStats.removed > 0 ? RED : GRAY}-${lineStats.removed}`;
-    const text = `${GRAY} ${branch} · ${unstagedCount} unstaged ${fileLabel} · ${addedText}${GRAY} ${removedText}${RESET}`;
+    const fileLabel = snapshot.unstagedCount === 1 ? "file" : "files";
+    const addedPrefix = snapshot.lineStatsComplete ? "+" : "~+";
+    const addedText = `${snapshot.added > 0 ? GREEN : GRAY}${addedPrefix}${snapshot.added}`;
+    const removedText = `${snapshot.removed > 0 ? RED : GRAY}-${snapshot.removed}`;
+    const text = `${GRAY} ${snapshot.branch} · ${snapshot.unstagedCount} unstaged ${fileLabel} · ${addedText}${GRAY} ${removedText}${RESET}`;
     setWidget(ctx, state, [text]);
   } catch {
     // Keep the last successful status visible while Git is slow or temporarily unavailable.
@@ -190,8 +85,10 @@ function updateWidget(ctx: ExtensionContext, state: WidgetState) {
   if (!state.active || state.updateInFlight) return;
 
   const generation = state.generation;
+  const controller = state.abortController;
+  if (!controller || controller.signal.aborted) return;
   state.updateInFlight = true;
-  void refreshWidget(ctx, state, generation)
+  void refreshWidget(ctx, state, generation, controller.signal)
     .catch((error) => {
       if (!isStaleContextError(error)) console.error(error);
     })
@@ -206,13 +103,16 @@ export default function (pi: ExtensionAPI) {
     interval: undefined,
     updateInFlight: false,
     generation: 0,
+    abortController: undefined,
     widgetInitialized: false,
     lastWidgetSignature: null,
   };
 
   pi.on("session_start", (_event, ctx) => {
+    state.abortController?.abort();
     state.active = true;
     state.generation += 1;
+    state.abortController = new AbortController();
     state.updateInFlight = false;
     state.widgetInitialized = false;
     state.lastWidgetSignature = null;
@@ -236,6 +136,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     state.active = false;
     state.generation += 1;
+    state.abortController?.abort();
+    state.abortController = undefined;
     state.updateInFlight = false;
     if (state.interval) {
       clearInterval(state.interval);
