@@ -2,17 +2,32 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { streamSimple, type AssistantMessageEvent, type Usage } from "@earendil-works/pi-ai/compat";
 import {
 	compact,
 	convertToLlm,
 	type CompactionResult,
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
-import { Container, fuzzyFilter, Input, matchesKey, Spacer, Text, type Focusable } from "@earendil-works/pi-tui";
+import {
+	Container,
+	fuzzyFilter,
+	Input,
+	matchesKey,
+	Spacer,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+	type Focusable,
+} from "@earendil-works/pi-tui";
 
 const CONFIG_FILE = getConfigFile();
 const VISIBLE_PICKER_ROWS = 12;
 const SUMMARY_PROMPT_HEADROOM_TOKENS = 3_000;
+const PROGRESS_WIDGET_KEY = "compaction-model-progress";
+const PROGRESS_UPDATE_INTERVAL_MS = 250;
+const FINAL_PROGRESS_HOLD_MS = 800;
+const PROGRESS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const USAGE = [
 	"COMPACTION MODEL",
@@ -35,6 +50,30 @@ type CompactionModelConfig = {
 	model: string;
 };
 
+type CompactionProgress = {
+	ctx: any;
+	preparation: any;
+	reason: string;
+	model: string;
+	contextWindow: number;
+	estimatedInputTokens: number;
+	startedAt: number;
+	active: boolean;
+	timer?: ReturnType<typeof setInterval>;
+	finalClearTimer?: ReturnType<typeof setTimeout>;
+	lastWidgetSignature?: string;
+	spinnerIndex: number;
+	requestCount: number;
+	purposeIndex: number;
+	currentPurpose: string;
+	currentTerminal: "done" | "error" | undefined;
+	currentPhase: string;
+	currentOutputChars: number;
+	currentThinkingChars: number;
+	currentUsage?: Usage;
+	currentError?: string;
+};
+
 function getConfigFile(): string {
 	const baseDirectory =
 		process.env.LOCALAPPDATA ??
@@ -45,6 +84,12 @@ function getConfigFile(): string {
 
 function modelLabel(config: Pick<CompactionModelConfig, "provider" | "model">): string {
 	return `${config.provider}/${config.model}`;
+}
+
+function progressModelLabel(value: string): string {
+	const separator = value.indexOf("/");
+	if (separator <= 0) return value;
+	return `${value.slice(separator + 1)} [${value.slice(0, separator)}]`;
 }
 
 function cleanString(value: unknown): string | undefined {
@@ -96,6 +141,248 @@ function formatTokens(value: unknown): string {
 	if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
 	if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
 	return String(Math.round(value));
+}
+
+function formatCompactTokens(value: number): string {
+	if (!Number.isFinite(value) || value <= 0) return "0";
+	if (value < 1_000) return String(Math.round(value));
+
+	const thousands = value / 1_000;
+	if (thousands < 10) return `${Number(thousands.toFixed(1))}k`;
+	return `${Math.round(thousands)}k`;
+}
+function shortenText(value: string, maxLength: number): string {
+	const oneLine = value.replace(/\s+/g, " ").trim();
+	return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, maxLength - 1)}…`;
+}
+
+function getProgressPurpose(preparation: any, purposeIndex: number): string {
+	if (!preparation.isSplitTurn) return "history summary";
+	if (preparation.messagesToSummarize.length > 0 && purposeIndex === 1) return "history summary";
+	return "split-turn prefix";
+}
+
+function safeDeltaChars(delta: unknown): number {
+	return typeof delta === "string" ? delta.length : 0;
+}
+
+function safeProgressChars(value: number): number {
+	return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function estimateProgressTokens(charCount: number): number {
+	return Math.ceil(safeProgressChars(charCount) / 4);
+}
+
+function progressContent(state: CompactionProgress, theme: Theme): string[] {
+	const complete = state.currentTerminal === "done";
+	const frame = complete
+		? "✓"
+		: PROGRESS_FRAMES[state.spinnerIndex % PROGRESS_FRAMES.length] ?? PROGRESS_FRAMES[0];
+	const currentOutputEstimate = estimateProgressTokens(
+		safeProgressChars(state.currentOutputChars) + safeProgressChars(state.currentThinkingChars),
+	);
+	const finalUsage = complete ? state.currentUsage : undefined;
+	const currentOutput = finalUsage && Number.isFinite(finalUsage.output) && (finalUsage.output > 0 || currentOutputEstimate === 0)
+		? finalUsage.output
+		: currentOutputEstimate;
+	const outputDisplay = currentOutput > 0
+		? theme.fg("dim", ` · ↓${formatCompactTokens(currentOutput)}`)
+		: "";
+	const errorLine = state.currentError
+		? theme.fg("warning", `⚠ ${shortenText(state.currentError, 100)}`)
+		: undefined;
+
+	return [
+		`${theme.fg("accent", `${frame} ${theme.bold("Compaction")}`)}${outputDisplay}`,
+		`${theme.fg("accent", progressModelLabel(state.model))} ${theme.fg("dim", "· reasoning off")}`,
+		...(errorLine ? [errorLine] : []),
+	];
+}
+
+function padToWidth(value: string, width: number): string {
+	const truncated = truncateToWidth(value, width, "");
+	return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
+}
+
+function progressWidgetComponent(state: CompactionProgress, theme: Theme) {
+	return {
+		render(width: number): string[] {
+			if (width < 8) return progressContent(state, theme).map((line) => truncateToWidth(line, width, ""));
+
+			const contentWidth = Math.max(1, width - 4);
+			const border = theme.fg("borderAccent", "│");
+			const horizontal = theme.fg("borderAccent", "─".repeat(contentWidth + 2));
+			const top = theme.fg("borderAccent", "╭") + horizontal + theme.fg("borderAccent", "╮");
+			const bottom = theme.fg("borderAccent", "╰") + horizontal + theme.fg("borderAccent", "╯");
+			const content = progressContent(state, theme).map(
+				(line) => `${border} ${padToWidth(line, contentWidth)} ${border}`,
+			);
+
+			return [top, ...content, bottom];
+		},
+		invalidate() {},
+	};
+}
+
+function setProgressWidget(state: CompactionProgress): void {
+	if (!state.active || !state.ctx.hasUI || state.ctx.mode !== "tui") return;
+
+	const signature = JSON.stringify([
+		state.spinnerIndex,
+		state.currentPhase,
+		state.currentOutputChars,
+		state.currentThinkingChars,
+		state.currentUsage?.output,
+		state.currentUsage?.input,
+		state.currentError,
+		state.requestCount,
+	]);
+	if (signature === state.lastWidgetSignature) return;
+	state.lastWidgetSignature = signature;
+
+	try {
+		state.ctx.ui.setWidget(PROGRESS_WIDGET_KEY, (_tui: any, theme: Theme) => progressWidgetComponent(state, theme));
+	} catch (error) {
+		if (!(error instanceof Error) || !error.message.includes("This extension ctx is stale")) {
+			console.error(error);
+		}
+	}
+}
+
+function createProgress(
+	ctx: any,
+	preparation: any,
+	reason: string,
+	model: any,
+	modelName: string,
+): CompactionProgress {
+	const state: CompactionProgress = {
+		ctx,
+		preparation,
+		reason,
+		model: modelName,
+		contextWindow: model.contextWindow ?? 0,
+		estimatedInputTokens: estimateSummaryInputTokens(preparation),
+		startedAt: Date.now(),
+		active: true,
+		spinnerIndex: 0,
+		requestCount: 0,
+		purposeIndex: 0,
+		currentPurpose: "preparing",
+		currentTerminal: undefined,
+		currentPhase: "preparing summary request",
+		currentOutputChars: 0,
+		currentThinkingChars: 0,
+	};
+
+	if (ctx.hasUI && ctx.mode === "tui") {
+		setProgressWidget(state);
+		state.timer = setInterval(() => {
+			state.spinnerIndex += 1;
+			setProgressWidget(state);
+		}, PROGRESS_UPDATE_INTERVAL_MS);
+	}
+
+	return state;
+}
+
+function handleProgressEvent(state: CompactionProgress, event: AssistantMessageEvent): void {
+	switch (event.type) {
+		case "start":
+			state.currentPhase = `waiting for ${state.currentPurpose}`;
+			break;
+		case "text_delta":
+			state.currentOutputChars += safeDeltaChars(event.delta);
+			state.currentPhase = `streaming ${state.currentPurpose}`;
+			break;
+		case "thinking_delta":
+			state.currentThinkingChars += safeDeltaChars(event.delta);
+			state.currentPhase = `reasoning ${state.currentPurpose}`;
+			break;
+		case "done": {
+			state.currentTerminal = "done";
+			state.currentUsage = event.message.usage;
+			state.currentPhase = `${state.currentPurpose} complete`;
+			state.currentError = undefined;
+			break;
+		}
+		case "error":
+			state.currentTerminal = "error";
+			state.currentUsage = event.error.usage;
+			state.currentError = event.error.errorMessage || event.reason;
+			state.currentPhase = `${state.currentPurpose} failed`;
+			break;
+		default:
+			break;
+	}
+
+	setProgressWidget(state);
+}
+
+function createProgressStreamFn(state: CompactionProgress): any {
+	return (model: any, context: any, options: any) => {
+		const retrying = state.currentTerminal === "error";
+		if (!retrying) state.purposeIndex += 1;
+		state.currentPurpose = getProgressPurpose(state.preparation, state.purposeIndex);
+		state.currentPhase = `${retrying ? "retrying" : "starting"} ${state.currentPurpose}`;
+		state.requestCount += 1;
+		state.currentOutputChars = 0;
+		state.currentThinkingChars = 0;
+		state.currentUsage = undefined;
+		state.currentError = undefined;
+		state.currentTerminal = undefined;
+		setProgressWidget(state);
+
+		let stream: any;
+		try {
+			stream = streamSimple(model, context, options);
+		} catch (error) {
+			state.currentTerminal = "error";
+			state.currentPhase = `${state.currentPurpose} failed`;
+			state.currentError = error instanceof Error ? error.message : String(error);
+			setProgressWidget(state);
+			throw error;
+		}
+
+		const push = stream.push.bind(stream);
+		stream.push = (event: AssistantMessageEvent) => {
+			handleProgressEvent(state, event);
+			push(event);
+		};
+		return stream;
+	};
+}
+
+function clearProgressWidget(state: CompactionProgress): void {
+	state.active = false;
+	state.finalClearTimer = undefined;
+	if (!state.ctx.hasUI || state.ctx.mode !== "tui") return;
+	try {
+		state.ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
+	} catch (error) {
+		if (!(error instanceof Error) || !error.message.includes("This extension ctx is stale")) {
+			console.error(error);
+		}
+	}
+}
+
+function clearProgress(state: CompactionProgress | undefined, showFinal = false): void {
+	if (!state) return;
+	if (state.timer) clearInterval(state.timer);
+	state.timer = undefined;
+	if (state.finalClearTimer) clearTimeout(state.finalClearTimer);
+	state.finalClearTimer = undefined;
+
+	const showFinalWidget = showFinal && state.currentTerminal === "done" && state.ctx.hasUI && state.ctx.mode === "tui";
+	if (showFinalWidget) {
+		// Let the terminal render the provider's exact final usage before removing
+		// the transient widget. This is short enough not to become a status panel.
+		state.finalClearTimer = setTimeout(() => clearProgressWidget(state), FINAL_PROGRESS_HOLD_MS);
+		return;
+	}
+
+	clearProgressWidget(state);
 }
 
 function modelSearchText(item: ModelItem): string {
@@ -301,7 +588,7 @@ function checkModelFits(preparation: any, model: any): { ok: true } | { ok: fals
 		message:
 			`Configured model ${model.provider}/${model.id} may not fit this compaction ` +
 			`(~${inputTokens.toLocaleString()} input + ${outputTokens.toLocaleString()} output > ` +
-			`${contextWindow.toLocaleString()} context). Falling back to Pi's default model.`,
+			`${contextWindow.toLocaleString()} context)`,
 	};
 }
 
@@ -382,13 +669,14 @@ async function showStatus(ctx: any): Promise<void> {
 
 export default function compactionModelExtension(pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
+		let configuredModel: string | undefined;
 		try {
 			const config = readConfig();
 
 			// No config means "off": let Pi run its normal current-model compaction.
 			if (!config) return;
 
-			const configuredModel = modelLabel(config);
+			configuredModel = modelLabel(config);
 			const model = ctx.modelRegistry.find(config.provider, config.model);
 			if (!model) {
 				notifyFallback(ctx, "the configured model was not found", event.reason, configuredModel);
@@ -418,24 +706,32 @@ export default function compactionModelExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const result = await compact(
-				event.preparation,
-				model,
-				auth.apiKey,
-				auth.headers,
-				event.customInstructions,
-				event.signal,
-				"off",
-				undefined,
-				auth.env,
-			);
-			return { compaction: result as CompactionResult };
+			const progress = createProgress(ctx, event.preparation, event.reason, model, configuredModel);
+			let completed = false;
+			try {
+				const result = await compact(
+					event.preparation,
+					model,
+					auth.apiKey,
+					auth.headers,
+					event.customInstructions,
+					event.signal,
+					"off",
+					createProgressStreamFn(progress) as any,
+					auth.env,
+				);
+				completed = true;
+				return { compaction: result as CompactionResult };
+			} finally {
+				clearProgress(progress, completed);
+			}
 		} catch (error) {
 			if (!event.signal.aborted) {
 				notifyFallback(
 					ctx,
 					`the override request failed (${error instanceof Error ? error.message : String(error)})`,
 					event.reason,
+					configuredModel,
 				);
 			}
 			return;
