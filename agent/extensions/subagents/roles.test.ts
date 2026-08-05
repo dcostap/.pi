@@ -30,11 +30,14 @@ Prompt
 `, "review.md")).toThrow("unknown frontmatter key unexpected");
 	});
 
-	test("discovers the external review role", async () => {
+	test("discovers the external review roles", async () => {
 		const roles = await loadSubagentRoles(path.join(path.dirname(fileURLToPath(import.meta.url)), "roles"));
-		const review = roles.get("review");
+		const review = roles.get("code-review");
 		expect(review?.description).toContain("read-only code review");
 		expect(review?.prompt).toContain("# Review Guidelines");
+		const simplifier = roles.get("code-simplifier");
+		expect(simplifier?.description).toContain("simplification review");
+		expect(simplifier?.prompt).toContain("# Code Simplification Review Guidelines");
 	});
 
 	test("loads unique legacy profile files as role aliases while preferring migrated roles", async () => {
