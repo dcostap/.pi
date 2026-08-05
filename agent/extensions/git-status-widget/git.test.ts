@@ -1,7 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
 	collectGitSnapshot,
 	parseNumstat,
@@ -28,16 +25,10 @@ describe("porcelain v2 parsing", () => {
 		);
 
 		expect(parsed.branch).toBe("feature/status");
-		expect(parsed.entries).toHaveLength(4);
-		expect(parsed.entries[0]?.path).toBe("src/file with spaces.ts");
-		expect(parsed.entries[1]).toMatchObject({
-			path: "src/new name.ts",
-			originalPath: "src/old name.ts",
-			indexStatus: "R",
-			worktreeStatus: ".",
-		});
-		expect(parsed.stagedCount).toBe(2);
-		expect(parsed.unstagedCount).toBe(3);
+		expect(parsed.changeCount).toBe(4);
+		expect(parsed.hasTrackedChanges).toBe(true);
+		expect(parsed.stagedCount).toBe(1);
+		expect(parsed.unstagedCount).toBe(2);
 		expect(parsed.untrackedCount).toBe(1);
 		expect(parsed.conflictedCount).toBe(1);
 	});
@@ -47,7 +38,18 @@ describe("porcelain v2 parsing", () => {
 			"# branch.oid 0123456789abcdef\0# branch.head (detached)\0",
 		);
 		expect(parsed.branch).toBe("detached@0123456");
-		expect(parsed.entries).toEqual([]);
+		expect(parsed.changeCount).toBe(0);
+	});
+
+	test("aggregates large status output without retaining one object per path", () => {
+		const records = Array.from({ length: 50_000 }, (_, index) =>
+			`1 .M N... 100644 100644 100644 aaaaaaa bbbbbbb src/file-${index}.ts\0`,
+		).join("");
+		const parsed = parseStatusPorcelainV2(
+			`# branch.oid 0123456789abcdef\0# branch.head main\0${records}`,
+		);
+		expect(parsed.changeCount).toBe(50_000);
+		expect(parsed.unstagedCount).toBe(50_000);
 	});
 
 	test("handles an unborn branch without inventing a commit", () => {
@@ -68,10 +70,9 @@ describe("numstat parsing", () => {
 
 describe("snapshot collection", () => {
 	test("runs only status for a clean worktree", async () => {
-		const calls: readonly string[][] = [];
-		const mutableCalls = calls as string[][];
+		const calls: string[][] = [];
 		const fakeRunGit: GitRunner = async (args) => {
-			mutableCalls.push([...args]);
+			calls.push([...args]);
 			return "# branch.oid 0123456789abcdef\0# branch.head main\0";
 		};
 
@@ -81,81 +82,47 @@ describe("snapshot collection", () => {
 		expect(calls[0]?.[0]).toBe("status");
 	});
 
-	test("combines one tracked diff with bounded untracked line counts", async () => {
-		const root = await mkdtemp(join(tmpdir(), "git-status-widget-"));
-		await writeFile(join(root, "new file.txt"), "one\ntwo\nthree");
+	test("combines staged and unstaged line activity and marks untracked lines approximate", async () => {
 		const calls: string[][] = [];
 		const fakeRunGit: GitRunner = async (args) => {
 			calls.push([...args]);
 			if (args[0] === "status") {
 				return `# branch.oid 0123456789abcdef\0# branch.head main\0${ORDINARY_RECORD}\0? new file.txt\0`;
 			}
-			if (args.includes("--show-toplevel")) return root;
-			return "5\t2\tsrc/file with spaces.ts\n";
+			return args.includes("--cached")
+				? "2\t1\tsrc/file with spaces.ts\n"
+				: "5\t2\tsrc/file with spaces.ts\n";
 		};
 
-		try {
-			const snapshot = await collectGitSnapshot(root, { runGit: fakeRunGit });
-			expect(snapshot).toMatchObject({ added: 8, removed: 2, lineStatsComplete: true });
-			expect(calls).toHaveLength(3);
-			expect(calls).toContainEqual(["diff", "HEAD", "--numstat", "--"]);
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
+		const snapshot = await collectGitSnapshot("C:/repo", { runGit: fakeRunGit });
+		expect(snapshot).toMatchObject({ added: 7, removed: 3, lineStatsComplete: false });
+		expect(calls).toHaveLength(3);
+		expect(calls).toContainEqual(["diff", "--numstat", "--"]);
+		expect(calls).toContainEqual(["diff", "--cached", "--numstat", "--"]);
 	});
 
 	test("marks line totals incomplete when normal untracked output contains a directory", async () => {
-		const fakeRunGit: GitRunner = async (args) => {
-			if (args[0] === "status") {
-				return "# branch.oid 0123456789abcdef\0# branch.head main\0? generated/\0";
-			}
-			return "C:/repo";
-		};
+		const fakeRunGit: GitRunner = async () =>
+			"# branch.oid 0123456789abcdef\0# branch.head main\0? generated/\0";
 		const snapshot = await collectGitSnapshot("C:/repo", { runGit: fakeRunGit });
 		expect(snapshot.lineStatsComplete).toBe(false);
 	});
 
-	test("resolves porcelain paths from the worktree root when cwd is nested", async () => {
-		const root = await mkdtemp(join(tmpdir(), "git-status-widget-root-"));
-		const nested = join(root, "nested");
-		await mkdir(nested);
-		await writeFile(join(root, "root-file.txt"), "root\nfile\n");
-		const fakeRunGit: GitRunner = async (args) => {
-			if (args[0] === "status") {
-				return "# branch.oid 0123456789abcdef\0# branch.head main\0? root-file.txt\0";
-			}
-			return root;
-		};
-
-		try {
-			const snapshot = await collectGitSnapshot(nested, { runGit: fakeRunGit });
-			expect(snapshot).toMatchObject({ added: 2, lineStatsComplete: true });
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("uses the matching empty tree for an unborn SHA-256 repository", async () => {
+	test("uses the same staged plus unstaged semantics for an unborn repository", async () => {
 		const calls: string[][] = [];
 		const fakeRunGit: GitRunner = async (args) => {
 			calls.push([...args]);
 			if (args[0] === "status") {
-				return "# branch.oid (initial)\0# branch.head main\u00001 A. N... 000000 100644 100644 0000000 aaaaaaa first.txt\0";
+				return "# branch.oid (initial)\0# branch.head main\u00001 AM N... 000000 100644 100644 0000000 aaaaaaa first.txt\0";
 			}
-			if (args.includes("--show-object-format")) return "sha256\n";
-			return "3\t1\tfirst.txt\n";
+			return args.includes("--cached") ? "2\t0\tfirst.txt\n" : "1\t1\tfirst.txt\n";
 		};
 
 		const snapshot = await collectGitSnapshot("C:/repo", { runGit: fakeRunGit });
 		expect(snapshot).toMatchObject({ added: 3, removed: 1 });
 		expect(calls.slice(1)).toEqual([
-			["rev-parse", "--show-object-format"],
-			[
-				"diff",
-				"6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
-				"--numstat",
-				"--",
-			],
+			["diff", "--numstat", "--"],
+			["diff", "--cached", "--numstat", "--"],
 		]);
 	});
 
