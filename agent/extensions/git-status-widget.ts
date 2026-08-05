@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const WIDGET_ID = "git-status-widget";
 const UPDATE_INTERVAL_MS = 2_000;
+const GIT_COMMAND_TIMEOUT_MS = 30_000;
 const GRAY = "\x1b[90m";
 const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
@@ -15,7 +16,7 @@ const RESET = "\x1b[0m";
 async function runGit(args: string[], cwd: string) {
   const { stdout } = await execFileAsync("git", args, {
     cwd,
-    timeout: 2_000,
+    timeout: GIT_COMMAND_TIMEOUT_MS,
     maxBuffer: 1024 * 1024,
   });
   return stdout.trimEnd();
@@ -121,6 +122,8 @@ function isStaleContextError(error: unknown) {
 type WidgetState = {
   active: boolean;
   interval: NodeJS.Timeout | undefined;
+  updateInFlight: boolean;
+  generation: number;
   widgetInitialized: boolean;
   lastWidgetSignature: string | null;
 };
@@ -148,8 +151,8 @@ function setWidget(ctx: ExtensionContext, state: WidgetState, lines: string[] | 
   }
 }
 
-async function updateWidget(ctx: ExtensionContext, state: WidgetState) {
-  if (!state.active) return;
+async function refreshWidget(ctx: ExtensionContext, state: WidgetState, generation: number) {
+  if (!state.active || state.generation !== generation) return;
 
   let cwd: string;
   try {
@@ -171,7 +174,7 @@ async function updateWidget(ctx: ExtensionContext, state: WidgetState) {
       getLineStats(cwd, status),
     ]);
 
-    if (!state.active) return;
+    if (!state.active || state.generation !== generation) return;
 
     const fileLabel = unstagedCount === 1 ? "file" : "files";
     const addedText = `${lineStats.added > 0 ? GREEN : GRAY}+${lineStats.added}`;
@@ -179,41 +182,61 @@ async function updateWidget(ctx: ExtensionContext, state: WidgetState) {
     const text = `${GRAY} ${branch} · ${unstagedCount} unstaged ${fileLabel} · ${addedText}${GRAY} ${removedText}${RESET}`;
     setWidget(ctx, state, [text]);
   } catch {
-    setWidget(ctx, state, undefined);
+    // Keep the last successful status visible while Git is slow or temporarily unavailable.
   }
+}
+
+function updateWidget(ctx: ExtensionContext, state: WidgetState) {
+  if (!state.active || state.updateInFlight) return;
+
+  const generation = state.generation;
+  state.updateInFlight = true;
+  void refreshWidget(ctx, state, generation)
+    .catch((error) => {
+      if (!isStaleContextError(error)) console.error(error);
+    })
+    .finally(() => {
+      if (state.generation === generation) state.updateInFlight = false;
+    });
 }
 
 export default function (pi: ExtensionAPI) {
   const state: WidgetState = {
     active: true,
     interval: undefined,
+    updateInFlight: false,
+    generation: 0,
     widgetInitialized: false,
     lastWidgetSignature: null,
   };
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     state.active = true;
+    state.generation += 1;
+    state.updateInFlight = false;
     state.widgetInitialized = false;
     state.lastWidgetSignature = null;
     if (state.interval) clearInterval(state.interval);
 
-    await updateWidget(ctx, state);
+    updateWidget(ctx, state);
     state.interval = setInterval(() => {
-      void updateWidget(ctx, state);
+      updateWidget(ctx, state);
     }, UPDATE_INTERVAL_MS);
   });
 
-  pi.on("input", async (_event, ctx) => {
-    await updateWidget(ctx, state);
+  pi.on("input", (_event, ctx) => {
+    updateWidget(ctx, state);
     return { action: "continue" };
   });
 
-  pi.on("tool_execution_end", async (_event, ctx) => {
-    await updateWidget(ctx, state);
+  pi.on("tool_execution_end", (_event, ctx) => {
+    updateWidget(ctx, state);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     state.active = false;
+    state.generation += 1;
+    state.updateInFlight = false;
     if (state.interval) {
       clearInterval(state.interval);
       state.interval = undefined;
