@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildPartialCloneArgs, formatGitHubCommitPreview, formatGitHubContentsPreview, GITHUB_GIT_TIMEOUT_MS, parseGitHubUrl } from "./github.ts";
+import { handleGitHubUrl, buildPartialCloneArgs, decodeGitHubContentsText, formatGitHubCommitPreview, formatGitHubContentsPreview, GITHUB_GIT_TIMEOUT_MS, parseGitHubUrl } from "./github.ts";
 import { normalizeUrl, resolveUrl, sanitizeUrlCandidate, thirdPartyFallbackBlockReason, urlDedupeKey } from "./url-routing.ts";
 
 test("sanitizes Markdown wrappers and unbalanced punctuation", () => {
@@ -124,4 +124,38 @@ test("labels truncated or unavailable GitHub API file content", () => {
 	});
 	assert.match(unavailable, /Content unavailable/);
 	assert.match(unavailable, /Download URL:/);
+});
+
+test("decodes GitHub API file content for focused answers", () => {
+	const source = "module intellij.platform.editor";
+	const contents = {
+		type: "file",
+		encoding: "base64",
+		content: Buffer.from(source).toString("base64"),
+	};
+	assert.equal(decodeGitHubContentsText(contents), source);
+	assert.equal(decodeGitHubContentsText({ type: "file", content: source }), source);
+});
+
+test("returns decoded GitHub tree file text separately from its preview", async () => {
+	const source = "intellij.platform.editor\nintellij.platform.core\n";
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response(JSON.stringify({
+		type: "file",
+		name: "module.iml",
+		size: Buffer.byteLength(source),
+		encoding: "base64",
+		content: Buffer.from(source).toString("base64"),
+	}), { status: 200, headers: { "content-type": "application/json" } });
+
+	try {
+		const result = await handleGitHubUrl({ maxTextResponseBytes: 1024 } as any, "https://github.com/owner/repo/tree/main/module.iml");
+		assert.equal(result.content, source);
+		assert.equal(result.contentKind, "text");
+		assert.equal(result.contentTruncated, false);
+		assert.match(result.preview, /File: module\.iml/);
+		assert.match(result.preview, /Source: GitHub Contents API/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 });

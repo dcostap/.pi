@@ -33,8 +33,8 @@ Pi extension for:
 - a small adapter registry owns GitHub/YouTube special handling and rewrites supported Apple Developer pages to Sosumi Markdown while preserving the Apple canonical URL; cross-origin rewrites do not forward query values
 - oversized results auto-summarize with:
   - the configured `fastCheap` model role (`/fast-model status`, `/fast-model set provider/model`)
-- if `fetch_url` gets a `prompt`, it answers from extracted content; weak extraction escalates to Firecrawl when configured
-- full artifacts always saved locally in per-request, atomically unique directories
+- if `fetch_url` gets a `prompt`, it answers from the bounded fetched text or listing, including GitHub-special payloads; weak ordinary extraction may escalate to Firecrawl when configured
+- fetch artifacts are saved locally in per-request, atomically unique directories; focused GitHub payloads are available as `content.txt`, while sparse-cache paths are supplemental and may change after another checkout
 - Firecrawl crawl failures/cancellations are errors, and crawl startup plus polling share one deadline
 - fetched content is explicitly framed as untrusted data for fast-model quality checks and summaries
 

@@ -154,6 +154,15 @@ export type GitHubResolution = {
 	requestedPath?: string;
 	localPath?: string;
 	preview: string;
+	/**
+	 * Bounded source material for focused questions. This is deliberately
+	 * separate from `preview`: previews contain transport/path metadata while
+	 * this value contains the actual file text when it is available.
+	 */
+	content: string;
+	contentKind: "api" | "text";
+	contentTruncated?: boolean;
+	contentUnavailable?: boolean;
 };
 
 type ParsedGitHubUrl =
@@ -214,10 +223,10 @@ async function git(args: string[], cwd?: string, signal?: AbortSignal) {
 		windowsHide: true,
 		maxBuffer: 10 * 1024 * 1024,
 		signal,
-		timeout: GITHUB_GIT_TIMEOUT_MS,
+		 timeout: GITHUB_GIT_TIMEOUT_MS,
 		env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" },
 	} as any);
-	return stdout.trim();
+	return String(stdout).trim();
 }
 
 export function buildPartialCloneArgs(owner: string, repo: string, targetDir: string): string[] {
@@ -333,6 +342,73 @@ function encodeApiPath(path: string): string {
 	return path.split("/").filter(Boolean).map(encodeURIComponent).join("/");
 }
 
+const GITHUB_CONTENT_PREVIEW_CHARS = 20_000;
+
+function limitUtf8Text(text: string, maxBytes: number): { text: string; truncated: boolean } {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.byteLength <= maxBytes) return { text, truncated: false };
+	return {
+		text: bytes.subarray(0, Math.max(1, maxBytes)).toString("utf8"),
+		truncated: true,
+	};
+}
+
+function boundFormattedPayload(text: string, maxBytes: number): { text: string; truncated: boolean } {
+	const bounded = limitUtf8Text(text, maxBytes);
+	return bounded.truncated
+		? {
+				text: `${bounded.text}\n\n[GitHub payload truncated at ${maxBytes.toLocaleString()} bytes]`,
+				truncated: true,
+			}
+		: bounded;
+}
+
+export function decodeGitHubContentsText(contents: any): string {
+	if (typeof contents?.content !== "string") return "";
+	if (contents.encoding === "base64") {
+		try {
+			return Buffer.from(contents.content.replace(/\s+/g, ""), "base64").toString("utf8");
+		} catch {
+			return "";
+		}
+	}
+	return contents.content;
+}
+
+function getGitHubContentsPayload(contents: any, maxBytes: number, preview: string): {
+	content: string;
+	contentKind: "api" | "text";
+	contentTruncated: boolean;
+	contentUnavailable: boolean;
+} {
+	if (Array.isArray(contents)) {
+		return {
+			content: preview,
+			contentKind: "api",
+			contentTruncated: false,
+			contentUnavailable: false,
+		};
+	}
+
+	const decoded = decodeGitHubContentsText(contents);
+	if (!decoded && contents?.type === "file" && Number(contents?.size) !== 0) {
+		return {
+			content: preview,
+			contentKind: "api",
+			contentTruncated: false,
+			contentUnavailable: true,
+		};
+	}
+
+	const bounded = limitUtf8Text(decoded, maxBytes);
+	return {
+		content: bounded.text,
+		contentKind: "text",
+		contentTruncated: bounded.truncated,
+		contentUnavailable: false,
+	};
+}
+
 export function formatGitHubContentsPreview(
 	owner: string,
 	repo: string,
@@ -358,11 +434,8 @@ export function formatGitHubContentsPreview(
 		].filter(Boolean).join("\n");
 	}
 
-	const encoded = typeof contents?.content === "string" ? contents.content.replace(/\s+/g, "") : "";
-	const decoded = contents?.encoding === "base64" && encoded
-		? Buffer.from(encoded, "base64").toString("utf8")
-		: "";
-	const text = decoded.slice(0, 20_000);
+	const decoded = decodeGitHubContentsText(contents);
+	const text = decoded.slice(0, GITHUB_CONTENT_PREVIEW_CHARS);
 	const truncated = decoded.length > text.length;
 	const unavailable = !decoded && contents?.type === "file";
 	return [
@@ -410,6 +483,8 @@ async function handleGitHubTree(
 		onProgress?.(`Retrying ${resolved.relPath || "/"} through the GitHub Contents API at ${resolved.ref}...`);
 		contents = await fetchContents(resolved.ref, resolved.relPath);
 	}
+	const preview = formatGitHubContentsPreview(parsed.owner, parsed.repo, resolved.ref, resolved.relPath, contents);
+	const payload = getGitHubContentsPayload(contents, config.maxTextResponseBytes, preview);
 	return {
 		kind: "github",
 		url,
@@ -419,7 +494,11 @@ async function handleGitHubTree(
 		cache: "none",
 		ref: resolved.ref,
 		requestedPath: resolved.relPath || undefined,
-		preview: formatGitHubContentsPreview(parsed.owner, parsed.repo, resolved.ref, resolved.relPath, contents),
+		preview,
+		content: payload.content,
+		contentKind: payload.contentKind,
+		contentTruncated: payload.contentTruncated,
+		contentUnavailable: payload.contentUnavailable,
 	};
 }
 
@@ -486,6 +565,9 @@ async function handleGitHubCommit(
 		config.maxTextResponseBytes,
 		signal,
 	);
+	const formatted = formatGitHubCommitPreview(parsed.owner, parsed.repo, commit, url);
+	const bounded = boundFormattedPayload(formatted, config.maxTextResponseBytes);
+	const preview = bounded.text;
 	return {
 		kind: "github",
 		url,
@@ -494,7 +576,10 @@ async function handleGitHubCommit(
 		strategy: "github-api",
 		cache: "none",
 		ref: commit?.sha || parsed.ref,
-		preview: formatGitHubCommitPreview(parsed.owner, parsed.repo, commit, url),
+		preview,
+		content: preview,
+		contentKind: "api",
+		contentTruncated: bounded.truncated || preview.includes("Diff preview truncated"),
 	};
 }
 
@@ -515,7 +600,7 @@ async function handleGitHubPullOrIssue(
 			config.maxTextResponseBytes,
 			signal,
 		);
-		const preview = [
+		const formatted = [
 			`Pull request: ${parsed.owner}/${parsed.repo}#${parsed.number}`,
 			`Title: ${pr.title}`,
 			`State: ${pr.state}${pr.merged ? " (merged)" : ""}`,
@@ -530,6 +615,8 @@ async function handleGitHubPullOrIssue(
 			"",
 			...formatChangedFiles(files),
 		].join("\n");
+		const bounded = boundFormattedPayload(formatted, config.maxTextResponseBytes);
+		const preview = bounded.text;
 		return {
 			kind: "github",
 			url,
@@ -538,6 +625,9 @@ async function handleGitHubPullOrIssue(
 			strategy: "github-api",
 			cache: "none",
 			preview,
+			content: preview,
+			contentKind: "api",
+			contentTruncated: bounded.truncated || preview.includes("Diff preview truncated"),
 		};
 	}
 
@@ -551,7 +641,7 @@ async function handleGitHubPullOrIssue(
 		config.maxTextResponseBytes,
 		signal,
 	);
-	const preview = [
+	const formatted = [
 		`Issue: ${parsed.owner}/${parsed.repo}#${parsed.number}`,
 		`Title: ${issue.title}`,
 		`State: ${issue.state}`,
@@ -563,6 +653,8 @@ async function handleGitHubPullOrIssue(
 		comments.length ? "\nRecent comments:" : "",
 		...comments.map((comment) => `\n${formatUser(comment.user)} at ${comment.created_at}:\n${comment.body || "(empty)"}`),
 	].join("\n");
+	const bounded = boundFormattedPayload(formatted, config.maxTextResponseBytes);
+	const preview = bounded.text;
 	return {
 		kind: "github",
 		url,
@@ -571,6 +663,9 @@ async function handleGitHubPullOrIssue(
 		strategy: "github-api",
 		cache: "none",
 		preview,
+		content: preview,
+		contentKind: "api",
+		contentTruncated: bounded.truncated,
 	};
 }
 
@@ -600,21 +695,52 @@ export async function handleGitHubUrl(config: ExtensionConfig, url: string, onPr
 
 		const localPath = resolved.relPath ? join(repoDir, resolved.relPath) : repoDir;
 		let preview = "";
+		let content = "";
+		let contentKind: "api" | "text" = "api";
+		let contentTruncated = false;
+		let contentUnavailable = false;
 		if (!resolved.relPath) {
+			const entries = listTree(repoDir, 140, 1);
 			preview = [
 				`Repository: ${parsed.owner}/${parsed.repo}`,
 				`Ref: ${resolved.ref}`,
-				`Local path: ${repoDir}`,
+				`Cache path: ${repoDir}`,
 				"Checkout: shallow, blob-filtered, sparse (top-level files only)",
 				"",
-				...listTree(repoDir, 140, 1),
+				...entries,
+				entries.length >= 140 ? "\n[cache listing limited to 140 entries]" : "",
 			].join("\n");
+			content = preview;
 		} else if (existsSync(localPath) && statSync(localPath).isDirectory()) {
-			preview = [`Directory: ${resolved.relPath}`, `Ref: ${resolved.ref}`, `Local path: ${localPath}`, "", listTree(localPath, 140, 2).join("\n")].join("\n");
+			const entries = listTree(localPath, 140, 2);
+			preview = [
+				`Directory: ${resolved.relPath}`,
+				`Ref: ${resolved.ref}`,
+				`Cache path: ${localPath}`,
+				"",
+				entries.join("\n"),
+				entries.length >= 140 ? "\n[cache listing limited to 140 entries]" : "",
+			].join("\n");
+			content = preview;
 		} else {
 			onProgress?.(`Reading ${resolved.relPath} from ${sourceUrl.owner}/${sourceUrl.repo}...`);
 			const text = readMaybe(localPath) ?? (await git(["show", `${resolved.ref}:${resolved.relPath}`], repoDir, signal).catch(() => ""));
-			preview = [`File: ${resolved.relPath}`, `Ref: ${resolved.ref}`, `Local path: ${localPath}`, "", text.slice(0, 20000)].join("\n");
+			const bounded = limitUtf8Text(text, config.maxTextResponseBytes);
+			const displayText = text.slice(0, GITHUB_CONTENT_PREVIEW_CHARS);
+			preview = [
+				`File: ${resolved.relPath}`,
+				`Ref: ${resolved.ref}`,
+				`Cache path: ${localPath}`,
+				"",
+				displayText,
+				displayText.length < text.length
+					? `\n[GitHub sparse file preview truncated at ${GITHUB_CONTENT_PREVIEW_CHARS.toLocaleString()} characters; bounded answer content has ${bounded.text.length.toLocaleString()} characters]`
+					: "",
+			].filter(Boolean).join("\n");
+			content = bounded.text;
+			contentKind = "text";
+			contentTruncated = bounded.truncated;
+			contentUnavailable = !existsSync(localPath) && !text;
 		}
 
 		return {
@@ -629,6 +755,10 @@ export async function handleGitHubUrl(config: ExtensionConfig, url: string, onPr
 			requestedPath: resolved.relPath || undefined,
 			localPath,
 			preview,
+			content,
+			contentKind,
+			contentTruncated,
+			contentUnavailable,
 		};
 	});
 }

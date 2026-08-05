@@ -13,7 +13,7 @@ import { assessWeakness, resolveBodyContentType } from "./quality-signals.ts";
 import { readResponseBuffer, readResponseText, ResponseSizeLimitError } from "./response-body.ts";
 import { processExtractedContentWithSpark } from "./summarize.ts";
 import { resolveUrl, thirdPartyFallbackBlockReason, type UrlResolution } from "./url-routing.ts";
-import { makeArtifactDir, saveBuffer, saveText, safeName, stripMarkdown } from "./utils.ts";
+import { makeArtifactDir, saveBuffer, saveJson, saveText, safeName, stripMarkdown } from "./utils.ts";
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const execFileAsync = promisify(execFile);
@@ -901,6 +901,9 @@ async function assessCandidate(
 		contentKind?: "api" | "binary" | "html" | "pdf" | "text" | "unknown";
 		method?: string;
 		headers?: Record<string, string>;
+		contentTruncated?: boolean;
+		sourcePath?: string;
+		artifactPath?: string;
 	},
 	onUpdate?: (update: any) => void,
 ): Promise<CandidateAssessment> {
@@ -932,7 +935,45 @@ export async function fetchUrl(
 			(message: string) => onUpdate?.({ content: [{ type: "text", text: message }] }),
 			signal,
 		);
-		const details = {
+		const content = gh.content;
+		const artifactDir = makeArtifactDir(config.fetchesDir, "fetch", route.canonicalUrl);
+		const files: Record<string, string> = {
+			preview: saveText(join(artifactDir, "github-preview.txt"), gh.preview),
+			content: saveText(join(artifactDir, "content.txt"), content),
+		};
+		const metadataPath = join(artifactDir, "metadata.json");
+		files.metadata = metadataPath;
+
+		let answer: string | undefined;
+		let answerQuality: "OK" | "WEAK" | undefined;
+		let answerQualityReason: string | undefined;
+		let answerModel: string | undefined;
+		if (prompt) {
+			onUpdate?.({ content: [{ type: "text", text: "Answering focused question from GitHub payload..." }] });
+			const focused = await processExtractedContentWithSpark(
+				content,
+				ctx,
+				gh.contentUnavailable ? ["github-content-unavailable"] : [],
+				signal,
+				prompt,
+				{
+					url: route.canonicalUrl,
+					finalUrl: route.fetchUrl,
+					contentType: gh.contentKind === "text" ? "text/plain" : "application/json",
+					contentKind: gh.contentKind,
+					method: "github",
+					contentTruncated: gh.contentTruncated,
+					sourcePath: gh.localPath || gh.requestedPath,
+					artifactPath: files.content,
+				},
+			);
+			answerQuality = focused.quality;
+			answerQualityReason = focused.reason;
+			answerModel = focused.model;
+			if (focused.quality === "OK" && focused.promptAnswer?.trim()) answer = focused.promptAnswer.trim();
+		}
+
+		const baseDetails = {
 			method: gh.kind,
 			url: route.canonicalUrl,
 			requestedUrl: route.requestedUrl,
@@ -942,16 +983,43 @@ export async function fetchUrl(
 			adapterId: route.adapterId,
 			strategy: gh.strategy,
 			cache: gh.cache,
-			fetchMs: Date.now() - githubStartedAt,
 			owner: gh.owner,
 			repo: gh.repo,
 			repoDir: gh.repoDir,
 			localPath: gh.localPath,
+			cachePath: gh.localPath,
 			ref: gh.ref,
 			requestedPath: gh.requestedPath,
 		};
+		const details = {
+			...baseDetails,
+			fetchMs: Date.now() - githubStartedAt,
+			contentKind: gh.contentKind,
+			contentChars: content.length,
+			contentTruncated: Boolean(gh.contentTruncated),
+			contentUnavailable: Boolean(gh.contentUnavailable),
+			quality: answerQuality,
+			qualityReason: answerQualityReason,
+			answer,
+			answerModel,
+			prompt,
+			outputMode: answer ? "answer" : "preview",
+			artifactDir,
+			files,
+		};
+		saveJson(metadataPath, details);
+		const artifactLines = Object.entries(files).map(([key, value]) => `- ${key}: ${value}`);
+		const output = [
+			gh.preview,
+			answer ? `\nAnswer:\n\n${answer}` : undefined,
+			prompt && !answer
+				? `\nNote:\n\nFocused answer unavailable; ${gh.contentUnavailable ? "the GitHub API did not provide the file body, so inspect the download URL or " : "inspect "}the bounded payload artifact at ${files.content}.`
+				: undefined,
+			"\nArtifacts:",
+			...artifactLines,
+		].filter(Boolean).join("\n");
 		return {
-			text: gh.preview,
+			text: output,
 			details,
 		};
 	}
