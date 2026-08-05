@@ -1,5 +1,5 @@
 ---
-name: review
+name: code-review
 description: Independent read-only code review using the standard review rubric.
 ---
 # Review Guidelines

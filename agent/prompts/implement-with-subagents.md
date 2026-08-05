@@ -1,0 +1,5 @@
+Go ahead and start the implementation, as robustly as possible. 
+Upon finishing each major milestone, while all the milestone code changes are still unstaged and uncommitted, launch 2 review subagents with openai-codex luna model at max reasoning (point the reviewers to git pending changes). One must be a general review subagent, the other must be a simplifier subagent. 
+Then, act on the review findings, address them as needed, always at your own discretion, then commit and continue onwards with next milestone. Keep doing this until you are fully finished, don't ever stop unless something major comes up that requires user's feedback. 
+As a special rule, upon finishing the very last milestone, launch 1 simplifier subagent and 3 general review subagents, and point them to the entire set of both git pending changes and the previous milestones' commits. They will do a thorough review of the entire implementation. Good luck and godspeed.
+If there are pending git changes currently, warn the user. We'd prefer to start the implementation with a clean git status.
