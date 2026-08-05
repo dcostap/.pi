@@ -15,7 +15,7 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "../_shared/conversation-transcript.ts";
 import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
@@ -36,6 +36,7 @@ import { loadSubagentRoles, type SubagentRole } from "./roles.ts";
 import { applyRuntimeStatusEvent } from "./runtime-events.ts";
 import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
+import { createSpinnerTicker, spinnerFrame } from "../_shared/spinner.ts";
 import { buildVisibleTree } from "./tree.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
@@ -1659,6 +1660,9 @@ function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Them
 		}
 		const record = item.record;
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
+		const glyph = state === "running" || state === "starting" || state === "stopping"
+			? spinnerFrame(now)
+			: stateGlyph(state);
 		const elapsedFrom = record.activeTools.size > 0
 			? Math.min(...[...record.activeTools.values()].map((tool) => tool.startedAt))
 			: record.startedAt;
@@ -1673,7 +1677,7 @@ function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Them
 		return {
 			indent: theme.fg("dim", prefix),
 			connector: theme.fg("dim", connector),
-			state: styledState(state, theme),
+			state: styledState(state, theme, glyph),
 			id: theme.fg("accent", record.id),
 			role: record.role && batches.find((batch) => batch.id === record.batchId)?.role !== record.role ? theme.fg("accent", `[${record.role}]`) : "",
 			title: theme.fg("muted", oneLine(record.title, 70)),
@@ -1690,13 +1694,19 @@ function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Them
 	return [header, ...renderedRows];
 }
 
-function widgetComponent(records: AgentRecord[], batches: BatchRecord[], theme: Theme) {
+function widgetComponent(records: AgentRecord[], batches: BatchRecord[], theme: Theme, tui?: Pick<TUI, "requestRender">) {
+	const ticker = tui && records.some((record) => record.state === "running" || record.state === "starting" || record.state === "stopping")
+		? createSpinnerTicker(() => tui.requestRender())
+		: undefined;
 	return {
 		render(width: number): string[] {
 			const contentWidth = Math.max(0, width - 1);
 			return widgetLines(records, batches, theme, Date.now(), contentWidth).map((line) => truncateToWidth(` ${line}`, width));
 		},
 		invalidate() {},
+		dispose() {
+			ticker?.dispose();
+		},
 	};
 }
 
@@ -1952,7 +1962,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		latestCtx.ui.setWidget(WIDGET_ID, (_tui, theme) => widgetComponent(records, batches, theme));
+		latestCtx.ui.setWidget(WIDGET_ID, (tui, theme) => widgetComponent(records, batches, theme, tui));
 		const hasActive = records.some(isActive);
 		const hasRecentFinished = records.some((record) => isRecentlyFinished(record, Date.now()));
 		if ((hasActive || hasRecentFinished) && !widgetTimer) widgetTimer = setInterval(refreshWidget, 1_000);

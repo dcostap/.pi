@@ -53,7 +53,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		if (!ctx || ctx.mode !== "tui" || shuttingDown) return;
 		const running = manager?.list().filter((snapshot) => !snapshot.settled) ?? [];
 		ctx.ui.setWidget("background-processes", running.length > 0
-			? (_tui, theme) => processWidgetComponent(running, theme)
+			? (tui, theme) => processWidgetComponent(running, theme, tui)
 			: undefined);
 		widgetLastRefreshAt = Date.now();
 		if (running.length > 0 && !widgetTimer) widgetTimer = setInterval(updateWidget, 1_000);

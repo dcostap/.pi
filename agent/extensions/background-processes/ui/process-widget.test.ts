@@ -44,7 +44,7 @@ describe("background process widget", () => {
 		expect(text).toContain("Tests");
 		expect(text).toContain("12s");
 		expect(text).toContain("42 tests passed");
-		expect(text).toContain("◐ stopping");
+		expect(text).toContain("· stopping");
 		expect(text).toContain("listening on :3000");
 	});
 

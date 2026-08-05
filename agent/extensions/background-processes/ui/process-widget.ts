@@ -1,6 +1,7 @@
 import { formatSize, type Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { renderAlignedTable, type AlignedColumn } from "../../_shared/aligned-table.ts";
+import { createSpinnerTicker, spinnerFrame } from "../../_shared/spinner.ts";
 import { cleanInline, formatDuration } from "../formatting.ts";
 import type { BackgroundProcessSnapshot } from "../manager.ts";
 
@@ -28,9 +29,10 @@ const PROCESS_COLUMNS: readonly AlignedColumn<keyof ProcessWidgetRow>[] = [
 	{ key: "activity", minWidth: 12, maxWidth: 80, shrinkPriority: 4 },
 ];
 
-function stateText(snapshot: BackgroundProcessSnapshot, theme: Theme): string {
-	if (snapshot.killRequested) return theme.fg("warning", "◐ stopping");
-	return theme.fg("accent", "● running");
+function stateText(snapshot: BackgroundProcessSnapshot, theme: Theme, now: number): string {
+	const state = snapshot.killRequested ? "stopping" : "running";
+	const color = snapshot.killRequested ? "warning" : "accent";
+	return theme.fg(color, `${spinnerFrame(now)} ${state}`);
 }
 
 function latestActivity(snapshot: BackgroundProcessSnapshot): string {
@@ -61,7 +63,7 @@ export function processWidgetLines(
 		);
 	const rows = running.map((snapshot, index): ProcessWidgetRow => ({
 		connector: theme.fg("dim", `${index === running.length - 1 ? "└─" : "├─"} `),
-		state: stateText(snapshot, theme),
+		state: stateText(snapshot, theme, now),
 		id: theme.fg("accent", snapshot.id),
 		title: theme.fg("muted", cleanInline(snapshot.title)),
 		duration: theme.fg("dim", formatDuration(Math.max(0, now - snapshot.createdAt))),
@@ -78,7 +80,12 @@ export function processWidgetLines(
 	return [header, ...rendered];
 }
 
-export function processWidgetComponent(snapshots: readonly BackgroundProcessSnapshot[], theme: Theme) {
+export function processWidgetComponent(
+	snapshots: readonly BackgroundProcessSnapshot[],
+	theme: Theme,
+	tui?: Pick<TUI, "requestRender">,
+) {
+	const ticker = tui ? createSpinnerTicker(() => tui.requestRender()) : undefined;
 	return {
 		render(width: number): string[] {
 			const contentWidth = Math.max(0, width - 1);
@@ -86,5 +93,8 @@ export function processWidgetComponent(snapshots: readonly BackgroundProcessSnap
 				.map((line) => truncateToWidth(` ${line}`, width));
 		},
 		invalidate() {},
+		dispose() {
+			ticker?.dispose();
+		},
 	};
 }
