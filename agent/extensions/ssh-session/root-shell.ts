@@ -58,7 +58,13 @@ export class RootShell {
 			shellQuote(`stty -echo; printf '%s\\n' ${shellQuote(readyMarker)}; exec /bin/sh -s`);
 		let rootShell: RootShell | undefined;
 
-		const succeeded = await ctx.ui.custom<boolean>((tui, _theme, _keybindings, done) => {
+		const succeeded = await ctx.ui.custom<boolean>(async (tui, _theme, _keybindings, done) => {
+			// TUI.stop() pauses stdin but intentionally does not drain bytes that are
+			// already queued by the terminal. Drain them before handing stdin to the
+			// remote PTY, otherwise a late Kitty key-release/terminal response (or a
+			// pending key from the previous dialog) becomes a prefix of the first
+			// sudo password attempt.
+			await tui.terminal.drainInput(1000);
 			tui.stop();
 			process.stdout.write("\nOpening a privileged channel. Enter the sudo password once; Ctrl+C cancels.\n\n");
 			let channel: ClientChannel | undefined;
@@ -117,9 +123,9 @@ export class RootShell {
 				channel.stderr.on("data", onStderr);
 				channel.on("error", onError);
 				channel.on("close", onClose);
+				if (process.stdin.isTTY && process.stdin.setRawMode) process.stdin.setRawMode(true);
 				process.stdin.on("data", onInput);
 				process.stdin.resume();
-				if (process.stdin.isTTY && process.stdin.setRawMode) process.stdin.setRawMode(true);
 			});
 
 			return { render: () => [], invalidate: () => {} };
