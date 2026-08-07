@@ -82,7 +82,6 @@ type SubagentDisplayRow = {
 // title/path/activity from stealing the whole terminal. Flexible columns are
 // shrunk first, then low-priority metrics disappear on narrow terminals.
 const SUBAGENT_COLUMNS: readonly AlignedColumn<keyof SubagentDisplayRow>[] = [
-	{ key: "connector", minWidth: 3 },
 	{ key: "state", minWidth: 7 },
 	{ key: "id", minWidth: 8 },
 	{ key: "role", maxWidth: 22, shrinkPriority: 1, optional: true, hidePriority: 1 },
@@ -100,7 +99,7 @@ function renderSubagentTable(rows: SubagentDisplayRow[], width: number): string[
 		gap: "  ",
 		visibleWidth,
 		truncate: (value, cellWidth) => truncateToWidth(value, cellWidth),
-	}, (row) => row.indent);
+	}, (row) => `${row.indent}${row.connector}`);
 }
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];

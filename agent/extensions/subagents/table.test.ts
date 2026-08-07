@@ -44,10 +44,9 @@ describe("aligned subagent tables", () => {
 		expect(rows[0]!.includes("$0.031")).toBe(false);
 	});
 
-	test("keeps data columns aligned while indenting the tree connector", () => {
+	test("indents the first label by tree depth while keeping later columns aligned", () => {
 		type Key = "indent" | "connector" | "state" | "id";
 		const treeColumns: readonly AlignedColumn<Key>[] = [
-			{ key: "connector", minWidth: 3 },
 			{ key: "state" },
 			{ key: "id" },
 		];
@@ -55,11 +54,12 @@ describe("aligned subagent tables", () => {
 			{ indent: "", connector: "└─ ", state: "running", id: "batch-1" },
 			{ indent: "   ", connector: "├─ ", state: "running", id: "sa-1" },
 			{ indent: "   ", connector: "└─ ", state: "running", id: "sa-2" },
-		], 80, treeColumns, { visibleWidth, truncate }, (row) => row.indent);
+		], 80, treeColumns, { visibleWidth, truncate }, (row) => `${row.indent}${row.connector}`);
 
-		expect(rows[0]!.startsWith("└─ ")).toBe(true);
-		expect(rows[1]!.startsWith("   ├─ ")).toBe(true);
-		expect(rows[2]!.startsWith("   └─ ")).toBe(true);
+		expect(rows[0]!.startsWith("└─ running")).toBe(true);
+		expect(rows[1]!.startsWith("   ├─ running")).toBe(true);
+		expect(rows[2]!.startsWith("   └─ running")).toBe(true);
+		expect(rows[0]!.indexOf("running")).toBeLessThan(rows[1]!.indexOf("running"));
 		expect(rows[1]!.indexOf("sa-1")).toBe(rows[0]!.indexOf("batch-1"));
 		expect(rows[2]!.indexOf("sa-2")).toBe(rows[0]!.indexOf("batch-1"));
 	});

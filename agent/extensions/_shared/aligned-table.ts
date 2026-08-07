@@ -151,11 +151,11 @@ export function renderAlignedTable<Key extends string>(
 }
 
 /**
- * Render one aligned table with a variable tree prefix in its first column.
+ * Render one aligned table with a variable tree prefix inside its first cell.
  *
- * The prefix belongs to the tree/connector column, rather than to the whole
- * row. This keeps the data columns aligned while still letting connectors move
- * to the right as the tree gets deeper.
+ * The first cell's content starts at its actual tree depth. Its trailing
+ * padding absorbs the variable prefix width, so every later column remains
+ * aligned across hierarchy levels.
  */
 export function renderIndentedAlignedTable<Key extends string>(
 	rows: readonly Readonly<Record<Key, string>>[],
