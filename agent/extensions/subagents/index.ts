@@ -7,7 +7,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	getMarkdownTheme,
+	getAgentDir,
 	keyHint,
+	CONFIG_DIR_NAME,
 	SessionManager,
 	truncateHead,
 	type ExtensionAPI,
@@ -34,6 +36,12 @@ import {
 } from "./launch-contract.ts";
 import { loadSubagentRoles, type SubagentRole } from "./roles.ts";
 import { applyRuntimeStatusEvent } from "./runtime-events.ts";
+import {
+	DEFAULT_COMPACTION_RESERVE_TOKENS,
+	shouldCancelManagedSubagentCompaction,
+	shouldCompactBeforeContinuation,
+	type ManagedSubagentCompactionPolicy,
+} from "./compaction-policy.ts";
 import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 import { createSpinnerTicker, spinnerFrame } from "../_shared/spinner.ts";
@@ -58,6 +66,7 @@ const RETRY_DELAY_MS = 1_000;
 const MAX_RPC_STDERR_CHARS = 128 * 1024;
 const NESTED_SUBAGENTS_ENABLED = false;
 const RECENT_FINISHED_WIDGET_MS = 60_000;
+const MANUAL_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 
 const WIDGET_ID = "subagents-tree";
 const MAX_WIDGET_NODES = 25;
@@ -235,6 +244,29 @@ type LaunchManifestMetadata = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function loadManagedSubagentCompactionPolicy(cwd: string): Promise<ManagedSubagentCompactionPolicy> {
+	const policy: ManagedSubagentCompactionPolicy = {
+		enabled: true,
+		reserveTokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
+	};
+	const settingsPaths = [
+		path.join(getAgentDir(), "settings.json"),
+		path.join(cwd, CONFIG_DIR_NAME, "settings.json"),
+	];
+	for (const settingsPath of settingsPaths) {
+		try {
+			const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+			if (!isRecord(settings) || !isRecord(settings.compaction)) continue;
+			if (typeof settings.compaction.enabled === "boolean") policy.enabled = settings.compaction.enabled;
+			const reserveTokens = settings.compaction.reserveTokens;
+			if (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens >= 0) policy.reserveTokens = reserveTokens;
+		} catch {
+			// Missing or invalid settings are handled by Pi itself; mirror its defaults here.
+		}
+	}
+	return policy;
 }
 
 function cleanText(value: string): string {
@@ -707,7 +739,10 @@ class SubagentManager {
 	private readonly listeners = new Set<(event: ManagerEvent) => void>();
 	private disposed = false;
 
-	constructor(private readonly cwd: string) {}
+	constructor(
+		private readonly cwd: string,
+		private readonly compactionPolicy: ManagedSubagentCompactionPolicy,
+	) {}
 
 	restore(items: SerializedAgent[], batches: SerializedBatch[] = []): void {
 		for (const batch of batches) {
@@ -952,6 +987,22 @@ class SubagentManager {
 			try {
 				client.start();
 				const exitPromise = client.waitForExit();
+				if (record.runNumber > 1 && this.compactionPolicy.enabled) {
+					try {
+						const stats = await client.send("get_session_stats", {}, 5_000);
+						const contextUsage = stats?.data?.contextUsage;
+						if (shouldCompactBeforeContinuation(record.runNumber, contextUsage, this.compactionPolicy)) {
+							addActivity(record, "compacting deferred context before continuation");
+							this.emit({ kind: "changed", id: record.id });
+							await client.send("compact", {}, MANUAL_COMPACTION_TIMEOUT_MS);
+						}
+					} catch (error) {
+						// Do not lose a continuation because proactive compaction failed. The
+						// normal overflow recovery path remains enabled for the prompt itself.
+						addActivity(record, `deferred compaction unavailable: ${oneLine(error instanceof Error ? error.message : String(error), 100)}`);
+						this.emit({ kind: "changed", id: record.id });
+					}
+				}
 				const prompt = wrapRunPrompt(record.currentRunId!, record.currentPrompt!);
 				await client.send("prompt", { message: prompt });
 				record.state = "running";
@@ -1930,6 +1981,7 @@ async function resolveIds(params: { ids?: string[]; batch_id?: string; input_fil
 export default async function subagentsExtension(pi: ExtensionAPI) {
 	const extensionDir = path.dirname(fileURLToPath(import.meta.url));
 	const roles = await loadSubagentRoles(path.join(extensionDir, "roles"), path.join(extensionDir, "profiles"));
+	const compactionPolicy = await loadManagedSubagentCompactionPolicy(process.cwd());
 	pi.on("before_provider_request", (event) => {
 		const promptCacheKey = process.env[PROMPT_CACHE_ENV];
 		if (!promptCacheKey || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
@@ -1939,7 +1991,15 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	// Temporary gate: the data model and UI support parentAgentId, but managed children remain workers only.
-	if (process.env[MANAGED_CHILD_ENV] === "1" && !NESTED_SUBAGENTS_ENABLED) return;
+	if (process.env[MANAGED_CHILD_ENV] === "1" && !NESTED_SUBAGENTS_ENABLED) {
+		// Keep overflow recovery intact, but do not spend another model call
+		// summarizing a successful answer immediately before this child exits.
+		// A cold continuation performs the deferred compaction before its prompt.
+		pi.on("session_before_compact", (event) => {
+			if (shouldCancelManagedSubagentCompaction(event)) return { cancel: true };
+		});
+		return;
+	}
 
 	let manager: SubagentManager | undefined;
 	let latestCtx: ExtensionContext | undefined;
@@ -2015,7 +2075,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		latestCtx = ctx;
 		if (shuttingDown) throw new Error("Subagent extension is shutting down");
 		if (manager) return manager;
-		manager = new SubagentManager(ctx.cwd);
+		manager = new SubagentManager(ctx.cwd, compactionPolicy);
 		manager.restore(scanSerializedAgents(ctx).map((item) => item.contextWindow
 			? item
 			: { ...item, contextWindow: modelContextWindow(ctx, item.modelRef) }), scanSerializedBatches(ctx));
