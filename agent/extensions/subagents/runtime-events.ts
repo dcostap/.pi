@@ -25,7 +25,7 @@ function applyAssistantStatus(target: RuntimeStatusTarget, message: any): void {
 		return;
 	}
 	if (message.stopReason === "length") {
-		target.error = "Assistant response stopped at the token limit";
+		target.error = "Assistant response was cut short (provider stop reason: length)";
 		return;
 	}
 	if (message.stopReason === "aborted") {

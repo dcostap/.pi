@@ -73,7 +73,7 @@ describe("managed subagent runtime events", () => {
 		expect(status.error).toBe("Assistant run aborted");
 
 		applyRuntimeStatusEvent(status, assistant("length"));
-		expect(status.error).toBe("Assistant response stopped at the token limit");
+		expect(status.error).toBe("Assistant response was cut short (provider stop reason: length)");
 	});
 
 	test("records final provider retry errors and clears them after recovery", () => {

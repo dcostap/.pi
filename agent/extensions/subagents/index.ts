@@ -40,6 +40,7 @@ import {
 	DEFAULT_COMPACTION_RESERVE_TOKENS,
 	shouldCancelManagedSubagentCompaction,
 	shouldCompactBeforeContinuation,
+	shouldContinueManagedSubagentAfterCompaction,
 	type ManagedSubagentCompactionPolicy,
 } from "./compaction-policy.ts";
 import { materializeSessionFile } from "./session-file.ts";
@@ -558,7 +559,7 @@ function inspectPersistedRecord(record: AgentRecord): void {
 				record.finalAnswer = assistantText(lastAssistant);
 			} else if (lastAssistant.stopReason === "length") {
 				record.lastOutcome = "failed";
-				record.error = "Assistant response stopped at the token limit";
+				record.error = "Assistant response was cut short (provider stop reason: length)";
 			} else if (lastAssistant.stopReason === "aborted") {
 				record.lastOutcome = "interrupted";
 				record.error = lastAssistant.errorMessage || "Assistant run aborted";
@@ -1486,7 +1487,7 @@ function findRunResult(record: AgentRecord, requestedRunId?: string): { runId?: 
 	const assistant = [...runMessages].reverse().find((message) => message?.role === "assistant" && assistantText(message));
 	if (!assistant) throw new Error(`No assistant answer found for ${selectedRun}`);
 	if (assistant.stopReason === "error" || assistant.errorMessage) throw new Error(assistant.errorMessage || `Run ${selectedRun} failed`);
-	if (assistant.stopReason === "length") throw new Error(`Run ${selectedRun} stopped at the token limit before producing a complete answer`);
+	if (assistant.stopReason === "length") throw new Error(`Run ${selectedRun} was cut short (provider stop reason: length) before producing a complete answer`);
 	if (assistant.stopReason !== "stop") {
 		throw new Error(`No final assistant answer found for ${selectedRun}; the run was interrupted after a partial response`);
 	}
@@ -1995,8 +1996,22 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		// Keep overflow recovery intact, but do not spend another model call
 		// summarizing a successful answer immediately before this child exits.
 		// A cold continuation performs the deferred compaction before its prompt.
+		let lastAssistantStopReason: string | undefined;
+		let continueAfterCompaction = false;
+		pi.on("message_end", (event) => {
+			if (event.message?.role === "assistant") lastAssistantStopReason = event.message.stopReason;
+		});
 		pi.on("session_before_compact", (event) => {
-			if (shouldCancelManagedSubagentCompaction(event)) return { cancel: true };
+			continueAfterCompaction = shouldContinueManagedSubagentAfterCompaction(event, lastAssistantStopReason);
+			if (shouldCancelManagedSubagentCompaction(event, lastAssistantStopReason)) return { cancel: true };
+		});
+		pi.on("session_compact", (event) => {
+			if (!continueAfterCompaction || event.willRetry) return;
+			continueAfterCompaction = false;
+			pi.sendUserMessage(
+				"Continue the interrupted task from the compacted context. Finish the work and return the originally requested final answer.",
+				{ deliverAs: "followUp" },
+			);
 		});
 		return;
 	}

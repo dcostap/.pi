@@ -15,8 +15,25 @@ type ContextUsage = {
  * serve. Managed subagents are made cold immediately afterwards, so generating
  * that summary would be wasted unless the parent later continues the session.
  */
-export function shouldCancelManagedSubagentCompaction(event: { reason?: unknown; willRetry?: unknown }): boolean {
-	return event.reason === "threshold" && event.willRetry !== true;
+export function shouldCancelManagedSubagentCompaction(
+	event: { reason?: unknown; willRetry?: unknown },
+	lastAssistantStopReason: string | undefined,
+): boolean {
+	const automatic = event.reason === "threshold" || event.reason === "overflow";
+	return automatic && event.willRetry !== true && lastAssistantStopReason === "stop";
+}
+
+/**
+ * Older Pi builds treat a context-pressured `length` stop as non-retrying
+ * threshold compaction. Queue one continuation after that compaction; newer Pi
+ * builds report the same condition as overflow with willRetry=true themselves.
+ */
+export function shouldContinueManagedSubagentAfterCompaction(
+	event: { reason?: unknown; willRetry?: unknown },
+	lastAssistantStopReason: string | undefined,
+): boolean {
+	const automatic = event.reason === "threshold" || event.reason === "overflow";
+	return automatic && event.willRetry !== true && lastAssistantStopReason === "length";
 }
 
 /** Decide whether a cold subagent needs its deferred compaction before a continuation. */
