@@ -47,7 +47,7 @@ export default function openaiCodexSecondary(pi: ExtensionAPI) {
     models: seededModels as any,
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     const primary = ctx.modelRegistry.getProvider(PRIMARY_PROVIDER_ID);
     if (!primary) {
       if (ctx.hasUI) {
@@ -76,5 +76,15 @@ export default function openaiCodexSecondary(pi: ExtensionAPI) {
     // requests after startup; the real provider has the built-in Codex OAuth
     // implementation and Pi resolves credentials under the secondary ID.
     pi.registerProvider(secondary);
+
+    // Model selection happens before session_start. Rebind an already-selected
+    // secondary model so a resumed/default session cannot retain stale model
+    // metadata from the early models.json bootstrap catalog.
+    if (ctx.model?.provider === SECONDARY_PROVIDER_ID) {
+      const activeModel = secondary.getModels().find((model) => model.id === ctx.model?.id);
+      if (activeModel) {
+        await pi.setModel(activeModel);
+      }
+    }
   });
 }
