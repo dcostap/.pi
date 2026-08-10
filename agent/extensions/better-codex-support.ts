@@ -23,17 +23,22 @@ const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STATUS_KEY = "better-codex-support-usage";
 const SHOW_THRESHOLD = 80;
 const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
-const TOKEN_REFRESH_SKEW_MS = 60_000;
 const AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
 const AUTH_FILE = path.join(AGENT_DIR, "auth.json");
 const OBSERVATIONS_FILE = path.join(AGENT_DIR, "codex-usage-observations.jsonl");
 
-type ProviderKey = "codex";
-type OAuthProviderId = "openai-codex";
+const PRIMARY_CODEX_PROVIDER_ID = "openai-codex" as const;
+const SECONDARY_CODEX_PROVIDER_ID = "openai-codex-secondary" as const;
+type OAuthProviderId = typeof PRIMARY_CODEX_PROVIDER_ID | typeof SECONDARY_CODEX_PROVIDER_ID;
+type ProviderKey = OAuthProviderId;
 
-interface AuthData {
-  "openai-codex"?: { access?: string; refresh?: string; expires?: number };
+interface StoredOAuthCredentials {
+  access?: string;
+  refresh?: string;
+  expires?: number;
 }
+
+type AuthData = Partial<Record<OAuthProviderId, StoredOAuthCredentials>> & Record<string, any>;
 
 interface ResetCreditData {
   status?: string;
@@ -100,22 +105,6 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<FetchResponseLik
 interface RequestConfig {
   fetchFn?: FetchLike;
   timeoutMs?: number;
-}
-
-interface OAuthApiKeyResult {
-  newCredentials: Record<string, any>;
-  apiKey: string;
-}
-
-type OAuthApiKeyResolver = (
-  providerId: OAuthProviderId,
-  credentials: Record<string, Record<string, any>>,
-) => Promise<OAuthApiKeyResult | null>;
-
-interface FreshAuthResult {
-  auth: AuthData | null;
-  changed: boolean;
-  refreshErrors: Partial<Record<OAuthProviderId, string>>;
 }
 
 interface JsonRequestSuccess {
@@ -210,20 +199,6 @@ function readAuth(authFile = AUTH_FILE): AuthData | null {
     return asObject(parsed) as AuthData;
   } catch {
     return null;
-  }
-}
-
-function writeAuth(auth: AuthData, authFile = AUTH_FILE): boolean {
-  try {
-    const dir = path.dirname(authFile);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-    const tmpPath = `${authFile}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(auth, null, 2));
-    fs.renameSync(tmpPath, authFile);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -357,70 +332,6 @@ function resetAtMs(window: any): number | undefined {
     return Date.now() + window.reset_after_seconds * 1000;
   }
   return undefined;
-}
-
-let cachedOAuthResolver: OAuthApiKeyResolver | null = null;
-
-async function getDefaultOAuthResolver(): Promise<OAuthApiKeyResolver> {
-  if (cachedOAuthResolver) return cachedOAuthResolver;
-
-  const mod = await import("@earendil-works/pi-ai/oauth");
-  if (typeof (mod as any).getOAuthApiKey !== "function") {
-    throw new Error("oauth resolver unavailable");
-  }
-
-  cachedOAuthResolver = (providerId, credentials) =>
-    (mod as any).getOAuthApiKey(providerId, credentials) as Promise<OAuthApiKeyResult | null>;
-
-  return cachedOAuthResolver;
-}
-
-function isCredentialExpired(creds: { expires?: number } | undefined, nowMs: number): boolean {
-  if (!creds) return false;
-  if (typeof creds.expires !== "number") return false;
-  return nowMs + TOKEN_REFRESH_SKEW_MS >= creds.expires;
-}
-
-async function ensureFreshCodexAuth(authFile = AUTH_FILE): Promise<FreshAuthResult> {
-  const auth = readAuth(authFile);
-  if (!auth) {
-    return { auth: null, changed: false, refreshErrors: {} };
-  }
-
-  const providerId: OAuthProviderId = "openai-codex";
-  const nowMs = Date.now();
-  const nextAuth: AuthData = { ...auth };
-  const refreshErrors: Partial<Record<OAuthProviderId, string>> = {};
-  let changed = false;
-
-  const creds = nextAuth[providerId];
-  if (creds?.refresh) {
-    const needsRefresh = !creds.access || isCredentialExpired(creds, nowMs);
-
-    if (needsRefresh) {
-      try {
-        const resolver = await getDefaultOAuthResolver();
-        const resolved = await resolver(providerId, nextAuth as any);
-        if (!resolved?.newCredentials) {
-          refreshErrors[providerId] = "missing OAuth credentials";
-        } else {
-          nextAuth[providerId] = {
-            ...(nextAuth[providerId] ?? {}),
-            ...resolved.newCredentials,
-          };
-          changed = true;
-        }
-      } catch (error) {
-        refreshErrors[providerId] = toErrorMessage(error);
-      }
-    }
-  }
-
-  if (changed) {
-    writeAuth(nextAuth, authFile);
-  }
-
-  return { auth: nextAuth, changed, refreshErrors };
 }
 
 function readPercentCandidate(value: unknown): number | null {
@@ -570,16 +481,19 @@ async function consumeCodexResetCredit(token: string, redeemRequestId: string, c
   return parseResetConsumeResult(result.data);
 }
 
-function detectProvider(model: { provider?: string; id?: string; name?: string; api?: string } | undefined | null): ProviderKey | null {
-  if (!model) return null;
-  const provider = (model.provider || "").toLowerCase();
-  if (provider === "openai-codex") return "codex";
-  return null;
+function detectProvider(model: { provider?: string; id?: string; name?: string; api?: string } | undefined | null): ProviderKey {
+  const provider = (model?.provider || "").toLowerCase();
+  if (provider === SECONDARY_CODEX_PROVIDER_ID) return SECONDARY_CODEX_PROVIDER_ID;
+  return PRIMARY_CODEX_PROVIDER_ID;
 }
 
-function canShowForProvider(active: ProviderKey | null, auth: AuthData | null): boolean {
-  if (!active || !auth) return false;
-  return !!(auth["openai-codex"]?.access || auth["openai-codex"]?.refresh);
+function canShowForProvider(active: ProviderKey, auth: AuthData | null): boolean {
+  if (!auth) return false;
+  return !!(auth[active]?.access || auth[active]?.refresh);
+}
+
+function providerDisplayName(providerId: OAuthProviderId): string {
+  return providerId === SECONDARY_CODEX_PROVIDER_ID ? "Codex Secondary" : "Codex";
 }
 
 function clampPercent(value: number): number {
@@ -609,7 +523,7 @@ class UsageSelectorComponent extends Container implements Focusable {
   private filteredItems: SubscriptionItem[] = [];
   private selectedIndex = 0;
   private loading = true;
-  private activeProvider: ProviderKey | null;
+  private activeProvider: ProviderKey;
   private fetchFn: () => Promise<UsageData | null>;
   private _focused = false;
 
@@ -625,7 +539,7 @@ class UsageSelectorComponent extends Container implements Focusable {
   constructor(
     tui: any,
     theme: any,
-    activeProvider: ProviderKey | null,
+    activeProvider: ProviderKey,
     fetchUsage: () => Promise<UsageData | null>,
     onCancel: () => void,
   ) {
@@ -672,10 +586,10 @@ class UsageSelectorComponent extends Container implements Focusable {
   private buildItems(result: UsageData | null) {
     this.allItems = [
       {
-        name: "Codex",
-        provider: "codex",
+        name: providerDisplayName(this.activeProvider),
+        provider: this.activeProvider,
         data: result,
-        isActive: this.activeProvider === "codex",
+        isActive: true,
       },
     ];
 
@@ -819,7 +733,7 @@ export default function (pi: ExtensionAPI) {
   const state = {
     codex: null as UsageData | null,
     lastPoll: 0,
-    activeProvider: null as ProviderKey | null,
+    activeProvider: PRIMARY_CODEX_PROVIDER_ID as ProviderKey,
   };
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -847,16 +761,30 @@ export default function (pi: ExtensionAPI) {
     return theme.fg(colorForPercent(v), full) + theme.fg("dim", empty);
   }
 
-  async function getFreshCodexAccess(): Promise<{ access?: string; error?: string }> {
-    if (!hasCodexCredentials(readAuth())) return { error: "missing Codex credentials (try /login openai-codex)" };
-    const refreshed = await ensureFreshCodexAuth();
-    const access = refreshed.auth?.["openai-codex"]?.access;
-    if (access) return { access };
-    const refreshError = refreshed.refreshErrors["openai-codex"];
-    return { error: refreshError ? `auth refresh failed (${refreshError})` : "missing access token (try /login again)" };
+  async function getFreshCodexAccess(
+    providerId: OAuthProviderId = state.activeProvider,
+  ): Promise<{ access?: string; error?: string }> {
+    if (!hasCodexCredentials(readAuth(), providerId)) {
+      return { error: `missing Codex credentials (try /login ${providerId})` };
+    }
+
+    try {
+      // Resolve through Pi's provider runtime instead of refreshing auth.json
+      // ourselves. This selects the OAuth implementation registered for the
+      // exact provider ID and persists refreshed credentials under that ID.
+      const resolved = await ctx?.modelRegistry.getProviderAuth(providerId);
+      const access = resolved?.auth?.apiKey;
+      return access ? { access } : { error: "missing access token (try /login again)" };
+    } catch (error) {
+      return { error: `auth refresh failed (${toErrorMessage(error)})` };
+    }
   }
 
-  async function confirmUsageReset(_ctx: ExtensionContext, data: UsageData): Promise<boolean> {
+  async function confirmUsageReset(
+    _ctx: ExtensionContext,
+    data: UsageData,
+    providerId: OAuthProviderId,
+  ): Promise<boolean> {
     if (!_ctx.hasUI) return false;
 
     return _ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
@@ -874,7 +802,7 @@ export default function (pi: ExtensionAPI) {
           const separator = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
           return [
             separator,
-            fitLine(theme.bold("Confirm Codex usage reset"), width),
+            fitLine(theme.bold(`Confirm ${providerDisplayName(providerId)} usage reset`), width),
             fitLine(theme.fg("warning", "This will redeem exactly one banked Codex rate-limit reset."), width),
             "",
             fitLine(renderUsage(), width),
@@ -915,11 +843,6 @@ export default function (pi: ExtensionAPI) {
 
     if (!ctx?.hasUI) return;
 
-    if (!active) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-      return;
-    }
-
     const auth = readAuth();
     if (!canShowForProvider(active, auth)) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -950,7 +873,7 @@ export default function (pi: ExtensionAPI) {
     if (weekly !== undefined) {
       usageParts.push(theme.fg("muted", "W ") + renderBar(theme, weekly) + " " + renderPercent(theme, weekly) + weeklyReset);
     }
-    const status = theme.fg("dim", "Codex ") + usageParts.join(" ") + resetBank;
+    const status = theme.fg("dim", `${providerDisplayName(active)} `) + usageParts.join(" ") + resetBank;
 
     ctx.ui.setStatus(STATUS_KEY, status);
   }
@@ -960,7 +883,8 @@ export default function (pi: ExtensionAPI) {
     state.activeProvider = detectProvider(modelLike);
 
     if (previous !== state.activeProvider) {
-      if (!state.activeProvider) state.codex = null;
+      // Never display one account's quota while the other account is active.
+      state.codex = null;
       updateStatus();
       return true;
     }
@@ -996,7 +920,7 @@ export default function (pi: ExtensionAPI) {
       type: "codex_quota_snapshot",
       timestamp: toIso(now),
       reason: force ? reason : changed ? `${reason}_changed` : `${reason}_stale`,
-      provider: "openai-codex",
+      provider: state.activeProvider,
       activeProvider: state.activeProvider,
       model: ctx?.model?.id,
       cwd: ctx?.cwd,
@@ -1027,7 +951,7 @@ export default function (pi: ExtensionAPI) {
     const sessionFile = getSessionFile();
     for (const message of messages) {
       if (message?.role !== "assistant") continue;
-      if (message.provider !== "openai-codex") continue;
+      if (message.provider !== PRIMARY_CODEX_PROVIDER_ID && message.provider !== SECONDARY_CODEX_PROVIDER_ID) continue;
       const usage = message.usage;
       if (!usage) continue;
 
@@ -1080,29 +1004,32 @@ export default function (pi: ExtensionAPI) {
     lastRollupFlushAt = now;
   }
 
-  function hasCodexCredentials(auth: AuthData | null): boolean {
-    return !!(auth?.["openai-codex"]?.access || auth?.["openai-codex"]?.refresh);
+  function hasCodexCredentials(auth: AuthData | null, providerId: OAuthProviderId): boolean {
+    return !!(auth?.[providerId]?.access || auth?.[providerId]?.refresh);
   }
 
   async function runPoll(reason: string, forceLog = false) {
-    if (!hasCodexCredentials(readAuth())) {
+    const providerId = state.activeProvider;
+    if (!hasCodexCredentials(readAuth(), providerId)) {
       state.codex = null;
       state.lastPoll = Date.now();
       updateStatus();
       return;
     }
 
-    const refreshed = await ensureFreshCodexAuth();
-    const refreshError = refreshed.refreshErrors["openai-codex"];
-    const access = refreshed.auth?.["openai-codex"]?.access;
+    const auth = await getFreshCodexAccess(providerId);
 
-    state.codex = access
-      ? await fetchCodexUsage(access)
+    const usage = auth.access
+      ? await fetchCodexUsage(auth.access)
       : {
           session: 0,
           weekly: 0,
-          error: refreshError ? `auth refresh failed (${refreshError})` : "missing access token (try /login again)",
+          error: auth.error ?? "missing access token (try /login again)",
         };
+
+    // A model switch may have happened while the request was in flight.
+    if (state.activeProvider !== providerId) return;
+    state.codex = usage;
 
     state.lastPoll = Date.now();
     updateStatus();
@@ -1159,13 +1086,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (_event, _ctx) => {
     ctx = _ctx;
     const changed = updateProviderFrom(_ctx.model);
-    if (changed && state.activeProvider === "codex") await poll("turn_start_model_changed", true);
+    if (changed) await poll("turn_start_model_changed", true);
   });
 
   pi.on("model_select", async (event, _ctx) => {
     ctx = _ctx;
     const changed = updateProviderFrom(event.model ?? _ctx.model);
-    if (changed && state.activeProvider === "codex") await poll("model_select", true);
+    if (changed) await poll("model_select", true);
   });
 
   pi.on("agent_end", async (event, _ctx) => {
@@ -1188,7 +1115,8 @@ export default function (pi: ExtensionAPI) {
 
       resetInFlight = true;
       try {
-        const auth = await getFreshCodexAccess();
+        const providerId = state.activeProvider;
+        const auth = await getFreshCodexAccess(providerId);
         if (!auth.access) {
           _ctx.ui.notify(auth.error ?? "missing Codex access token", "error");
           return;
@@ -1215,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const confirmed = await confirmUsageReset(_ctx, data);
+        const confirmed = await confirmUsageReset(_ctx, data, providerId);
         if (!confirmed) {
           _ctx.ui.notify("Codex reset cancelled. No reset was attempted.", "info");
           return;
@@ -1289,20 +1217,18 @@ export default function (pi: ExtensionAPI) {
           const fitLine = (line: string, width: number): string =>
             truncateToWidth(line, Math.max(0, width), "");
 
-          ensureFreshCodexAuth()
-            .then((refreshed) => {
-              const access = refreshed.auth?.["openai-codex"]?.access;
-              if (!access) {
+          const providerId = state.activeProvider;
+          getFreshCodexAccess(providerId)
+            .then((auth) => {
+              if (!auth.access) {
                 data = {
                   session: 0,
                   weekly: 0,
-                  error: refreshed.refreshErrors["openai-codex"]
-                    ? `auth refresh failed (${refreshed.refreshErrors["openai-codex"]})`
-                    : "missing access token (try /login again)",
+                  error: auth.error ?? "missing access token (try /login again)",
                 };
                 return;
               }
-              return fetchCodexUsage(access).then((usage) => {
+              return fetchCodexUsage(auth.access).then((usage) => {
                 data = usage;
               });
             })
@@ -1317,11 +1243,13 @@ export default function (pi: ExtensionAPI) {
           return {
             render(width: number) {
               const separator = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
-              if (loading) return [separator, fitLine(theme.fg("dim", "Fetching Codex usage…"), width), separator];
-              if (!data) return [separator, fitLine(theme.fg("error", "No usage data"), width), separator];
-              if (data.error) return [separator, fitLine(theme.fg("error", data.error), width), separator];
+              const title = fitLine(theme.bold(`${providerDisplayName(providerId)} usage`), width);
+              if (loading) return [separator, title, fitLine(theme.fg("dim", "Fetching usage…"), width), separator];
+              if (!data) return [separator, title, fitLine(theme.fg("error", "No usage data"), width), separator];
+              if (data.error) return [separator, title, fitLine(theme.fg("error", data.error), width), separator];
               const lines = [
                 separator,
+                title,
               ];
               lines.push(data.session === undefined
                 ? fitLine(`${theme.fg("muted", "Session".padEnd(8))} ${theme.fg("dim", "unavailable")}`, width)
