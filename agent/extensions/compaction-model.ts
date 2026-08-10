@@ -40,10 +40,21 @@ const USAGE = [
 ].join("\n");
 
 type ModelItem = {
+	kind: "model";
 	provider: string;
 	id: string;
 	model: any;
 };
+
+type OffItem = {
+	kind: "off";
+};
+
+type PickerItem = ModelItem | OffItem;
+
+type CompactionModelSelection =
+	| { kind: "model"; model: any }
+	| { kind: "off" };
 
 type CompactionModelConfig = {
 	provider: string;
@@ -385,13 +396,14 @@ function clearProgress(state: CompactionProgress | undefined, showFinal = false)
 	clearProgressWidget(state);
 }
 
-function modelSearchText(item: ModelItem): string {
+function modelSearchText(item: PickerItem): string {
+	if (item.kind === "off") return "off disable current model default compaction";
 	return `${item.provider}/${item.id} ${item.model.name ?? ""}`;
 }
 
 function sortModels(models: any[], current?: CompactionModelConfig): ModelItem[] {
 	return models
-		.map((model) => ({ provider: model.provider, id: model.id, model }))
+		.map((model) => ({ kind: "model" as const, provider: model.provider, id: model.id, model }))
 		.sort((a, b) => {
 			const aCurrent = current?.provider === a.provider && current.model === a.id;
 			const bCurrent = current?.provider === b.provider && current.model === b.id;
@@ -408,8 +420,8 @@ function sortModels(models: any[], current?: CompactionModelConfig): ModelItem[]
 class CompactionModelSelector extends Container implements Focusable {
 	private readonly searchInput = new Input();
 	private readonly listContainer = new Container();
-	private readonly allModels: ModelItem[];
-	private filteredModels: ModelItem[];
+	private readonly allItems: PickerItem[];
+	private filteredItems: PickerItem[];
 	private selectedIndex = 0;
 	private _focused = false;
 
@@ -427,11 +439,17 @@ class CompactionModelSelector extends Container implements Focusable {
 		models: any[],
 		initialQuery: string,
 		private readonly current: CompactionModelConfig | undefined,
-		private readonly done: (model: any | undefined) => void,
+		private readonly done: (selection: CompactionModelSelection | undefined) => void,
 	) {
 		super();
-		this.allModels = sortModels(models, current);
-		this.filteredModels = this.allModels;
+		const sortedModels = sortModels(models, current);
+		const currentIndex = sortedModels.findIndex(
+			(item) => current?.provider === item.provider && current.model === item.id,
+		);
+		this.allItems = currentIndex >= 0
+			? [sortedModels[currentIndex]!, { kind: "off" }, ...sortedModels.filter((_, index) => index !== currentIndex)]
+			: [{ kind: "off" }, ...sortedModels];
+		this.filteredItems = this.allItems;
 
 		this.addChild(new Text(theme.fg("accent", theme.bold("Compaction model")), 0, 0));
 		this.addChild(
@@ -465,8 +483,8 @@ class CompactionModelSelector extends Container implements Focusable {
 	}
 
 	private filterModels(query: string): void {
-		this.filteredModels = query ? fuzzyFilter(this.allModels, query, modelSearchText) : this.allModels;
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
+		this.filteredItems = query ? fuzzyFilter(this.allItems, query, modelSearchText) : this.allItems;
+		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredItems.length - 1));
 		this.updateList();
 	}
 
@@ -476,17 +494,25 @@ class CompactionModelSelector extends Container implements Focusable {
 			0,
 			Math.min(
 				this.selectedIndex - Math.floor(VISIBLE_PICKER_ROWS / 2),
-				this.filteredModels.length - VISIBLE_PICKER_ROWS,
+				this.filteredItems.length - VISIBLE_PICKER_ROWS,
 			),
 		);
-		const endIndex = Math.min(startIndex + VISIBLE_PICKER_ROWS, this.filteredModels.length);
+		const endIndex = Math.min(startIndex + VISIBLE_PICKER_ROWS, this.filteredItems.length);
 
 		for (let i = startIndex; i < endIndex; i += 1) {
-			const item = this.filteredModels[i];
+			const item = this.filteredItems[i];
 			if (!item) continue;
 			const selected = i === this.selectedIndex;
-			const current = this.current?.provider === item.provider && this.current.model === item.id;
 			const prefix = selected ? this.theme.fg("accent", "→ ") : "  ";
+			if (item.kind === "off") {
+				const label = selected ? this.theme.fg("accent", "Off") : "Off";
+				const description = this.theme.fg("muted", " — use Pi's current model");
+				const check = !this.current ? this.theme.fg("success", " ✓") : "";
+				this.listContainer.addChild(new Text(`${prefix}${label}${description}${check}`, 0, 0));
+				continue;
+			}
+
+			const current = this.current?.provider === item.provider && this.current.model === item.id;
 			const name = selected ? this.theme.fg("accent", item.id) : item.id;
 			const provider = this.theme.fg("muted", ` [${item.provider}]`);
 			const context = this.theme.fg("dim", ` ${formatTokens(item.model.contextWindow)} ctx`);
@@ -494,36 +520,37 @@ class CompactionModelSelector extends Container implements Focusable {
 			this.listContainer.addChild(new Text(`${prefix}${name}${provider}${context}${check}`, 0, 0));
 		}
 
-		if (startIndex > 0 || endIndex < this.filteredModels.length) {
+		if (startIndex > 0 || endIndex < this.filteredItems.length) {
 			this.listContainer.addChild(
 				new Text(
-					this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredModels.length})`),
+					this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredItems.length})`),
 					0,
 					0,
 				),
 			);
 		}
 
-		if (this.filteredModels.length === 0) {
+		if (this.filteredItems.length === 0) {
 			this.listContainer.addChild(new Text(this.theme.fg("muted", "  No matching models"), 0, 0));
 		}
 	}
 
 	private selectCurrent(): void {
-		const selected = this.filteredModels[this.selectedIndex];
-		if (selected) this.done(selected.model);
+		const selected = this.filteredItems[this.selectedIndex];
+		if (!selected) return;
+		this.done(selected.kind === "off" ? { kind: "off" } : { kind: "model", model: selected.model });
 	}
 
 	handleInput(keyData: string): void {
 		if (matchesKey(keyData, "up")) {
-			if (this.filteredModels.length === 0) return;
-			this.selectedIndex = this.selectedIndex === 0 ? this.filteredModels.length - 1 : this.selectedIndex - 1;
+			if (this.filteredItems.length === 0) return;
+			this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
 			this.updateList();
 			return;
 		}
 		if (matchesKey(keyData, "down")) {
-			if (this.filteredModels.length === 0) return;
-			this.selectedIndex = this.selectedIndex === this.filteredModels.length - 1 ? 0 : this.selectedIndex + 1;
+			if (this.filteredItems.length === 0) return;
+			this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
 			this.updateList();
 			return;
 		}
@@ -626,19 +653,20 @@ async function pickModel(ctx: any, initialQuery = ""): Promise<void> {
 	}
 
 	const models = ctx.modelRegistry.getAvailable();
-	if (!models.length) {
-		ctx.ui.notify("No authenticated models are available. Use /login or configure models.json.", "error");
-		return;
-	}
-
 	const current = await readConfig();
-	const selected = await ctx.ui.custom<any | undefined>(
-		(_tui: any, theme: Theme, _keybindings: any, done: (model: any | undefined) => void) =>
+	const selected = await ctx.ui.custom<CompactionModelSelection | undefined>(
+		(_tui: any, theme: Theme, _keybindings: any, done: (selection: CompactionModelSelection | undefined) => void) =>
 			new CompactionModelSelector(theme, models, initialQuery, current, done),
 	);
 	if (!selected) return;
 
-	await saveModel(ctx, selected.provider, selected.id);
+	if (selected.kind === "off") {
+		writeConfig(undefined);
+		ctx.ui.notify("Compaction model override disabled; Pi will use the current model.", "info");
+		return;
+	}
+
+	await saveModel(ctx, selected.model.provider, selected.model.id);
 }
 
 async function showStatus(ctx: any): Promise<void> {
