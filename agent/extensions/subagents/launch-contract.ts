@@ -5,7 +5,6 @@ import type { SubagentRole } from "./roles.ts";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const CONTEXT_MODES = ["fresh", "transcript", "clone"] as const;
 const MAX_SYSTEM_PROMPT_BYTES = 1024 * 1024;
-export const MAX_BATCH_MEMBERS = 32;
 export const MAX_SHARED_PROMPT_BYTES = 256 * 1024;
 const MAX_EXPANDED_BATCH_ASSIGNMENT_BYTES = 16 * 1024 * 1024;
 
@@ -71,7 +70,6 @@ function validateBatchSpec(value: unknown, location: string): string[] {
 	if (value.role !== undefined && (typeof value.role !== "string" || !cleanText(value.role))) errors.push(`${location}.role: expected non-empty string`);
 	if (!Array.isArray(value.agents) || value.agents.length === 0) errors.push(`${location}.agents: required non-empty array`);
 	else {
-		if (value.agents.length > MAX_BATCH_MEMBERS) errors.push(`${location}.agents: exceeds maximum of ${MAX_BATCH_MEMBERS}`);
 		errors.push(...value.agents.flatMap((agent, index) => validateStartSpec(agent, `${location}.agents[${index}]`)));
 		if (typeof value.shared_prompt === "string") {
 			const expandedBytes = utf8Bytes(value.shared_prompt) * value.agents.length
@@ -99,7 +97,6 @@ export function parseStartRequest(value: unknown, location: string): ParsedStart
 	const normalized = normalizeLegacyStartValue(value);
 	if (Array.isArray(normalized)) {
 		if (normalized.length === 0) throw new Error(`${location}: legacy start array must not be empty`);
-		if (normalized.length > MAX_BATCH_MEMBERS) throw new Error(`${location}: exceeds maximum of ${MAX_BATCH_MEMBERS} entries`);
 		const errors = normalized.flatMap((item, index) => validateStartSpec(item, `${location}[${index}]`));
 		if (errors.length > 0) throw new Error(errors.slice(0, 50).join("\n"));
 		return { specs: normalized as StartSpec[] };

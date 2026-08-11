@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildMainInstructions, combinedSystemPrompt, genericPrompt, MAX_BATCH_MEMBERS, parseStartRequest } from "./launch-contract.ts";
+import { buildMainInstructions, combinedSystemPrompt, genericPrompt, parseStartRequest } from "./launch-contract.ts";
 import type { SubagentRole } from "./roles.ts";
 
 const reviewRole: SubagentRole = {
@@ -59,14 +59,15 @@ describe("subagent launch requests", () => {
 		}, "manifest")).toThrow("profile: unknown property");
 	});
 
-	test("bounds formal batch fan-out", () => {
-		expect(() => parseStartRequest({
+	test("allows large formal batch fan-out", () => {
+		const request = parseStartRequest({
 			batch: {
-				title: "Too many",
+				title: "Large batch",
 				shared_prompt: "Shared",
-				agents: Array.from({ length: MAX_BATCH_MEMBERS + 1 }, (_, index) => ({ title: `Agent ${index}`, task: "Task", model: "p/m", thinking: "high" })),
+				agents: Array.from({ length: 40 }, (_, index) => ({ title: `Agent ${index}`, task: "Task", model: "p/m", thinking: "high" })),
 			},
-		}, "tool input")).toThrow(`exceeds maximum of ${MAX_BATCH_MEMBERS}`);
+		}, "tool input");
+		expect(request.specs).toHaveLength(40);
 	});
 
 	test("keeps shared and individual assignments distinct", () => {

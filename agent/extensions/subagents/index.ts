@@ -26,7 +26,6 @@ import {
 	combinedSystemPrompt,
 	CONTEXT_MODES,
 	genericPrompt,
-	MAX_BATCH_MEMBERS,
 	MAX_SHARED_PROMPT_BYTES,
 	normalizeLegacyStartValue,
 	parseStartRequest,
@@ -2125,7 +2124,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		title: Type.String({ minLength: 1, description: "Human-readable batch title." }),
 		shared_prompt: Type.String({ minLength: 1, maxLength: MAX_SHARED_PROMPT_BYTES, description: "Assignment context injected into every batch member." }),
 		role: Type.Optional(Type.String({ minLength: 1, description: `Optional role inherited by members that do not specify one. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
-		agents: Type.Array(AgentSpecSchema, { minItems: 1, maxItems: MAX_BATCH_MEMBERS, description: "Agents with individual tasks. An agent role overrides the batch role." }),
+		agents: Type.Array(AgentSpecSchema, { minItems: 1, description: "Agents with individual tasks. An agent role overrides the batch role." }),
 	}, { additionalProperties: false });
 
 	pi.registerTool({
