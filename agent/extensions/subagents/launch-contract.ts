@@ -15,6 +15,7 @@ export type StartSpec = {
 	thinking: (typeof THINKING_LEVELS)[number];
 	role?: string;
 	context?: (typeof CONTEXT_MODES)[number];
+	context_files?: boolean;
 	system_prompt?: string;
 	system_prompt_file?: string;
 };
@@ -23,6 +24,7 @@ export type BatchSpec = {
 	title: string;
 	shared_prompt: string;
 	role?: string;
+	context_files?: boolean;
 	agents: StartSpec[];
 };
 
@@ -43,7 +45,7 @@ function utf8Bytes(value: string): number {
 function validateStartSpec(value: unknown, location: string): string[] {
 	const errors: string[] = [];
 	if (!isRecord(value)) return [`${location}: expected object`];
-	const allowed = new Set(["title", "task", "model", "thinking", "role", "context", "system_prompt", "system_prompt_file"]);
+	const allowed = new Set(["title", "task", "model", "thinking", "role", "context", "context_files", "system_prompt", "system_prompt_file"]);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
 	for (const key of ["title", "task", "model"] as const) {
 		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
@@ -51,6 +53,7 @@ function validateStartSpec(value: unknown, location: string): string[] {
 	if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) errors.push(`${location}.thinking: required; expected one of ${THINKING_LEVELS.join(", ")}`);
 	if (value.role !== undefined && (typeof value.role !== "string" || !cleanText(value.role))) errors.push(`${location}.role: expected non-empty string`);
 	if (value.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(value.context)) errors.push(`${location}.context: expected one of ${CONTEXT_MODES.join(", ")}`);
+	if (value.context_files !== undefined && typeof value.context_files !== "boolean") errors.push(`${location}.context_files: expected boolean`);
 	if (value.system_prompt !== undefined && (typeof value.system_prompt !== "string" || !cleanText(value.system_prompt))) errors.push(`${location}.system_prompt: expected non-empty string`);
 	if (value.system_prompt_file !== undefined && (typeof value.system_prompt_file !== "string" || !cleanText(value.system_prompt_file))) errors.push(`${location}.system_prompt_file: expected non-empty string`);
 	if (value.system_prompt !== undefined && value.system_prompt_file !== undefined) errors.push(`${location}: system_prompt and system_prompt_file are mutually exclusive`);
@@ -61,13 +64,14 @@ function validateStartSpec(value: unknown, location: string): string[] {
 function validateBatchSpec(value: unknown, location: string): string[] {
 	const errors: string[] = [];
 	if (!isRecord(value)) return [`${location}: expected object`];
-	const allowed = new Set(["title", "shared_prompt", "role", "agents"]);
+	const allowed = new Set(["title", "shared_prompt", "role", "context_files", "agents"]);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
 	for (const key of ["title", "shared_prompt"] as const) {
 		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
 	}
 	if (typeof value.shared_prompt === "string" && utf8Bytes(value.shared_prompt) > MAX_SHARED_PROMPT_BYTES) errors.push(`${location}.shared_prompt: exceeds ${MAX_SHARED_PROMPT_BYTES} UTF-8 bytes`);
 	if (value.role !== undefined && (typeof value.role !== "string" || !cleanText(value.role))) errors.push(`${location}.role: expected non-empty string`);
+	if (value.context_files !== undefined && typeof value.context_files !== "boolean") errors.push(`${location}.context_files: expected boolean`);
 	if (!Array.isArray(value.agents) || value.agents.length === 0) errors.push(`${location}.agents: required non-empty array`);
 	else {
 		errors.push(...value.agents.flatMap((agent, index) => validateStartSpec(agent, `${location}.agents[${index}]`)));
@@ -107,7 +111,14 @@ export function parseStartRequest(value: unknown, location: string): ParsedStart
 		const errors = validateBatchSpec(normalized.batch, `${location}.batch`);
 		if (errors.length > 0) throw new Error(errors.slice(0, 50).join("\n"));
 		const batch = normalized.batch as BatchSpec;
-		return { specs: batch.agents.map((agent) => ({ ...agent, role: agent.role ?? batch.role })), batch };
+		return {
+			specs: batch.agents.map((agent) => ({
+				...agent,
+				role: agent.role ?? batch.role,
+				context_files: agent.context_files ?? batch.context_files,
+			})),
+			batch,
+		};
 	}
 	const errors = validateStartSpec(normalized, location);
 	if (errors.length > 0) throw new Error(errors.join("\n"));
@@ -166,6 +177,7 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>): string 
 - Every new subagent requires an exact provider/model-id and an explicit thinking level. Never inherit or guess either value from the main session.
 - Before launching, the user must have established a clear contract for which exact model and thinking level to use for that task or class of tasks. If no such contract exists, ask the user before launching. Use \`pi --list-models <query>\` to search exact IDs as needed.
 - A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
+- Child Pi context-file discovery defaults to enabled. Set context_files to false only when the user wants the child to ignore AGENTS.md and CLAUDE.md files; this does not restrict filesystem access or disable other project resources.
 - Reuse an existing subagent with subagent_send only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
 - Use subagent_status only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
 - For work sharing common context, launch a formal batch with a shared_prompt and individual agent tasks. Then call subagent_wait once with its batch_id and required wait_mode. Use wait_mode "all" for the complete batch; use wait_mode "any" when the first settled result is sufficient. An "any" wait returns the settled subset and leaves the remaining agents running.

@@ -172,6 +172,7 @@ type SerializedAgent = {
 	batchId?: string;
 	parentAgentId?: string;
 	contextMode: ContextMode;
+	contextFiles: boolean;
 	sessionFile: string;
 	sandboxDir: string;
 	systemPromptPath?: string;
@@ -436,6 +437,7 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 		batchId: record.batchId,
 		parentAgentId: record.parentAgentId,
 		contextMode: record.contextMode,
+		contextFiles: record.contextFiles,
 		sessionFile: record.sessionFile,
 		sandboxDir: record.sandboxDir,
 		systemPromptPath: record.systemPromptPath,
@@ -612,6 +614,7 @@ class RpcClient {
 			"--thinking", this.record.thinking,
 			"--name", `[Subagent ${this.record.id}] ${this.record.title}`,
 		];
+		if (!this.record.contextFiles) args.push("--no-context-files");
 		if (this.record.systemPromptPath) args.push("--append-system-prompt", this.record.systemPromptPath);
 		const invocation = getPiInvocation(args);
 		this.child = spawn(invocation.command, invocation.args, {
@@ -1233,6 +1236,7 @@ async function prepareAgent(
 			role: role?.name,
 			batchId,
 			contextMode,
+			contextFiles: spec.context_files !== false,
 			sessionFile,
 			sandboxDir,
 			systemPromptPath,
@@ -1278,6 +1282,7 @@ function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
 				byId.set(value.id, {
 					...restored,
 					role: typeof restored.role === "string" ? restored.role : typeof restored.profile === "string" ? restored.profile : undefined,
+					contextFiles: restored.contextFiles !== false,
 				});
 				continue;
 			}
@@ -1328,6 +1333,7 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		role: record.role,
 		batchId: record.batchId,
 		parentAgentId: record.parentAgentId,
+		contextFiles: record.contextFiles,
 		currentRunId: record.currentRunId,
 		activity: currentActivity(record),
 		createdAt: record.createdAt,
@@ -1414,6 +1420,7 @@ function formatStatus(record: AgentRecord): string {
 		record.batchId ? `Batch: ${record.batchId}` : "",
 		record.parentAgentId ? `Parent subagent: ${record.parentAgentId}` : "",
 		`Context: ${record.contextMode}`,
+		`Context files: ${record.contextFiles ? "enabled" : "disabled"}`,
 		record.currentRunId ? `Current/latest run: ${record.currentRunId}` : "",
 		`Task: ${oneLine(record.currentTaskSummary ?? record.task, 180)}`,
 	];
@@ -2117,6 +2124,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		thinking: StringEnum(THINKING_LEVELS, { description: "Required explicit Pi thinking level." }),
 		role: Type.Optional(Type.String({ minLength: 1, description: `Optional role. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
 		context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
+		context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
 		system_prompt: Type.Optional(Type.String({ minLength: 1, description: "Optional additional system prompt; fresh context only." })),
 		system_prompt_file: Type.Optional(Type.String({ minLength: 1, description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 	}, { additionalProperties: false });
@@ -2124,6 +2132,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		title: Type.String({ minLength: 1, description: "Human-readable batch title." }),
 		shared_prompt: Type.String({ minLength: 1, maxLength: MAX_SHARED_PROMPT_BYTES, description: "Assignment context injected into every batch member." }),
 		role: Type.Optional(Type.String({ minLength: 1, description: `Optional role inherited by members that do not specify one. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
+		context_files: Type.Optional(Type.Boolean({ description: "Default context-file discovery for batch members. Defaults to true; an agent-level value overrides it." })),
 		agents: Type.Array(AgentSpecSchema, { minItems: 1, description: "Agents with individual tasks. An agent role overrides the batch role." }),
 	}, { additionalProperties: false });
 
@@ -2140,6 +2149,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Required explicit Pi thinking level." })),
 			role: Type.Optional(Type.String({ description: `Optional role whose instructions are injected into the child system prompt. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
 			context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
+			context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
 			system_prompt: Type.Optional(Type.String({ description: "Optional additional system prompt; fresh context only." })),
 			system_prompt_file: Type.Optional(Type.String({ description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 		}, { additionalProperties: false }),
@@ -2186,7 +2196,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				let text: string;
 				let handlesFile: string | undefined;
 				if (records.length <= NORMAL_LAUNCH_DETAIL_LIMIT) {
-					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
+					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
 				} else {
 					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
 					const running = records.length;

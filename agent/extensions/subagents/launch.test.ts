@@ -10,21 +10,33 @@ const reviewRole: SubagentRole = {
 };
 
 describe("subagent launch requests", () => {
-	test("resolves a formal batch and inherits its optional role", () => {
+	test("resolves a formal batch and inherits its optional role and context-file setting", () => {
 		const request = parseStartRequest({
 			batch: {
 				title: "Review batch",
 				shared_prompt: "Review the current diff.",
 				role: "review",
+				context_files: false,
 				agents: [
 					{ title: "Correctness", task: "Focus on lifecycle.", model: "p/m", thinking: "high" },
-					{ title: "UX", task: "Focus on UX.", model: "p/m", thinking: "high", role: "other" },
+					{ title: "UX", task: "Focus on UX.", model: "p/m", thinking: "high", role: "other", context_files: true },
 				],
 			},
 		}, "tool input");
 
 		expect(request.batch?.shared_prompt).toBe("Review the current diff.");
 		expect(request.specs.map((spec) => spec.role)).toEqual(["review", "other"]);
+		expect(request.specs.map((spec) => spec.context_files)).toEqual([false, true]);
+	});
+
+	test("validates the context-file setting", () => {
+		expect(() => parseStartRequest({
+			title: "Review",
+			task: "Review",
+			model: "p/m",
+			thinking: "high",
+			context_files: "no",
+		}, "tool input")).toThrow("context_files: expected boolean");
 	});
 
 	test("requires a non-empty shared prompt for formal batches", () => {
