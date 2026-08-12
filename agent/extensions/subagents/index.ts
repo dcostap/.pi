@@ -66,7 +66,6 @@ const MAX_RECENT_ACTIVITIES = 5;
 const MAX_RETRIES = 4;
 const RETRY_DELAY_MS = 1_000;
 const MAX_RPC_STDERR_CHARS = 128 * 1024;
-const NESTED_SUBAGENTS_ENABLED = false;
 const RECENT_FINISHED_WIDGET_MS = 60_000;
 const MANUAL_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 
@@ -2013,8 +2012,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		if (Object.hasOwn(payload, "promptCacheKey")) return { ...payload, promptCacheKey };
 	});
 
-	// Temporary gate: the data model and UI support parentAgentId, but managed children remain workers only.
-	if (process.env[MANAGED_CHILD_ENV] === "1" && !NESTED_SUBAGENTS_ENABLED) {
+	// Managed children keep their compact completion behavior and can also
+	// orchestrate managed descendants through the tools registered below.
+	if (process.env[MANAGED_CHILD_ENV] === "1") {
 		// Keep overflow recovery intact, but do not spend another model call
 		// summarizing a successful answer immediately before this child exits.
 		// A cold continuation performs the deferred compaction before its prompt.
@@ -2035,7 +2035,6 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				{ deliverAs: "followUp" },
 			);
 		});
-		return;
 	}
 
 	let manager: SubagentManager | undefined;

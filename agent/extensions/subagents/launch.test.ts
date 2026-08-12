@@ -103,6 +103,7 @@ describe("subagent launch requests", () => {
 	test("injects the concise role catalog and selection rule", () => {
 		const instructions = buildMainInstructions(new Map([[reviewRole.name, reviewRole]]));
 		expect(instructions).toContain("Available roles:\n- review: Independent read-only code review.");
+		expect(instructions).toContain("Never start Pi through bash as a substitute for subagent_start.");
 		expect(instructions).toContain('When the user requests "<role> subagents", use that role for each launched subagent.');
 		expect(instructions).not.toContain("For example, \"launch 3 review subagents\"");
 	});

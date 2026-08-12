@@ -174,6 +174,7 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>): string 
 	return `Managed subagents:
 - Do not launch subagents unless the user explicitly asks for delegated/subagent work or has already established that subagents should be used for the current task.
 - Use subagent_start for ordinary delegated work and formal batches. subagent_start returns immediately; continue useful work instead of polling.
+- Never start Pi through bash as a substitute for subagent_start.
 - Every new subagent requires an exact provider/model-id and an explicit thinking level. Never inherit or guess either value from the main session.
 - Before launching, the user must have established a clear contract for which exact model and thinking level to use for that task or class of tasks. If no such contract exists, ask the user before launching. Use \`pi --list-models <query>\` to search exact IDs as needed.
 - A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
