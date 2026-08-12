@@ -46,6 +46,7 @@ import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 import { createSpinnerTicker, spinnerFrame } from "../_shared/spinner.ts";
 import { buildVisibleTree } from "./tree.ts";
+import { MAX_LISTED_SUBAGENTS, takeRecent } from "./list-policy.ts";
 import { incrementalWaitState } from "./wait-policy.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
@@ -1879,7 +1880,8 @@ function agentSummaryResult(resultValue: any, options: { expanded: boolean; isPa
 			: theme.fg("success", `✓ ${verb}`);
 	const counts = agentCounts(agents);
 	const totalCost = agents.reduce((sum, agent) => sum + agent.cost, 0);
-	const summary = `${prefix}${counts ? ` · ${counts}` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}`;
+	const omitted = Number(resultValue?.details?.omittedAgents ?? 0);
+	const summary = `${prefix}${counts ? ` · ${counts}` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}${omitted > 0 ? ` · ${omitted} older omitted` : ""}`;
 	component.setText(`${summary}\n${agentRows(agents, batches, theme, options.expanded)}`);
 	return component;
 }
@@ -2246,15 +2248,28 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: LIST_TOOL_NAME,
 		label: "List Subagents",
-		description: "List managed subagents compactly. Does not return transcripts, raw tool output, or full final answers.",
+		description: `List the ${MAX_LISTED_SUBAGENTS} most recently created managed subagents. Reports how many older subagents it omits. Does not return transcripts, raw tool output, or full final answers.`,
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const activeManager = ensureManager(ctx);
-			const records = activeManager.list();
-			const batches = activeManager.listBatches();
-			const formatted = formatList(records, batches);
+			const allRecords = activeManager.list();
+			const recent = takeRecent(allRecords);
+			const records = recent.items;
+			const batchIds = new Set(records.map((record) => record.batchId).filter((id): id is string => Boolean(id)));
+			const batches = activeManager.listBatches().filter((batch) => batchIds.has(batch.id));
+			const omissionNotice = recent.omitted > 0
+				? `Showing the ${records.length} most recent subagents. ${recent.omitted} older subagent${recent.omitted === 1 ? " is" : "s are"} not included.\n\n`
+				: "";
+			const formatted = `${omissionNotice}${formatList(records, batches)}`;
 			const truncated = truncateHead(formatted);
-			return result(truncated.content, { agents: records.map(compactRecord), batches: batches.map(compactBatch), truncated: truncated.truncated });
+			return result(truncated.content, {
+				agents: records.map(compactRecord),
+				batches: batches.map(compactBatch),
+				totalAgents: allRecords.length,
+				omittedAgents: recent.omitted,
+				listLimit: MAX_LISTED_SUBAGENTS,
+				truncated: truncated.truncated || recent.omitted > 0,
+			});
 		},
 		renderCall(_args, theme, context) {
 			return toolHeader("List subagents", "", theme, context.lastComponent);
