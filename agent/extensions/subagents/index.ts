@@ -46,6 +46,7 @@ import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 import { createSpinnerTicker, spinnerFrame } from "../_shared/spinner.ts";
 import { buildVisibleTree } from "./tree.ts";
+import { incrementalWaitState } from "./wait-policy.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
 const START_TOOL_NAME = "subagent_start";
@@ -861,12 +862,25 @@ class SubagentManager {
 		}) : new Promise<never>(() => {});
 		try {
 			if (signal?.aborted) throw new SubagentWaitAbortedError();
-			const completion = mode === "any"
-				? Promise.race(records.map((record) => record.completion ?? Promise.resolve()))
-				: Promise.all(records.map((record) => record.completion ?? Promise.resolve()));
-			await Promise.race([completion, abortPromise]);
-			const settled = mode === "any" ? records.filter((record) => record.state === "cold") : records;
-			const pending = records.filter((record) => !settled.includes(record));
+			let settled: AgentRecord[];
+			let pending: AgentRecord[];
+			if (mode === "any") {
+				while (true) {
+					({ settled, pending } = incrementalWaitState(records));
+					if (settled.length > 0 || pending.length === 0) break;
+					await Promise.race([
+						Promise.race(pending.map((record) => record.completion ?? Promise.resolve())),
+						abortPromise,
+					]);
+				}
+			} else {
+				await Promise.race([
+					Promise.all(records.map((record) => record.completion ?? Promise.resolve())),
+					abortPromise,
+				]);
+				settled = records;
+				pending = [];
+			}
 			if (consumeDelivery) {
 				for (const record of settled) {
 					record.deliveryConsumed = true;
@@ -2328,12 +2342,12 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: WAIT_TOOL_NAME,
 		label: "Wait for Subagents",
-		description: "Wait for selected subagents by ids, formal batch_id, or handle file. Required wait_mode \"all\" waits for every selected agent and returns their integrated results; \"any\" returns when at least one selected agent settles and leaves the rest running. Cancellation or timeout leaves unfinished subagents running.",
+		description: "Wait for selected subagents by ids, formal batch_id, or handle file. Required wait_mode \"all\" waits for every selected agent and returns their integrated results; \"any\" waits for the next undelivered completion, returns only new results, and leaves the rest running. Cancellation or timeout leaves unfinished subagents running.",
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
 			batch_id: Type.Optional(Type.String({ minLength: 1, description: "Select every member of one formal batch. Mutually exclusive with ids and input_file." })),
 			input_file: Type.Optional(Type.String()),
-			wait_mode: StringEnum(["all", "any"] as const, { description: "Required: all waits for every selected agent; any returns after at least one selected agent settles." }),
+			wait_mode: StringEnum(["all", "any"] as const, { description: "Required: all waits for every selected agent; any waits for and returns only the next undelivered completion set." }),
 			timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400 })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
