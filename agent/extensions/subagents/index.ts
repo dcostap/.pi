@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,7 +44,7 @@ import {
 } from "./compaction-policy.ts";
 import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
-import { createSpinnerTicker, spinnerFrame } from "../_shared/spinner.ts";
+import { SPINNER_INTERVAL_MS, spinnerFrame } from "../_shared/spinner.ts";
 import { buildVisibleTree } from "./tree.ts";
 import { MAX_LISTED_SUBAGENTS, takeRecent } from "./list-policy.ts";
 import { incrementalWaitState } from "./wait-policy.ts";
@@ -59,6 +59,8 @@ const RESULT_TOOL_NAME = "subagent_result";
 const STOP_TOOL_NAME = "subagent_stop";
 
 const MANAGED_CHILD_ENV = "PI_MANAGED_SUBAGENT";
+const HIERARCHY_REGISTRY_ENV = "PI_SUBAGENT_HIERARCHY_REGISTRY";
+const CURRENT_AGENT_ENV = "PI_SUBAGENT_CURRENT_AGENT_ID";
 const PROMPT_CACHE_ENV = "PI_SUBAGENT_PROMPT_CACHE_KEY";
 const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 const NORMAL_LAUNCH_DETAIL_LIMIT = 10;
@@ -71,6 +73,9 @@ const MANUAL_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 
 const WIDGET_ID = "subagents-tree";
 const MAX_WIDGET_NODES = 25;
+const WIDGET_STATE_REFRESH_MS = 100;
+const HIERARCHY_REFRESH_MS = 1_000;
+const HIERARCHY_STALE_MS = 5_000;
 
 type SubagentDisplayRow = {
 	indent: string;
@@ -219,6 +224,26 @@ type AgentRecord = SerializedAgent & {
 	deliveryPending: boolean;
 	deliveryConsumed: boolean;
 	latestCompletion?: CompletionSnapshot;
+};
+
+type HierarchyAgentSnapshot = SerializedAgent & {
+	state: AgentRuntimeState;
+	lastOutcome: RunOutcome;
+	currentRunId?: string;
+	startedAt?: number;
+	updatedAt: number;
+	settledAt?: number;
+	lastObservedAt?: number;
+	recent: Activity[];
+	usage: UsageStats;
+	contextTokens?: number;
+};
+
+type HierarchySnapshot = {
+	ownerAgentId: string;
+	publishedAt: number;
+	agents: HierarchyAgentSnapshot[];
+	batches: SerializedBatch[];
 };
 
 type PreparedAgent = {
@@ -605,6 +630,7 @@ class RpcClient {
 		private readonly record: AgentRecord,
 		private readonly cwd: string,
 		private readonly onEvent: (event: any) => void,
+		private readonly hierarchyRegistryDir?: string,
 	) {}
 
 	start(): void {
@@ -622,10 +648,12 @@ class RpcClient {
 			cwd: this.cwd,
 			shell: false,
 			stdio: ["pipe", "pipe", "pipe"],
-			env: {
-				...process.env,
-				[MANAGED_CHILD_ENV]: "1",
-				PI_SUBAGENT_SANDBOX: this.record.sandboxDir,
+				env: {
+					...process.env,
+					[MANAGED_CHILD_ENV]: "1",
+					...(this.hierarchyRegistryDir ? { [HIERARCHY_REGISTRY_ENV]: this.hierarchyRegistryDir } : {}),
+					[CURRENT_AGENT_ENV]: this.record.id,
+					PI_SUBAGENT_SANDBOX: this.record.sandboxDir,
 				[PROMPT_CACHE_ENV]: this.record.promptCacheKey ?? this.record.sessionFile,
 			},
 		});
@@ -746,6 +774,7 @@ class SubagentManager {
 	constructor(
 		private readonly cwd: string,
 		private readonly compactionPolicy: ManagedSubagentCompactionPolicy,
+		private readonly hierarchyRegistryDir?: string,
 	) {}
 
 	restore(items: SerializedAgent[], batches: SerializedBatch[] = []): void {
@@ -993,13 +1022,13 @@ class SubagentManager {
 			const settledPromise = new Promise<void>((resolve) => { resolveSettled = resolve; });
 			const client = new RpcClient(record, this.cwd, (event) => {
 				if (event.type === "tool_execution_start") attemptUsedTool = true;
-				this.applyEvent(record, event);
+				const changed = this.applyEvent(record, event);
 				if (event.type === "agent_settled") {
 					record.settling = true;
 					resolveSettled();
 				}
-				this.emit({ kind: "changed", id: record.id });
-			});
+				if (changed) this.emit({ kind: "changed", id: record.id });
+			}, this.hierarchyRegistryDir);
 			record.client = client;
 			try {
 				client.start();
@@ -1088,7 +1117,8 @@ class SubagentManager {
 		this.emit({ kind: "settled", id: record.id });
 	}
 
-	private applyEvent(record: AgentRecord, event: any): void {
+	/** Apply an RPC event and report whether it changed visible state. */
+	private applyEvent(record: AgentRecord, event: any): boolean {
 		const now = Date.now();
 		record.updatedAt = now;
 		record.lastObservedAt = now;
@@ -1097,36 +1127,38 @@ class SubagentManager {
 		if (event.type === "agent_start") {
 			record.state = "running";
 			addActivity(record, "agent running", now);
-			return;
+			return true;
 		}
 		if (event.type === "tool_execution_start") {
 			const description = compactToolActivity(event.toolName, event.args);
 			record.activeTools.set(event.toolCallId, { name: event.toolName, description, startedAt: now });
 			addActivity(record, description, now);
-			return;
+			return true;
 		}
 		if (event.type === "tool_execution_end") {
 			const active = record.activeTools.get(event.toolCallId);
 			record.activeTools.delete(event.toolCallId);
 			if (active) addActivity(record, `${active.name} ${event.isError ? "failed" : "finished"}`, now);
-			return;
+			return Boolean(active);
 		}
 		if (event.type === "message_update") {
 			const type = event.assistantMessageEvent?.type;
 			if (type === "thinking_start") addActivity(record, "thinking", now);
 			else if (type === "text_start") addActivity(record, "writing response", now);
-			return;
+			return type === "thinking_start" || type === "text_start";
 		}
 		if (event.type === "message_end" && event.message?.role === "assistant") {
 			updateUsage(record, event.message);
 			const text = assistantText(event.message);
 			if (text) record.finalAnswer = text;
-			return;
+			return true;
 		}
 		if (event.type === "agent_end") {
 			const text = finalAssistantText(event.messages || []);
 			if (text) record.finalAnswer = text;
+			return true;
 		}
+		return Boolean(runtimeActivity);
 	}
 
 	private emit(event: ManagerEvent): void {
@@ -1249,6 +1281,7 @@ async function prepareAgent(
 			thinking: spec.thinking,
 			role: role?.name,
 			batchId,
+			parentAgentId: process.env[CURRENT_AGENT_ENV] || undefined,
 			contextMode,
 			contextFiles: spec.context_files !== false,
 			sessionFile,
@@ -1765,20 +1798,119 @@ function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Them
 	return [header, ...renderedRows];
 }
 
-function widgetComponent(records: AgentRecord[], batches: BatchRecord[], theme: Theme, tui?: Pick<TUI, "requestRender">) {
-	const ticker = tui && records.some((record) => record.state === "running" || record.state === "starting" || record.state === "stopping")
-		? createSpinnerTicker(() => tui.requestRender())
-		: undefined;
+function widgetComponent(getRecords: () => AgentRecord[], getBatches: () => BatchRecord[], theme: Theme, onDispose: () => void) {
 	return {
 		render(width: number): string[] {
 			const contentWidth = Math.max(0, width - 1);
-			return widgetLines(records, batches, theme, Date.now(), contentWidth).map((line) => truncateToWidth(` ${line}`, width));
+			return widgetLines(getRecords(), getBatches(), theme, Date.now(), contentWidth).map((line) => truncateToWidth(` ${line}`, width));
 		},
 		invalidate() {},
 		dispose() {
-			ticker?.dispose();
+			onDispose();
 		},
 	};
+}
+
+function hierarchyAgentSnapshot(record: AgentRecord): HierarchyAgentSnapshot {
+	return {
+		...serializeAgent(record),
+		state: record.state,
+		lastOutcome: record.lastOutcome,
+		currentRunId: record.currentRunId,
+		startedAt: record.startedAt,
+		updatedAt: record.updatedAt,
+		settledAt: record.settledAt,
+		lastObservedAt: record.lastObservedAt,
+		recent: record.recent.slice(-MAX_RECENT_ACTIVITIES),
+		usage: { ...record.usage },
+		contextTokens: record.contextTokens,
+	};
+}
+
+function hierarchyAgentRecord(value: unknown, publishedAt: number): AgentRecord | undefined {
+	if (!isRecord(value) || typeof value.id !== "string" || typeof value.title !== "string" || typeof value.task !== "string") return undefined;
+	if (typeof value.modelRef !== "string" || !(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) return undefined;
+	if (typeof value.sessionFile !== "string" || typeof value.sandboxDir !== "string" || typeof value.createdAt !== "number") return undefined;
+	const serialized = value as unknown as SerializedAgent;
+	const record = newRecord(serialized);
+	const state = value.state;
+	if (state === "queued" || state === "starting" || state === "running" || state === "stopping" || state === "cold") record.state = state;
+	const outcome = value.lastOutcome;
+	if (outcome === "none" || outcome === "completed" || outcome === "failed" || outcome === "stopped" || outcome === "interrupted") record.lastOutcome = outcome;
+	record.currentRunId = typeof value.currentRunId === "string" ? value.currentRunId : undefined;
+	record.startedAt = typeof value.startedAt === "number" ? value.startedAt : undefined;
+	record.updatedAt = typeof value.updatedAt === "number" ? value.updatedAt : publishedAt;
+	record.settledAt = typeof value.settledAt === "number" ? value.settledAt : undefined;
+	record.lastObservedAt = typeof value.lastObservedAt === "number" ? value.lastObservedAt : undefined;
+	record.contextTokens = typeof value.contextTokens === "number" ? value.contextTokens : undefined;
+	if (Array.isArray(value.recent)) {
+		record.recent = value.recent.filter((item): item is Activity => isRecord(item) && typeof item.at === "number" && typeof item.text === "string").slice(-MAX_RECENT_ACTIVITIES);
+	}
+	if (isRecord(value.usage)) {
+		record.usage = {
+			input: Number(value.usage.input) || 0,
+			output: Number(value.usage.output) || 0,
+			cacheRead: Number(value.usage.cacheRead) || 0,
+			cacheWrite: Number(value.usage.cacheWrite) || 0,
+			latestCacheHitRate: typeof value.usage.latestCacheHitRate === "number" ? value.usage.latestCacheHitRate : undefined,
+			cost: Number(value.usage.cost) || 0,
+			turns: Number(value.usage.turns) || 0,
+		};
+	}
+	if (record.state !== "cold" && Date.now() - publishedAt > HIERARCHY_STALE_MS) {
+		record.state = "cold";
+		record.lastOutcome = "interrupted";
+		record.settledAt = publishedAt;
+		addActivity(record, "hierarchy reporter stopped", publishedAt);
+	}
+	return record;
+}
+
+async function publishHierarchySnapshot(registryDir: string, ownerAgentId: string, records: AgentRecord[], batches: BatchRecord[]): Promise<void> {
+	await mkdir(registryDir, { recursive: true });
+	const target = path.join(registryDir, `${ownerAgentId}.json`);
+	const temporary = `${target}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+	const snapshot: HierarchySnapshot = {
+		ownerAgentId,
+		publishedAt: Date.now(),
+		agents: records.map(hierarchyAgentSnapshot),
+		batches: batches.map((batch) => ({ ...batch, memberIds: [...batch.memberIds] })),
+	};
+	await writeFile(temporary, `${JSON.stringify(snapshot)}\n`, "utf8");
+	await rename(temporary, target);
+}
+
+async function readHierarchySnapshots(registryDir: string): Promise<{ records: AgentRecord[]; batches: BatchRecord[] }> {
+	let names: string[];
+	try {
+		names = (await readdir(registryDir)).filter((name) => name.endsWith(".json"));
+	} catch {
+		return { records: [], batches: [] };
+	}
+	const snapshots = await Promise.all(names.map(async (name): Promise<HierarchySnapshot | undefined> => {
+		try {
+			const value = JSON.parse(await readFile(path.join(registryDir, name), "utf8"));
+			if (!isRecord(value) || typeof value.ownerAgentId !== "string" || typeof value.publishedAt !== "number") return undefined;
+			if (!Array.isArray(value.agents) || !Array.isArray(value.batches)) return undefined;
+			return value as unknown as HierarchySnapshot;
+		} catch {
+			return undefined;
+		}
+	}));
+	const records: AgentRecord[] = [];
+	const batches: BatchRecord[] = [];
+	for (const snapshot of snapshots) {
+		if (!snapshot) continue;
+		for (const value of snapshot.agents) {
+			const record = hierarchyAgentRecord(value, snapshot.publishedAt);
+			if (record) records.push(record);
+		}
+		for (const value of snapshot.batches) {
+			if (!isRecord(value) || typeof value.id !== "string" || typeof value.title !== "string" || !Array.isArray(value.memberIds)) continue;
+			batches.push(value as BatchRecord);
+		}
+	}
+	return { records, batches };
 }
 
 function agentCounts(agents: DisplayAgent[]): string {
@@ -2040,31 +2172,131 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let manager: SubagentManager | undefined;
 	let latestCtx: ExtensionContext | undefined;
 	let unsubscribe: (() => void) | undefined;
+	const currentAgentId = process.env[CURRENT_AGENT_ENV] || undefined;
+	let hierarchyRegistryDir = process.env[HIERARCHY_REGISTRY_ENV] || undefined;
+	let hierarchyRecords: AgentRecord[] = [];
+	let hierarchyBatches: BatchRecord[] = [];
+	let hierarchyTimer: ReturnType<typeof setInterval> | undefined;
+	let hierarchyPublishTimer: ReturnType<typeof setTimeout> | undefined;
+	let hierarchyPublishing = false;
+	let hierarchyRefreshing = false;
 	let completionFlushScheduled = false;
 	let completionFlushRunning = false;
-	let widgetTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetInstalled = false;
+	let widgetRecords: AgentRecord[] = [];
+	let widgetBatches: BatchRecord[] = [];
+	let widgetTui: Pick<TUI, "requestRender"> | undefined;
+	let widgetStateTimer: ReturnType<typeof setTimeout> | undefined;
+	let widgetAnimationTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetClockTimer: ReturnType<typeof setInterval> | undefined;
 	let shuttingDown = false;
+
+	const mergedById = <T extends { id: string }>(local: T[], remote: T[]): T[] => {
+		const values = new Map<string, T>();
+		for (const item of remote) values.set(item.id, item);
+		for (const item of local) values.set(item.id, item);
+		return [...values.values()].sort((left: any, right: any) => Number(left.createdAt) - Number(right.createdAt));
+	};
+
+	const publishCurrentHierarchy = async () => {
+		if (!currentAgentId || !hierarchyRegistryDir || !manager || hierarchyPublishing || shuttingDown) return;
+		hierarchyPublishing = true;
+		try {
+			await publishHierarchySnapshot(hierarchyRegistryDir, currentAgentId, manager.list(), manager.listBatches());
+		} catch {
+			// The widget is optional. Do not fail an agent run for reporting errors.
+		} finally {
+			hierarchyPublishing = false;
+		}
+	};
+
+	const scheduleHierarchyPublish = () => {
+		if (!currentAgentId || !hierarchyRegistryDir || hierarchyPublishTimer || shuttingDown) return;
+		hierarchyPublishTimer = setTimeout(() => {
+			hierarchyPublishTimer = undefined;
+			void publishCurrentHierarchy();
+		}, WIDGET_STATE_REFRESH_MS);
+	};
+
+	const refreshHierarchy = async () => {
+		if (currentAgentId || !hierarchyRegistryDir || hierarchyRefreshing || shuttingDown) return;
+		hierarchyRefreshing = true;
+		try {
+			const hierarchy = await readHierarchySnapshots(hierarchyRegistryDir);
+			hierarchyRecords = hierarchy.records;
+			hierarchyBatches = hierarchy.batches;
+			refreshWidget();
+		} finally {
+			hierarchyRefreshing = false;
+		}
+	};
+
+	const clearWidgetTimers = () => {
+		if (widgetStateTimer) clearTimeout(widgetStateTimer);
+		if (widgetAnimationTimer) clearInterval(widgetAnimationTimer);
+		if (widgetClockTimer) clearInterval(widgetClockTimer);
+		widgetStateTimer = undefined;
+		widgetAnimationTimer = undefined;
+		widgetClockTimer = undefined;
+	};
+
+	const syncWidgetTimers = () => {
+		const hasActive = widgetRecords.some(isActive);
+		const hasRecentFinished = widgetRecords.some((record) => isRecentlyFinished(record, Date.now()));
+		if (hasActive) {
+			if (!widgetAnimationTimer) widgetAnimationTimer = setInterval(() => widgetTui?.requestRender(), SPINNER_INTERVAL_MS);
+			if (widgetClockTimer) clearInterval(widgetClockTimer);
+			widgetClockTimer = undefined;
+			return;
+		}
+		if (widgetAnimationTimer) clearInterval(widgetAnimationTimer);
+		widgetAnimationTimer = undefined;
+		if (hasRecentFinished && !widgetClockTimer) {
+			widgetClockTimer = setInterval(() => {
+				widgetTui?.requestRender();
+				syncWidgetTimers();
+			}, 1_000);
+		} else if (!hasRecentFinished && widgetClockTimer) {
+			clearInterval(widgetClockTimer);
+			widgetClockTimer = undefined;
+		}
+	};
 
 	const refreshWidget = () => {
 		if (!latestCtx || latestCtx.mode !== "tui" || shuttingDown) return;
-		const records = manager?.list() ?? [];
-		const batches = manager?.listBatches() ?? [];
-		if (records.length === 0) {
-			latestCtx.ui.setWidget(WIDGET_ID, undefined);
-			if (widgetTimer) {
-				clearInterval(widgetTimer);
-				widgetTimer = undefined;
-			}
+		widgetRecords = mergedById(manager?.list() ?? [], hierarchyRecords);
+		widgetBatches = mergedById(manager?.listBatches() ?? [], hierarchyBatches);
+		if (widgetRecords.length === 0) {
+			if (widgetInstalled) latestCtx.ui.setWidget(WIDGET_ID, undefined);
+			widgetInstalled = false;
+			widgetTui = undefined;
+			clearWidgetTimers();
 			return;
 		}
-		latestCtx.ui.setWidget(WIDGET_ID, (tui, theme) => widgetComponent(records, batches, theme, tui));
-		const hasActive = records.some(isActive);
-		const hasRecentFinished = records.some((record) => isRecentlyFinished(record, Date.now()));
-		if ((hasActive || hasRecentFinished) && !widgetTimer) widgetTimer = setInterval(refreshWidget, 1_000);
-		else if (!hasActive && !hasRecentFinished && widgetTimer) {
-			clearInterval(widgetTimer);
-			widgetTimer = undefined;
+		if (!widgetInstalled) {
+			// Keep one component. Later state changes only request a render.
+			widgetInstalled = true;
+			latestCtx.ui.setWidget(WIDGET_ID, (tui, theme) => {
+				widgetTui = tui;
+				return widgetComponent(
+					() => widgetRecords,
+					() => widgetBatches,
+					theme,
+					() => { if (widgetTui === tui) widgetTui = undefined; },
+				);
+			});
+		} else {
+			widgetTui?.requestRender();
 		}
+		syncWidgetTimers();
+	};
+
+	const scheduleWidgetRefresh = () => {
+		if (widgetStateTimer || shuttingDown || latestCtx?.mode !== "tui") return;
+		widgetStateTimer = setTimeout(() => {
+			widgetStateTimer = undefined;
+			refreshWidget();
+		}, WIDGET_STATE_REFRESH_MS);
 	};
 
 	const flushCompletions = async () => {
@@ -2111,15 +2343,17 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		latestCtx = ctx;
 		if (shuttingDown) throw new Error("Subagent extension is shutting down");
 		if (manager) return manager;
-		manager = new SubagentManager(ctx.cwd, compactionPolicy);
+		manager = new SubagentManager(ctx.cwd, compactionPolicy, hierarchyRegistryDir);
 		manager.restore(scanSerializedAgents(ctx).map((item) => item.contextWindow
 			? item
 			: { ...item, contextWindow: modelContextWindow(ctx, item.modelRef) }), scanSerializedBatches(ctx));
 		unsubscribe = manager.subscribe((event) => {
-			refreshWidget();
+			scheduleWidgetRefresh();
+			scheduleHierarchyPublish();
 			if (event.kind === "settled") scheduleCompletionFlush();
 		});
 		refreshWidget();
+		scheduleHierarchyPublish();
 		return manager;
 	};
 
@@ -2201,6 +2435,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 						title: sanitizeTitle(resolved.batch.title),
 						sharedPrompt: cleanText(resolved.batch.shared_prompt),
 						role: exactRole(roles, resolved.batch.role)?.name,
+						parentAgentId: process.env[CURRENT_AGENT_ENV] || undefined,
 						memberIds: prepared.map((item) => item.record.id),
 						createdAt: Math.min(...prepared.map((item) => item.record.createdAt)),
 					};
@@ -2544,7 +2779,16 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		shuttingDown = false;
+		hierarchyRegistryDir ??= path.join(tmpdir(), "pi-subagent-hierarchy", ctx.sessionManager.getSessionId());
+		await mkdir(hierarchyRegistryDir, { recursive: true });
 		ensureManager(ctx);
+		if (currentAgentId) {
+			await publishCurrentHierarchy();
+			hierarchyTimer = setInterval(() => void publishCurrentHierarchy(), HIERARCHY_REFRESH_MS);
+		} else {
+			await refreshHierarchy();
+			hierarchyTimer = setInterval(() => void refreshHierarchy(), HIERARCHY_REFRESH_MS);
+		}
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -2553,10 +2797,16 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		await publishCurrentHierarchy();
 		shuttingDown = true;
-		if (widgetTimer) clearInterval(widgetTimer);
-		widgetTimer = undefined;
+		if (hierarchyTimer) clearInterval(hierarchyTimer);
+		if (hierarchyPublishTimer) clearTimeout(hierarchyPublishTimer);
+		hierarchyTimer = undefined;
+		hierarchyPublishTimer = undefined;
+		clearWidgetTimers();
 		if (latestCtx?.mode === "tui") latestCtx.ui.setWidget(WIDGET_ID, undefined);
+		widgetInstalled = false;
+		widgetTui = undefined;
 		unsubscribe?.();
 		unsubscribe = undefined;
 		const active = manager;
