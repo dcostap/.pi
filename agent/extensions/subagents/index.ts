@@ -9,15 +9,23 @@ import {
 	getMarkdownTheme,
 	getAgentDir,
 	keyHint,
+	AssistantMessageComponent,
+	BashExecutionComponent,
+	BranchSummaryMessageComponent,
+	CompactionSummaryMessageComponent,
 	CONFIG_DIR_NAME,
 	SessionManager,
+	sessionEntryToContextMessages,
+	ToolExecutionComponent,
+	UserMessageComponent,
 	truncateHead,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type KeybindingsManager,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
-import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildConversationTranscript } from "../_shared/conversation-transcript.ts";
 import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
@@ -72,7 +80,6 @@ const RECENT_FINISHED_WIDGET_MS = 60_000;
 const MANUAL_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 
 const WIDGET_ID = "subagents-tree";
-const MAX_WIDGET_NODES = 40;
 const WIDGET_STATE_REFRESH_MS = 100;
 const HIERARCHY_REFRESH_MS = 1_000;
 const HIERARCHY_STALE_MS = 5_000;
@@ -1547,19 +1554,6 @@ function findRunResult(record: AgentRecord, requestedRunId?: string): { runId?: 
 	return { runId: selectedRun, text: assistantText(assistant) };
 }
 
-function transcriptText(record: AgentRecord): string {
-	const manager = SessionManager.open(record.sessionFile);
-	const lines: string[] = [`# ${record.title}`, ``, `Model: ${record.modelRef} [${record.thinking}]`, `Session: ${record.sessionFile}`, ``];
-	for (const entry of manager.getBranch() as any[]) {
-		if (entry?.type !== "message") continue;
-		const message = entry.message;
-		if (message.role === "user") lines.push("## User", messageText(message), "");
-		else if (message.role === "assistant") lines.push("## Assistant", assistantText(message) || "(no text)", "");
-		else if (message.role === "toolResult") lines.push(`### Tool result: ${message.toolName}`, messageText(message), "");
-	}
-	return lines.join("\n");
-}
-
 function result(text: string, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text }], details };
 }
@@ -1703,7 +1697,14 @@ function contextMeterValues(contextWindow: number | undefined, contextTokens: nu
 	return theme.fg("muted", display);
 }
 
-function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Theme, now = Date.now(), width = Number.POSITIVE_INFINITY): string[] {
+function widgetLines(
+	records: AgentRecord[],
+	batches: BatchRecord[],
+	theme: Theme,
+	now = Date.now(),
+	width = Number.POSITIVE_INFINITY,
+	includeInactive = false,
+): string[] {
 	const active = records.filter(isActive);
 	const inactive = records.filter((record) => !isActive(record));
 	const recentFinished = records.filter((record) => isRecentlyFinished(record, now));
@@ -1716,7 +1717,7 @@ function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Them
 	const inactiveParts = [completed ? `${completed} completed` : "", failed ? `${failed} failed` : "", stopped ? `${stopped} stopped` : ""].filter(Boolean).join(" · ");
 	if (active.length === 0) {
 		const known = records.length === 0 ? "none known" : `${records.length} total${inactiveParts ? ` · ${inactiveParts}` : ""}`;
-		if (recentFinished.length === 0) return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
+		if (!includeInactive && recentFinished.length === 0) return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
 		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${costSummary}`);
@@ -1724,17 +1725,17 @@ function widgetLines(records: AgentRecord[], batches: BatchRecord[], theme: Them
 		| { id: string; parentId?: string; createdAt: number; active: boolean; kind: "batch"; batch: BatchRecord };
 	const batchIds = new Set(batches.map((batch) => batch.id));
 	const nodes: WidgetNode[] = [
-		...batches.map((batch): WidgetNode => ({ id: batch.id, parentId: batch.parentAgentId, createdAt: batch.createdAt, active: false, kind: "batch", batch })),
+		...batches.map((batch): WidgetNode => ({ id: batch.id, parentId: batch.parentAgentId, createdAt: batch.createdAt, active: includeInactive, kind: "batch", batch })),
 		...records.map((record): WidgetNode => ({
 			id: record.id,
 			parentId: record.batchId && batchIds.has(record.batchId) ? record.batchId : record.parentAgentId,
 			createdAt: record.createdAt,
-			active: isActive(record) || isRecentlyFinished(record, now),
+			active: includeInactive || isActive(record) || isRecentlyFinished(record, now),
 			kind: "agent",
 			record,
 		})),
 	];
-	const tree = buildVisibleTree(nodes, MAX_WIDGET_NODES);
+	const tree = buildVisibleTree(nodes, Number.POSITIVE_INFINITY);
 	const rows = tree.rows.map(({ item, prefix, isLast }): SubagentDisplayRow => {
 		const connector = `${isLast ? "└─" : "├─"} `;
 		if (item.kind === "batch") {
@@ -1809,6 +1810,326 @@ function widgetComponent(getRecords: () => AgentRecord[], getBatches: () => Batc
 			onDispose();
 		},
 	};
+}
+
+type SubagentDashboardOptions = {
+	getRecords: () => AgentRecord[];
+	getBatches: () => BatchRecord[];
+	tui: TUI;
+	theme: Theme;
+	keybindings: KeybindingsManager;
+	requestRender: () => void;
+	done: () => void;
+	onSend: (record: AgentRecord) => Promise<void>;
+	onStop: (record: AgentRecord) => Promise<void>;
+	onShowCommand: (record: AgentRecord) => Promise<void>;
+};
+
+/** A live browser that uses the same hierarchy rows as the pinned widget. */
+class SubagentDashboard {
+	private mode: "list" | "status" | "transcript" = "list";
+	private selectedId: string | undefined;
+	private scrollFromBottom = 0;
+	private toolsExpanded = false;
+	private notice: { color: "success" | "warning" | "error"; text: string } | undefined;
+	private busy = false;
+	private closed = false;
+	private clock: ReturnType<typeof setInterval>;
+	private transcriptKey = "";
+	private transcript = new Container();
+
+	constructor(private readonly options: SubagentDashboardOptions) {
+		this.syncSelection();
+		this.clock = setInterval(() => {
+			if (!this.closed) this.options.requestRender();
+		}, 1_000);
+	}
+
+	handleInput(data: string): void {
+		if (this.isCancel(data)) {
+			if (this.mode === "list") this.close();
+			else {
+				this.mode = "list";
+				this.scrollFromBottom = 0;
+				this.options.requestRender();
+			}
+			return;
+		}
+
+		if (this.mode !== "list") {
+			if (this.isUp(data)) this.scrollFromBottom++;
+			else if (this.isDown(data)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+			else if (this.options.keybindings.matches(data, "tui.select.pageUp")) this.scrollFromBottom += this.contentHeight();
+			else if (this.options.keybindings.matches(data, "tui.select.pageDown")) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - this.contentHeight());
+			else if (matchesKey(data, "home")) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+			else if (matchesKey(data, "end") || data === "g" || data === "G") this.scrollFromBottom = 0;
+			else if (this.mode === "transcript" && (data === "o" || data === "O")) {
+				this.toolsExpanded = !this.toolsExpanded;
+				this.transcriptKey = "";
+			}
+			this.options.requestRender();
+			return;
+		}
+
+		if (this.isUp(data)) this.moveSelection(-1);
+		else if (this.isDown(data)) this.moveSelection(1);
+		else if (this.options.keybindings.matches(data, "tui.select.pageUp")) this.moveSelection(-this.contentHeight());
+		else if (this.options.keybindings.matches(data, "tui.select.pageDown")) this.moveSelection(this.contentHeight());
+		else if (matchesKey(data, "home")) this.selectEdge("first");
+		else if (matchesKey(data, "end")) this.selectEdge("last");
+		else if (this.isConfirm(data) || data === "t" || data === "T") this.openMode("transcript");
+		else if (data === "i" || data === "I") this.openMode("status");
+		else if (data === "m" || data === "M") this.runAction("send");
+		else if (data === "x" || data === "X") this.runAction("stop");
+		else if (data === "c" || data === "C") this.runAction("command");
+	}
+
+	render(width: number): string[] {
+		this.syncSelection();
+		if (width < 4) return [truncateToWidth("subagents", width)];
+		return this.mode === "list" ? this.renderList(width) : this.renderDetail(width);
+	}
+
+	invalidate(): void {
+		this.transcript.invalidate();
+	}
+
+	dispose(): void {
+		if (this.closed) return;
+		this.closed = true;
+		clearInterval(this.clock);
+	}
+
+	private renderList(width: number): string[] {
+		const records = this.options.getRecords();
+		const innerWidth = width - 2;
+		const all = widgetLines(records, this.options.getBatches(), this.options.theme, Date.now(), innerWidth, true);
+		const summary = all.shift() ?? "Subagents";
+		const selectedIndex = this.selectedId
+			? Math.max(0, all.findIndex((line) => line.includes(this.selectedId!)))
+			: 0;
+		const pageSize = Math.max(1, this.contentHeight() - 2);
+		const start = Math.max(0, Math.min(selectedIndex - Math.floor(pageSize / 2), all.length - pageSize));
+		const visible = all.slice(start, start + pageSize);
+		const lines = [
+			this.topBorder("/subagents", width),
+			this.frame(summary, innerWidth),
+			this.separator(width),
+		];
+		for (const line of visible) {
+			const selected = Boolean(this.selectedId && line.includes(this.selectedId));
+			const content = this.pad(line, innerWidth);
+			lines.push(this.frame(selected ? this.options.theme.bg("selectedBg", content) : content, innerWidth, true));
+		}
+		if (all.length === 0) lines.push(this.frame(this.options.theme.fg("muted", "No subagents are known."), innerWidth));
+		if (all.length > pageSize) lines.push(this.frame(this.options.theme.fg("dim", `${start + 1}–${start + visible.length} of ${all.length}`), innerWidth));
+		lines.push(this.separator(width));
+		lines.push(this.frame(this.notice
+			? this.options.theme.fg(this.notice.color, this.notice.text)
+			: this.options.theme.fg("dim", "↑↓/jk select · Enter transcript · i status · m message · x stop · c command · Esc close"), innerWidth));
+		lines.push(this.bottomBorder(width));
+		return lines;
+	}
+
+	private renderDetail(width: number): string[] {
+		const record = this.selectedRecord();
+		if (!record) {
+			this.mode = "list";
+			return this.renderList(width);
+		}
+		const innerWidth = width - 2;
+		let content: string[];
+		if (this.mode === "transcript") {
+			this.refreshTranscript(record);
+			content = this.transcript.render(innerWidth).map((line) => truncateToWidth(line, innerWidth));
+		} else {
+			content = new Text(formatStatus(record), 0, 0).render(innerWidth);
+		}
+		const height = this.contentHeight();
+		const maxScroll = Math.max(0, content.length - height);
+		this.scrollFromBottom = Math.min(this.scrollFromBottom, maxScroll);
+		const start = Math.max(0, content.length - height - this.scrollFromBottom);
+		const visible = content.slice(start, start + height);
+		const state = record.state === "cold" ? record.lastOutcome : record.state;
+		const lines = [
+			this.topBorder(`${record.id} · ${record.title}`, width),
+			this.frame(`${styledState(state, this.options.theme)}  ${this.options.theme.fg("dim", `${record.modelRef} [${record.thinking}]`)}`, innerWidth),
+			this.separator(width),
+		];
+		for (const line of visible) lines.push(this.frame(line, innerWidth));
+		for (let index = visible.length; index < height; index++) lines.push(this.frame("", innerWidth));
+		lines.push(this.separator(width));
+		const position = content.length > height
+			? `${start + 1}–${Math.min(content.length, start + visible.length)} of ${content.length} · `
+			: "";
+		const hint = this.mode === "transcript"
+			? `${position}↑↓/jk scroll · PgUp/PgDn jump · End/G newest · o ${this.toolsExpanded ? "collapse" : "expand"} tools · Esc back`
+			: `${position}↑↓/jk scroll · PgUp/PgDn jump · Esc back`;
+		lines.push(this.frame(this.options.theme.fg("dim", hint), innerWidth));
+		lines.push(this.bottomBorder(width));
+		return lines;
+	}
+
+	private refreshTranscript(record: AgentRecord): void {
+		const key = `${record.id}:${record.updatedAt}:${record.state}:${this.toolsExpanded}`;
+		if (key === this.transcriptKey) return;
+		try {
+			const manager = SessionManager.open(record.sessionFile);
+			const container = new Container();
+			const pendingTools = new Map<string, ToolExecutionComponent>();
+			const messages = (manager.getBranch() as any[]).flatMap((entry) => entry?.type === "custom" ? [] : sessionEntryToContextMessages(entry));
+			for (const message of messages as any[]) {
+				if (message.role === "user") {
+					if (container.children.length > 0) container.addChild(new Spacer(1));
+					const text = messageText(message);
+					if (text) container.addChild(new UserMessageComponent(text, getMarkdownTheme(), 1));
+				} else if (message.role === "assistant") {
+					container.addChild(new AssistantMessageComponent(message, false, getMarkdownTheme(), "Thinking...", 1));
+					for (const part of message.content ?? []) {
+						if (part?.type !== "toolCall") continue;
+						const component = new ToolExecutionComponent(part.name, part.id, part.arguments, { showImages: false }, undefined, this.options.tui, manager.getCwd());
+						component.setExpanded(this.toolsExpanded);
+						container.addChild(component);
+						pendingTools.set(part.id, component);
+					}
+				} else if (message.role === "toolResult") {
+					const component = pendingTools.get(message.toolCallId);
+					if (component) {
+						component.updateResult(message);
+						pendingTools.delete(message.toolCallId);
+					}
+				} else if (message.role === "compactionSummary") {
+					container.addChild(new Spacer(1));
+					const component = new CompactionSummaryMessageComponent(message, getMarkdownTheme());
+					component.setExpanded(this.toolsExpanded);
+					container.addChild(component);
+				} else if (message.role === "branchSummary") {
+					container.addChild(new Spacer(1));
+					const component = new BranchSummaryMessageComponent(message, getMarkdownTheme());
+					component.setExpanded(this.toolsExpanded);
+					container.addChild(component);
+				} else if (message.role === "bashExecution") {
+					const component = new BashExecutionComponent(message.command, this.options.tui, message.excludeFromContext);
+					if (message.output) component.appendOutput(message.output);
+					component.setComplete(message.exitCode, message.cancelled, message.truncated ? { truncated: true } as any : undefined, message.fullOutputPath);
+					component.setExpanded(this.toolsExpanded);
+					container.addChild(component);
+				}
+			}
+			if (container.children.length === 0) container.addChild(new Text(this.options.theme.fg("muted", "(No transcript entries yet.)"), 1, 0));
+			this.transcript = container;
+			this.transcriptKey = key;
+		} catch (error) {
+			this.transcript = new Container();
+			this.transcript.addChild(new Text(this.options.theme.fg("error", `Could not read transcript: ${error instanceof Error ? error.message : String(error)}`), 1, 0));
+			this.transcriptKey = key;
+		}
+	}
+
+	private openMode(mode: "status" | "transcript"): void {
+		if (!this.selectedRecord()) return;
+		this.mode = mode;
+		this.scrollFromBottom = mode === "status" ? Number.MAX_SAFE_INTEGER : 0;
+		if (mode === "transcript") this.transcriptKey = "";
+		this.options.requestRender();
+	}
+
+	private runAction(action: "send" | "stop" | "command"): void {
+		const record = this.selectedRecord();
+		if (!record || this.busy) return;
+		this.busy = true;
+		this.notice = { color: "warning", text: action === "send" ? `Messaging ${record.id}…` : action === "stop" ? `Stopping ${record.id}…` : "Preparing command…" };
+		this.options.requestRender();
+		const operation = action === "send" ? this.options.onSend(record) : action === "stop" ? this.options.onStop(record) : this.options.onShowCommand(record);
+		void operation.then(() => {
+			this.notice = { color: "success", text: action === "send" ? `Message sent to ${record.id}.` : action === "stop" ? `Stop requested for ${record.id}.` : "Command shown." };
+		}).catch((error: unknown) => {
+			this.notice = { color: "error", text: error instanceof Error ? error.message : String(error) };
+		}).finally(() => {
+			this.busy = false;
+			if (!this.closed) this.options.requestRender();
+		});
+	}
+
+	private selectedRecord(): AgentRecord | undefined {
+		return this.options.getRecords().find((record) => record.id === this.selectedId);
+	}
+
+	private syncSelection(): void {
+		const records = this.options.getRecords();
+		if (records.length === 0) this.selectedId = undefined;
+		else if (!this.selectedId || !records.some((record) => record.id === this.selectedId)) this.selectedId = records.at(-1)!.id;
+	}
+
+	private moveSelection(delta: number): void {
+		const records = this.options.getRecords();
+		if (records.length === 0) return;
+		const index = Math.max(0, records.findIndex((record) => record.id === this.selectedId));
+		const next = Math.max(0, Math.min(records.length - 1, index + delta));
+		this.selectedId = records[next]!.id;
+		this.notice = undefined;
+		this.options.requestRender();
+	}
+
+	private selectEdge(edge: "first" | "last"): void {
+		const records = this.options.getRecords();
+		const record = edge === "first" ? records[0] : records.at(-1);
+		if (!record) return;
+		this.selectedId = record.id;
+		this.notice = undefined;
+		this.options.requestRender();
+	}
+
+	private contentHeight(): number {
+		return Math.max(5, Math.min(22, Math.floor((process.stdout.rows ?? 30) * 0.85) - 7));
+	}
+
+	private isUp(data: string): boolean {
+		return data === "k" || data === "K" || this.options.keybindings.matches(data, "tui.select.up") || matchesKey(data, "up");
+	}
+
+	private isDown(data: string): boolean {
+		return data === "j" || data === "J" || this.options.keybindings.matches(data, "tui.select.down") || matchesKey(data, "down");
+	}
+
+	private isConfirm(data: string): boolean {
+		return this.options.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, "return");
+	}
+
+	private isCancel(data: string): boolean {
+		return this.options.keybindings.matches(data, "tui.select.cancel") || matchesKey(data, "escape") || matchesKey(data, "ctrl+c");
+	}
+
+	private topBorder(title: string, width: number): string {
+		const innerWidth = width - 2;
+		const label = truncateToWidth(` ${title} `, innerWidth, "");
+		const rest = Math.max(0, innerWidth - visibleWidth(label));
+		return this.options.theme.fg("border", "╭──") + this.options.theme.fg("accent", this.options.theme.bold(label)) + this.options.theme.fg("border", `${"─".repeat(Math.max(0, rest - 2))}╮`);
+	}
+
+	private separator(width: number): string {
+		return this.options.theme.fg("border", `├${"─".repeat(Math.max(1, width - 2))}┤`);
+	}
+
+	private bottomBorder(width: number): string {
+		return this.options.theme.fg("border", `╰${"─".repeat(Math.max(1, width - 2))}╯`);
+	}
+
+	private frame(text: string, innerWidth: number, padded = false): string {
+		const content = padded ? truncateToWidth(text, innerWidth, "") : this.pad(text, innerWidth);
+		return this.options.theme.fg("border", "│") + content + this.options.theme.fg("border", "│");
+	}
+
+	private pad(text: string, width: number): string {
+		const fitted = truncateToWidth(text, width, "…");
+		return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
+	}
+
+	private close(): void {
+		if (this.closed) return;
+		this.dispose();
+		this.options.done();
+	}
 }
 
 function hierarchyAgentSnapshot(record: AgentRecord): HierarchyAgentSnapshot {
@@ -2745,34 +3066,49 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		description: "Inspect and interact with managed subagents",
 		handler: async (_args, ctx) => {
 			const activeManager = ensureManager(ctx);
-			if (!ctx.hasUI) return;
-			while (true) {
-				const records = activeManager.list();
-				if (records.length === 0) { ctx.ui.notify("No subagents are known in this parent session.", "info"); return; }
-				const choices = records.map((record) => `${record.id} · ${record.state === "cold" ? `cold/${record.lastOutcome}` : record.state}${record.role ? ` · [${record.role}]` : ""} · ${record.title} · ${record.modelRef} [${record.thinking}]`);
-				const selected = await ctx.ui.select("Managed subagents", choices);
-				if (!selected) return;
-				const id = selected.split(" · ")[0]!;
-				const record = activeManager.get(id);
-				const action = await ctx.ui.select(`${record.id} — ${record.title}`, ["View status", "View transcript", "Send message", "Stop", "Show native session command", "Back"]);
-				if (!action || action === "Back") continue;
-				if (action === "View status") await ctx.ui.editor(`${record.id} status`, formatStatus(record));
-				else if (action === "View transcript") await ctx.ui.editor(`${record.id} transcript (read-only; edits are discarded)`, transcriptText(record));
-				else if (action === "Send message") {
-					const message = await ctx.ui.editor(`Message ${record.id}`, "");
-					if (message?.trim()) {
-						await activeManager.send(record.id, message, "follow_up");
-						ctx.ui.notify(`Message sent to ${record.id}.`, "info");
-					}
-				} else if (action === "Stop") {
-					await activeManager.stop([record.id]);
-					ctx.ui.notify(`Stop requested for ${record.id}.`, "info");
-				} else if (action === "Show native session command") {
-					const command = `pi --session ${JSON.stringify(record.sessionFile)}`;
-					await ctx.ui.editor("Native Pi command (copy this; edits are discarded)", command);
-					ctx.ui.notify("Stop the managed subagent before opening the same session in another Pi process.", "warning");
-				}
+			const getRecords = () => mergedById(activeManager.list(), hierarchyRecords);
+			const getBatches = () => mergedById(activeManager.listBatches(), hierarchyBatches);
+			const records = getRecords();
+			if (records.length === 0) {
+				if (ctx.hasUI) ctx.ui.notify("No subagents are known in this parent session.", "info");
+				return;
 			}
+			if (ctx.mode === "rpc") {
+				ctx.ui.notify(formatList(records, getBatches()), "info");
+				return;
+			}
+			if (ctx.mode !== "tui") return;
+			const isLocal = (id: string) => activeManager.list().some((record) => record.id === id);
+			await ctx.ui.custom<void>(
+				(tui, theme, keybindings, done) => new SubagentDashboard({
+					getRecords,
+					getBatches,
+					tui,
+					theme,
+					keybindings,
+					requestRender: () => tui.requestRender(),
+					done: () => done(undefined),
+					onSend: async (record) => {
+						if (!isLocal(record.id)) throw new Error(`${record.id} is managed by another subagent. Inspect it here, then message it through its parent.`);
+						const message = await ctx.ui.editor(`Message ${record.id}`, "");
+						if (!message?.trim()) throw new Error("No message was sent.");
+						await activeManager.send(record.id, message, "follow_up");
+					},
+					onStop: async (record) => {
+						if (!isLocal(record.id)) throw new Error(`${record.id} is managed by another subagent. Stop it through its parent.`);
+						await activeManager.stop([record.id]);
+					},
+					onShowCommand: async (record) => {
+						const command = `pi --session ${JSON.stringify(record.sessionFile)}`;
+						await ctx.ui.editor("Native Pi command (copy this; edits are discarded)", command);
+						ctx.ui.notify("Stop the managed subagent before opening the same session in another Pi process.", "warning");
+					},
+				}),
+				{
+					overlay: true,
+					overlayOptions: { anchor: "center", width: "90%", minWidth: 72, maxHeight: "90%", margin: 1 },
+				},
+			);
 		},
 	});
 
