@@ -10,8 +10,17 @@ import {
 
 test("parses ssh -G output", () => {
 	assert.deepEqual(
-		parseSshConfig("box", "host box\nuser dario\nhostname 10.0.0.4\nport 2222\n"),
-		{ requested: "box", hostName: "10.0.0.4", user: "dario", port: 2222 },
+		parseSshConfig(
+			"box",
+			"host box\nuser dario\nhostname 10.0.0.4\nport 2222\nidentityfile ~/.ssh/missing\nidentityfile ~/.ssh/id_ed25519\n",
+		),
+		{
+			requested: "box",
+			hostName: "10.0.0.4",
+			user: "dario",
+			port: 2222,
+			identityFiles: ["~/.ssh/missing", "~/.ssh/id_ed25519"],
+		},
 	);
 });
 

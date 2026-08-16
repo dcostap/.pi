@@ -28,7 +28,8 @@ The model receives one permanently registered `ssh_session` tool. It cannot init
 ## Current scope
 
 - Interactive connection and sudo authentication require Pi TUI mode.
-- Uses `ssh -G` and `ssh-keygen` to resolve OpenSSH host/user/port configuration and known-host fingerprints.
+- Uses `ssh -G` and `ssh-keygen` to resolve OpenSSH connection settings and known-host fingerprints.
+- Tries each readable OpenSSH `IdentityFile` before password authentication. Encrypted keys use a masked passphrase prompt.
 - Uses one cross-platform `ssh2` transport with independent command channels; it does not depend on unsupported Windows `ControlMaster` sockets.
 - Uploads and downloads individual regular files through SFTP channels on that same authenticated transport; no second login, temporary SSH key, or shell/base64 encoding is required.
 - Transfers stream through temporary sibling files and are committed into place only after size validation. Existing destinations require explicit `overwrite: true`; each result reports the transferred byte count and SHA-256 digest.

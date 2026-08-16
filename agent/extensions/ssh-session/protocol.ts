@@ -5,15 +5,23 @@ export interface ResolvedSshTarget {
 	readonly hostName: string;
 	readonly user: string;
 	readonly port: number;
+	/** Resolved identity file paths in OpenSSH authentication order. */
+	readonly identityFiles?: readonly string[];
 }
 
 export function parseSshConfig(requested: string, output: string): ResolvedSshTarget {
 	const values = new Map<string, string>();
+	const identityFiles: string[] = [];
 	for (const line of output.split(/\r?\n/u)) {
 		const separator = line.indexOf(" ");
 		if (separator <= 0) continue;
 		const key = line.slice(0, separator).toLowerCase();
-		if (!values.has(key)) values.set(key, line.slice(separator + 1).trim());
+		const value = line.slice(separator + 1).trim();
+		if (key === "identityfile") {
+			if (value) identityFiles.push(value);
+		} else if (!values.has(key)) {
+			values.set(key, value);
+		}
 	}
 
 	const hostName = values.get("hostname");
@@ -23,7 +31,9 @@ export function parseSshConfig(requested: string, output: string): ResolvedSshTa
 	if (!hostName || !user || !Number.isInteger(port) || port < 1 || port > 65_535) {
 		throw new Error("OpenSSH did not return a usable hostname, user, and port");
 	}
-	return { requested, hostName, user, port };
+	const target: ResolvedSshTarget = { requested, hostName, user, port };
+	if (identityFiles.length > 0) target.identityFiles = identityFiles;
+	return target;
 }
 
 export function shellQuote(value: string): string {

@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
 	BashOperations,
 	ExtensionAPI,
@@ -10,7 +13,7 @@ import type {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { Client } from "ssh2";
+import type { Client, ParsedKey } from "ssh2";
 import { BackgroundProcessManager, type BackgroundProcessSnapshot } from "../background-processes/manager.ts";
 import { TailBuffer } from "../background-processes/tail-buffer.ts";
 import {
@@ -377,10 +380,26 @@ async function connectClient(
 	target: ResolvedSshTarget,
 	knownFingerprints: string[],
 ): Promise<Client> {
-	const { Client } = await import("ssh2");
+	const { Client, utils } = await import("ssh2");
 	const client = new Client();
 	let authenticationCancelled = false;
 	let passwordAttempted = false;
+	let nextKeyIndex = 0;
+	const privateKeys: Array<
+		| { readonly path: string; readonly parsed: ParsedKey }
+		| { readonly path: string; readonly encrypted: string }
+	> = [];
+	for (const identityFile of target.identityFiles ?? []) {
+		try {
+			const path = expandTilde(identityFile);
+			const key = readFileSync(path, "utf8");
+			const parsed = utils.parseKey(key);
+			if (!(parsed instanceof Error)) privateKeys.push({ path, parsed });
+			else if (/no passphrase/iu.test(parsed.message)) privateKeys.push({ path, encrypted: key });
+		} catch {
+			// OpenSSH lists default identity paths even when the files do not exist.
+		}
+	}
 
 	return new Promise<Client>((resolve, reject) => {
 		let settled = false;
@@ -428,30 +447,57 @@ async function connectClient(
 					.then((approved) => verify(approved), () => verify(false));
 			},
 			authHandler(methodsLeft, _partialSuccess, callback) {
-				if (passwordAttempted || (methodsLeft && !methodsLeft.includes("password"))) {
-					callback(false);
-					return;
-				}
-				passwordAttempted = true;
-				void promptSecret(ctx, `Password for ${target.user}@${target.hostName}`)
-					.then((password) => {
-						if (password === undefined) {
-							authenticationCancelled = true;
-							callback(false);
+				void (async () => {
+					if ((!methodsLeft || methodsLeft.includes("publickey")) && nextKeyIndex < privateKeys.length) {
+						while (nextKeyIndex < privateKeys.length) {
+							const candidate = privateKeys[nextKeyIndex++];
+							if ("parsed" in candidate) {
+								callback({ type: "publickey", username: target.user, key: candidate.parsed });
+								return;
+							}
+
+							const passphrase = await promptSecret(
+								ctx,
+								`Passphrase for ${candidate.path}`,
+								"Passphrase",
+							);
+							if (passphrase === undefined) continue;
+							const parsed = utils.parseKey(candidate.encrypted, passphrase);
+							if (parsed instanceof Error) {
+								ctx.ui.notify(`Could not unlock SSH key ${candidate.path}`, "warning");
+								continue;
+							}
+							callback({ type: "publickey", username: target.user, key: parsed });
 							return;
 						}
-						callback({ type: "password", username: target.user, password });
-					})
-					.catch(() => {
+					}
+
+					if (passwordAttempted || (methodsLeft && !methodsLeft.includes("password"))) {
+						callback(false);
+						return;
+					}
+					passwordAttempted = true;
+					const password = await promptSecret(ctx, `Password for ${target.user}@${target.hostName}`);
+					if (password === undefined) {
 						authenticationCancelled = true;
 						callback(false);
-					});
+						return;
+					}
+					callback({ type: "password", username: target.user, password });
+				})().catch(() => {
+					authenticationCancelled = true;
+					callback(false);
+				});
 			},
 		});
 	});
 }
 
-async function promptSecret(ctx: ExtensionCommandContext, title: string): Promise<string | undefined> {
+async function promptSecret(
+	ctx: ExtensionCommandContext,
+	title: string,
+	label = "Password",
+): Promise<string | undefined> {
 	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
 		let characters: string[] = [];
 		let finished = false;
@@ -467,7 +513,7 @@ async function promptSecret(ctx: ExtensionCommandContext, title: string): Promis
 			render(width: number) {
 				return [
 					truncateToWidth(theme.fg("accent", theme.bold(title)), width),
-					truncateToWidth(`Password: ${"•".repeat(characters.length)}`, width),
+					truncateToWidth(`${label}: ${"•".repeat(characters.length)}`, width),
 					truncateToWidth(theme.fg("dim", "Enter confirms • Esc cancels • value is never sent to the model"), width),
 				];
 			},
@@ -510,6 +556,13 @@ function validateTarget(value: string): string {
 		throw new Error("Usage: /ssh-connect user@host");
 	}
 	return target;
+}
+
+/** Expand a leading `~` or `~/` in a resolved path to the user's home directory. */
+function expandTilde(path: string): string {
+	if (path === "~") return homedir();
+	if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+	return path;
 }
 
 function resolveTarget(requested: string): ResolvedSshTarget {

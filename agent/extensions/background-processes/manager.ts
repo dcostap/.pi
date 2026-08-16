@@ -99,8 +99,8 @@ export class BackgroundProcessManager {
 		private readonly operations: BashOperations,
 		options: BackgroundProcessManagerOptions = {},
 	) {
-		this.maxRunning = options.maxRunning ?? 8;
-		this.maxEntries = options.maxEntries ?? 32;
+		this.maxRunning = options.maxRunning ?? 64;
+		this.maxEntries = options.maxEntries ?? 256;
 		this.maxOutputBytes = options.maxOutputBytes ?? 1024 * 1024;
 		this.persistFullOutput = options.persistFullOutput ?? true;
 		this.now = options.now ?? Date.now;
