@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,6 +56,13 @@ import { SPINNER_INTERVAL_MS, spinnerFrame } from "../_shared/spinner.ts";
 import { buildVisibleTree } from "./tree.ts";
 import { MAX_LISTED_SUBAGENTS, takeRecent } from "./list-policy.ts";
 import { incrementalWaitState } from "./wait-policy.ts";
+import {
+	publishHierarchySnapshot as writeHierarchySnapshot,
+	readHierarchyRegistry,
+	removeHierarchyReporter,
+	type HierarchySnapshot,
+} from "./hierarchy-registry.ts";
+import { isUnusedRpcStreamEvent } from "./rpc-event-filter.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
 const START_TOOL_NAME = "subagent_start";
@@ -81,6 +88,7 @@ const MANUAL_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 
 const WIDGET_ID = "subagents-tree";
 const WIDGET_STATE_REFRESH_MS = 100;
+const WIDGET_CLOCK_REFRESH_MS = 1_000;
 const HIERARCHY_REFRESH_MS = 1_000;
 const HIERARCHY_STALE_MS = 5_000;
 
@@ -122,6 +130,11 @@ function renderSubagentTable(rows: SubagentDisplayRow[], width: number): string[
 		visibleWidth,
 		truncate: (value, cellWidth) => truncateToWidth(value, cellWidth),
 	}, (row) => `${row.indent}${row.connector}`);
+}
+
+function widgetSpinnerFrame(now: number): string {
+	const clockTick = Math.floor(now / WIDGET_CLOCK_REFRESH_MS);
+	return spinnerFrame(clockTick * SPINNER_INTERVAL_MS);
 }
 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -246,12 +259,7 @@ type HierarchyAgentSnapshot = SerializedAgent & {
 	contextTokens?: number;
 };
 
-type HierarchySnapshot = {
-	ownerAgentId: string;
-	publishedAt: number;
-	agents: HierarchyAgentSnapshot[];
-	batches: SerializedBatch[];
-};
+type SubagentHierarchySnapshot = HierarchySnapshot<HierarchyAgentSnapshot, SerializedBatch>;
 
 type PreparedAgent = {
 	record: AgentRecord;
@@ -737,6 +745,12 @@ class RpcClient {
 	}
 
 	private handleLine(line: string): void {
+		if (isUnusedRpcStreamEvent(line)) {
+			const now = Date.now();
+			this.record.updatedAt = now;
+			this.record.lastObservedAt = now;
+			return;
+		}
 		let parsed: any;
 		try { parsed = JSON.parse(line); } catch { return; }
 		if (parsed?.type === "response" && typeof parsed.id === "string") {
@@ -1766,7 +1780,7 @@ function widgetLines(
 		const record = item.record;
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
 		const glyph = state === "running" || state === "starting" || state === "stopping"
-			? spinnerFrame(now)
+			? widgetSpinnerFrame(now)
 			: stateGlyph(state);
 		const elapsedFrom = record.activeTools.size > 0
 			? Math.min(...[...record.activeTools.values()].map((tool) => tool.startedAt))
@@ -1799,17 +1813,78 @@ function widgetLines(
 	return [header, ...renderedRows];
 }
 
-function widgetComponent(getRecords: () => AgentRecord[], getBatches: () => BatchRecord[], theme: Theme, onDispose: () => void) {
+function widgetComponent(
+	getRecords: () => AgentRecord[],
+	getBatches: () => BatchRecord[],
+	getRevision: () => number,
+	theme: Theme,
+	onDispose: () => void,
+) {
+	let cachedWidth: number | undefined;
+	let cachedRevision: number | undefined;
+	let cachedClockTick: number | undefined;
+	let cachedLines: string[] | undefined;
+	const clearCache = () => {
+		cachedWidth = undefined;
+		cachedRevision = undefined;
+		cachedClockTick = undefined;
+		cachedLines = undefined;
+	};
 	return {
 		render(width: number): string[] {
+			const now = Date.now();
+			const revision = getRevision();
+			const clockTick = Math.floor(now / WIDGET_CLOCK_REFRESH_MS);
+			if (cachedLines && cachedWidth === width && cachedRevision === revision && cachedClockTick === clockTick) return cachedLines;
 			const contentWidth = Math.max(0, width - 1);
-			return widgetLines(getRecords(), getBatches(), theme, Date.now(), contentWidth).map((line) => truncateToWidth(` ${line}`, width));
+			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth).map((line) => truncateToWidth(` ${line}`, width));
+			cachedWidth = width;
+			cachedRevision = revision;
+			cachedClockTick = clockTick;
+			return cachedLines;
 		},
-		invalidate() {},
+		invalidate: clearCache,
 		dispose() {
+			clearCache();
 			onDispose();
 		},
 	};
+}
+
+function widgetFingerprint(records: AgentRecord[], batches: BatchRecord[]): string {
+	return JSON.stringify({
+		records: records.map((record) => [
+			record.id,
+			record.title,
+			record.modelRef,
+			record.thinking,
+			record.role,
+			record.batchId,
+			record.parentAgentId,
+			record.createdAt,
+			record.state,
+			record.lastOutcome,
+			record.startedAt,
+			record.settledAt,
+			record.contextWindow,
+			record.contextTokens,
+			record.usage.cost,
+			record.usage.latestCacheHitRate,
+			record.usage.cacheRead,
+			record.usage.cacheWrite,
+			[...record.activeTools.values()].map((tool) => [tool.name, tool.description, tool.startedAt]),
+			record.recent.at(-1)?.at,
+			record.recent.at(-1)?.text,
+		]),
+		batches: batches.map((batch) => [
+			batch.id,
+			batch.title,
+			batch.role,
+			batch.parentAgentId,
+			batch.createdAt,
+			batch.memberIds,
+		]),
+	});
 }
 
 type SubagentDashboardOptions = {
@@ -2188,36 +2263,19 @@ function hierarchyAgentRecord(value: unknown, publishedAt: number): AgentRecord 
 }
 
 async function publishHierarchySnapshot(registryDir: string, ownerAgentId: string, records: AgentRecord[], batches: BatchRecord[]): Promise<void> {
-	await mkdir(registryDir, { recursive: true });
-	const target = path.join(registryDir, `${ownerAgentId}.json`);
-	const temporary = `${target}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
-	const snapshot: HierarchySnapshot = {
+	await writeHierarchySnapshot(
+		registryDir,
 		ownerAgentId,
-		publishedAt: Date.now(),
-		agents: records.map(hierarchyAgentSnapshot),
-		batches: batches.map((batch) => ({ ...batch, memberIds: [...batch.memberIds] })),
-	};
-	await writeFile(temporary, `${JSON.stringify(snapshot)}\n`, "utf8");
-	await rename(temporary, target);
+		records.map(hierarchyAgentSnapshot),
+		batches.map((batch) => ({ ...batch, memberIds: [...batch.memberIds] })),
+	);
 }
 
-async function readHierarchySnapshots(registryDir: string): Promise<{ records: AgentRecord[]; batches: BatchRecord[] }> {
-	let names: string[];
-	try {
-		names = (await readdir(registryDir)).filter((name) => name.endsWith(".json"));
-	} catch {
-		return { records: [], batches: [] };
-	}
-	const snapshots = await Promise.all(names.map(async (name): Promise<HierarchySnapshot | undefined> => {
-		try {
-			const value = JSON.parse(await readFile(path.join(registryDir, name), "utf8"));
-			if (!isRecord(value) || typeof value.ownerAgentId !== "string" || typeof value.publishedAt !== "number") return undefined;
-			if (!Array.isArray(value.agents) || !Array.isArray(value.batches)) return undefined;
-			return value as unknown as HierarchySnapshot;
-		} catch {
-			return undefined;
-		}
-	}));
+async function readHierarchySnapshots(
+	registryDir: string,
+	cache: Map<string, SubagentHierarchySnapshot>,
+): Promise<{ records: AgentRecord[]; batches: BatchRecord[] }> {
+	const snapshots = await readHierarchyRegistry(registryDir, cache, HIERARCHY_STALE_MS);
 	const records: AgentRecord[] = [];
 	const batches: BatchRecord[] = [];
 	for (const snapshot of snapshots) {
@@ -2497,15 +2555,19 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let hierarchyRegistryDir = process.env[HIERARCHY_REGISTRY_ENV] || undefined;
 	let hierarchyRecords: AgentRecord[] = [];
 	let hierarchyBatches: BatchRecord[] = [];
+	const hierarchySnapshotCache = new Map<string, SubagentHierarchySnapshot>();
 	let hierarchyTimer: ReturnType<typeof setInterval> | undefined;
 	let hierarchyPublishTimer: ReturnType<typeof setTimeout> | undefined;
 	let hierarchyPublishing = false;
 	let hierarchyRefreshing = false;
+	let hierarchyPublishedFingerprint: string | undefined;
 	let completionFlushScheduled = false;
 	let completionFlushRunning = false;
 	let widgetInstalled = false;
 	let widgetRecords: AgentRecord[] = [];
 	let widgetBatches: BatchRecord[] = [];
+	let widgetRevision = 0;
+	let widgetStateFingerprint = "";
 	let widgetTui: Pick<TUI, "requestRender"> | undefined;
 	let widgetStateTimer: ReturnType<typeof setTimeout> | undefined;
 	let widgetAnimationTimer: ReturnType<typeof setInterval> | undefined;
@@ -2521,9 +2583,17 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	const publishCurrentHierarchy = async () => {
 		if (!currentAgentId || !hierarchyRegistryDir || !manager || hierarchyPublishing || shuttingDown) return;
+		const records = manager.list();
+		const batches = manager.listBatches();
+		const fingerprint = JSON.stringify({
+			agents: records.map(hierarchyAgentSnapshot),
+			batches: batches.map((batch) => ({ ...batch, memberIds: [...batch.memberIds] })),
+		});
+		if (!records.some(isActive) && fingerprint === hierarchyPublishedFingerprint) return;
 		hierarchyPublishing = true;
 		try {
-			await publishHierarchySnapshot(hierarchyRegistryDir, currentAgentId, manager.list(), manager.listBatches());
+			await publishHierarchySnapshot(hierarchyRegistryDir, currentAgentId, records, batches);
+			hierarchyPublishedFingerprint = fingerprint;
 		} catch {
 			// The widget is optional. Do not fail an agent run for reporting errors.
 		} finally {
@@ -2543,7 +2613,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		if (currentAgentId || !hierarchyRegistryDir || hierarchyRefreshing || shuttingDown) return;
 		hierarchyRefreshing = true;
 		try {
-			const hierarchy = await readHierarchySnapshots(hierarchyRegistryDir);
+			const hierarchy = await readHierarchySnapshots(hierarchyRegistryDir, hierarchySnapshotCache);
 			hierarchyRecords = hierarchy.records;
 			hierarchyBatches = hierarchy.batches;
 			refreshWidget();
@@ -2565,7 +2635,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		const hasActive = widgetRecords.some(isActive);
 		const hasRecentFinished = widgetRecords.some((record) => isRecentlyFinished(record, Date.now()));
 		if (hasActive) {
-			if (!widgetAnimationTimer) widgetAnimationTimer = setInterval(() => widgetTui?.requestRender(), SPINNER_INTERVAL_MS);
+			if (!widgetAnimationTimer) widgetAnimationTimer = setInterval(() => widgetTui?.requestRender(), WIDGET_CLOCK_REFRESH_MS);
 			if (widgetClockTimer) clearInterval(widgetClockTimer);
 			widgetClockTimer = undefined;
 			return;
@@ -2576,7 +2646,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			widgetClockTimer = setInterval(() => {
 				widgetTui?.requestRender();
 				syncWidgetTimers();
-			}, 1_000);
+			}, WIDGET_CLOCK_REFRESH_MS);
 		} else if (!hasRecentFinished && widgetClockTimer) {
 			clearInterval(widgetClockTimer);
 			widgetClockTimer = undefined;
@@ -2585,8 +2655,16 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	const refreshWidget = () => {
 		if (!latestCtx || latestCtx.mode !== "tui" || shuttingDown) return;
-		widgetRecords = mergedById(manager?.list() ?? [], hierarchyRecords);
-		widgetBatches = mergedById(manager?.listBatches() ?? [], hierarchyBatches);
+		const nextRecords = mergedById(manager?.list() ?? [], hierarchyRecords);
+		const nextBatches = mergedById(manager?.listBatches() ?? [], hierarchyBatches);
+		const nextFingerprint = widgetFingerprint(nextRecords, nextBatches);
+		const stateChanged = nextFingerprint !== widgetStateFingerprint;
+		if (stateChanged) {
+			widgetRecords = nextRecords;
+			widgetBatches = nextBatches;
+			widgetStateFingerprint = nextFingerprint;
+			widgetRevision++;
+		}
 		if (widgetRecords.length === 0) {
 			if (widgetInstalled) latestCtx.ui.setWidget(WIDGET_ID, undefined);
 			widgetInstalled = false;
@@ -2602,11 +2680,12 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				return widgetComponent(
 					() => widgetRecords,
 					() => widgetBatches,
+					() => widgetRevision,
 					theme,
 					() => { if (widgetTui === tui) widgetTui = undefined; },
 				);
 			});
-		} else {
+		} else if (stateChanged) {
 			widgetTui?.requestRender();
 		}
 		syncWidgetTimers();
@@ -3133,7 +3212,6 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		await publishCurrentHierarchy();
 		shuttingDown = true;
 		if (hierarchyTimer) clearInterval(hierarchyTimer);
 		if (hierarchyPublishTimer) clearTimeout(hierarchyPublishTimer);
@@ -3148,5 +3226,16 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		const active = manager;
 		manager = undefined;
 		if (active) await active.dispose();
+		if (currentAgentId && hierarchyRegistryDir) {
+			try {
+				if (active) await publishHierarchySnapshot(hierarchyRegistryDir, currentAgentId, active.list(), active.listBatches());
+				else await removeHierarchyReporter(hierarchyRegistryDir, currentAgentId);
+			} catch {
+				// Hierarchy reporting must not prevent a clean Pi shutdown.
+			}
+		} else if (hierarchyRegistryDir) {
+			await rm(hierarchyRegistryDir, { recursive: true, force: true }).catch(() => {});
+			hierarchySnapshotCache.clear();
+		}
 	});
 }
