@@ -36,6 +36,8 @@ Pi extension for:
 - if `fetch_url` gets a `prompt`, it answers from the bounded fetched text or listing, including GitHub-special payloads; weak ordinary extraction may escalate to Firecrawl when configured
 - fetch artifacts are saved locally in per-request, atomically unique directories; focused GitHub payloads are available as `content.txt`, while sparse-cache paths are supplemental and may change after another checkout
 - Firecrawl crawl failures/cancellations are errors, and crawl startup plus polling share one deadline
+- every billable Firecrawl request checks the live team balance first and fails closed if the balance cannot be read
+- Firecrawl search, scrape fallback, and crawl start stop when credits reach the configured minimum reserve
 - fetched content is explicitly framed as untrusted data for fast-model quality checks and summaries
 
 ## Config
@@ -53,6 +55,7 @@ Or create:
 ```json
 {
   "firecrawlApiKey": "fc-...",
+  "firecrawlMinimumCredits": 100,
   "summaryThresholdChars": 18000,
   "previewChars": 5000,
   "maxConcurrentFetches": 4,
@@ -64,6 +67,9 @@ Or create:
 
 The character limits can also be set with `WEB_SMART_FETCH_SUMMARY_THRESHOLD_CHARS` and
 `WEB_SMART_FETCH_PREVIEW_CHARS`.
+
+`firecrawlMinimumCredits` defaults to `100`. Set it with `FIRECRAWL_MINIMUM_CREDITS` if needed.
+Use `/firecrawl-credits` to show the live balance, plan total, reserve, and reset time.
 
 Resource limits can also be set with:
 

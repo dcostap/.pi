@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { ConcurrencyLimiter } from "./concurrency-limiter.ts";
 import { fetchUrl } from "./fetch-url.ts";
-import { crawlWithFirecrawl, getFirecrawlClient, searchWithFirecrawl } from "./firecrawl.ts";
+import { crawlWithFirecrawl, getFirecrawlClient, getFirecrawlCreditUsage, searchWithFirecrawl } from "./firecrawl.ts";
 import { join } from "node:path";
 import { makeArtifactDir, preview, saveJson, saveText, truncate } from "./utils.ts";
 
@@ -137,6 +137,31 @@ function githubPreviewOnly(output: string): string {
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 	const fetchLimiter = new ConcurrencyLimiter(config.maxConcurrentFetches);
+
+	pi.registerCommand("firecrawl-credits", {
+		description: "Show the Firecrawl credit balance and safety reserve",
+		handler: async (_args, ctx) => {
+			const client = await getFirecrawlClient(config);
+			if (!client) {
+				ctx.ui.notify("Firecrawl is not configured.", "error");
+				return;
+			}
+			try {
+				const usage = await getFirecrawlCreditUsage(client);
+				const reset = usage.billingPeriodEnd
+					? new Date(usage.billingPeriodEnd).toLocaleString()
+					: "unknown";
+				ctx.ui.notify(
+					`Firecrawl: ${usage.remainingCredits}/${usage.planCredits} credits. ` +
+					`Billable requests stop at ${config.firecrawlMinimumCredits}. Reset: ${reset}.`,
+					usage.remainingCredits <= config.firecrawlMinimumCredits ? "warning" : "info",
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Could not read Firecrawl credits: ${message}`, "error");
+			}
+		},
+	});
 
 	pi.registerTool({
 		name: "fetch_url",

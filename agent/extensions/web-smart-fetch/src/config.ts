@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 export type ExtensionConfig = {
 	firecrawlApiKey?: string;
+	firecrawlMinimumCredits: number;
 	summaryThresholdChars: number;
 	previewChars: number;
 	maxConcurrentFetches: number;
@@ -41,6 +42,12 @@ export function loadConfig(): ExtensionConfig {
 	const cfg: ExtensionConfig = {
 		firecrawlApiKey:
 			(process.env.FIRECRAWL_API_KEY || fileConfig.firecrawlApiKey?.toString()) ?? undefined,
+		firecrawlMinimumCredits: boundedInteger(
+			process.env.FIRECRAWL_MINIMUM_CREDITS ?? fileConfig.firecrawlMinimumCredits,
+			100,
+			0,
+			1_000_000,
+		),
 		summaryThresholdChars: boundedInteger(
 			process.env.WEB_SMART_FETCH_SUMMARY_THRESHOLD_CHARS ?? fileConfig.summaryThresholdChars,
 			18_000,

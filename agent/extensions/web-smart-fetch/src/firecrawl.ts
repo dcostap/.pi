@@ -8,9 +8,19 @@ type FirecrawlClient = {
 	apiKey: string;
 	apiUrl: string;
 	maxResponseBytes: number;
+	minimumCredits: number;
 };
 
-async function requestFirecrawl(
+export type FirecrawlCreditUsage = {
+	remainingCredits: number;
+	planCredits: number;
+	billingPeriodStart: string;
+	billingPeriodEnd: string;
+};
+
+const BILLABLE_PATHS = new Set(["/v2/scrape", "/v2/search", "/v2/crawl"]);
+
+async function sendFirecrawlRequest(
 	client: FirecrawlClient,
 	path: string,
 	init?: RequestInit,
@@ -40,6 +50,48 @@ async function requestFirecrawl(
 		throw new Error(`Firecrawl request failed (${path}): ${message}`);
 	}
 	return body;
+}
+
+export async function getFirecrawlCreditUsage(
+	client: FirecrawlClient,
+	signal?: AbortSignal,
+): Promise<FirecrawlCreditUsage> {
+	const body = await sendFirecrawlRequest(client, "/v2/team/credit-usage", undefined, signal);
+	const data = body?.data;
+	if (!Number.isFinite(data?.remainingCredits) || !Number.isFinite(data?.planCredits)) {
+		throw new Error("Firecrawl credit usage response did not contain valid credit balances");
+	}
+	return {
+		remainingCredits: data.remainingCredits,
+		planCredits: data.planCredits,
+		billingPeriodStart: String(data.billingPeriodStart || ""),
+		billingPeriodEnd: String(data.billingPeriodEnd || ""),
+	};
+}
+
+async function requestFirecrawl(
+	client: FirecrawlClient,
+	path: string,
+	init?: RequestInit,
+	parentSignal?: AbortSignal,
+	timeoutMs = FIRECRAWL_TIMEOUT_MS,
+): Promise<any> {
+	if (BILLABLE_PATHS.has(path)) {
+		let usage: FirecrawlCreditUsage;
+		try {
+			usage = await getFirecrawlCreditUsage(client, parentSignal);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			throw new Error(`Firecrawl credit guard could not verify the balance. No billable request was sent. ${reason}`);
+		}
+		if (usage.remainingCredits <= client.minimumCredits) {
+			throw new Error(
+				`Firecrawl credit guard stopped ${path}: ${usage.remainingCredits} credits remain; ` +
+				`the minimum reserve is ${client.minimumCredits}. No billable request was sent.`,
+			);
+		}
+	}
+	return sendFirecrawlRequest(client, path, init, parentSignal, timeoutMs);
 }
 
 function remainingMs(deadline: number, jobId?: string): number {
@@ -78,6 +130,7 @@ export async function getFirecrawlClient(config: ExtensionConfig): Promise<Firec
 		apiKey: config.firecrawlApiKey,
 		apiUrl: FIRECRAWL_API_URL,
 		maxResponseBytes: config.maxFirecrawlResponseBytes,
+		minimumCredits: config.firecrawlMinimumCredits,
 	};
 }
 
