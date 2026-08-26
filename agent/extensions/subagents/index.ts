@@ -37,6 +37,7 @@ import {
 	MAX_SHARED_PROMPT_BYTES,
 	normalizeLegacyStartValue,
 	parseStartRequest,
+	resolveSubagentCwd,
 	THINKING_LEVELS,
 	type BatchSpec,
 	type StartSpec,
@@ -206,6 +207,7 @@ type SerializedAgent = {
 	parentAgentId?: string;
 	contextMode: ContextMode;
 	contextFiles: boolean;
+	cwd?: string;
 	sessionFile: string;
 	sandboxDir: string;
 	systemPromptPath?: string;
@@ -500,6 +502,7 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 		parentAgentId: record.parentAgentId,
 		contextMode: record.contextMode,
 		contextFiles: record.contextFiles,
+		cwd: record.cwd,
 		sessionFile: record.sessionFile,
 		sandboxDir: record.sandboxDir,
 		systemPromptPath: record.systemPromptPath,
@@ -590,6 +593,7 @@ function messageText(message: any): string {
 function inspectPersistedRecord(record: AgentRecord): void {
 	try {
 		const manager = SessionManager.open(record.sessionFile);
+		record.cwd ??= manager.getCwd();
 		const entries = manager.getBranch();
 		const messages = entries.filter((entry: any) => entry?.type === "message").map((entry: any) => entry.message);
 		let maxRun = record.runNumber;
@@ -664,7 +668,7 @@ class RpcClient {
 
 	constructor(
 		private readonly record: AgentRecord,
-		private readonly cwd: string,
+		private readonly parentCwd: string,
 		private readonly onEvent: (event: any) => void,
 		private readonly hierarchyRegistryDir?: string,
 	) {}
@@ -681,7 +685,7 @@ class RpcClient {
 		if (this.record.systemPromptPath) args.push("--append-system-prompt", this.record.systemPromptPath);
 		const invocation = getPiInvocation(args);
 		this.child = spawn(invocation.command, invocation.args, {
-			cwd: this.cwd,
+			cwd: this.record.cwd ?? this.parentCwd,
 			shell: false,
 			stdio: ["pipe", "pipe", "pipe"],
 				env: {
@@ -1291,7 +1295,7 @@ function exactRole(roles: Map<string, SubagentRole>, raw: string | undefined): S
 	return role;
 }
 
-function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): SessionManager {
+function createClonedSessionBeforeLatestUser(ctx: ExtensionContext, childCwd: string): SessionManager {
 	const sourceSessionFile = ctx.sessionManager.getSessionFile();
 	if (!ctx.sessionManager.isPersisted() || !sourceSessionFile) throw new Error("clone context requires a persisted parent session");
 	const branch = ctx.sessionManager.getBranch();
@@ -1302,9 +1306,9 @@ function createClonedSessionBeforeLatestUser(ctx: ExtensionContext): SessionMana
 	}
 	if (latestUserIndex < 0) throw new Error("clone context could not find the current user message");
 	const cloneLeafId = (branch[latestUserIndex - 1] as any)?.id;
-	const source = SessionManager.open(sourceSessionFile, ctx.sessionManager.getSessionDir());
+	const source = (SessionManager.open as any)(sourceSessionFile, ctx.sessionManager.getSessionDir(), childCwd) as SessionManager;
 	if (!cloneLeafId) {
-		return (SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession: sourceSessionFile }) as SessionManager;
+		return (SessionManager.create as any)(childCwd, ctx.sessionManager.getSessionDir(), { parentSession: sourceSessionFile }) as SessionManager;
 	}
 	const cloned = source.createBranchedSession(cloneLeafId);
 	if (!cloned) throw new Error("failed to create cloned subagent session");
@@ -1324,6 +1328,7 @@ async function prepareAgent(
 	const model = exactModel(ctx, spec.model);
 	validateThinking(model, spec.thinking);
 	const contextMode = spec.context ?? "fresh";
+	const childCwd = spec.cwd ?? ctx.cwd;
 	const id = `sa-${randomUUID().slice(0, 8)}`;
 	const sandboxDir = path.join(tmpdir(), "pi-subagents", id);
 	let sessionFile: string | undefined;
@@ -1333,8 +1338,8 @@ async function prepareAgent(
 		const systemPromptBytes = await combinedSystemPrompt(spec, role, ctx.cwd);
 		const parentSession = ctx.sessionManager.isPersisted() ? ctx.sessionManager.getSessionFile() : undefined;
 		const childSession = contextMode === "clone"
-			? createClonedSessionBeforeLatestUser(ctx)
-			: ((SessionManager.create as any)(ctx.cwd, ctx.sessionManager.getSessionDir(), { parentSession }) as SessionManager);
+			? createClonedSessionBeforeLatestUser(ctx, childCwd)
+			: ((SessionManager.create as any)(childCwd, ctx.sessionManager.getSessionDir(), { parentSession }) as SessionManager);
 		sessionFile = childSession.getSessionFile();
 		if (!sessionFile) throw new Error("failed to create a persisted subagent session");
 		childSession.appendSessionInfo(`[Subagent ${id}] ${sanitizeTitle(spec.title)}`);
@@ -1357,6 +1362,7 @@ async function prepareAgent(
 			parentAgentId: process.env[CURRENT_AGENT_ENV] || undefined,
 			contextMode,
 			contextFiles: spec.context_files !== false,
+			cwd: childCwd,
 			sessionFile,
 			sandboxDir,
 			systemPromptPath,
@@ -1365,7 +1371,7 @@ async function prepareAgent(
 			runNumber: 0,
 			contextWindow: model.contextWindow,
 		};
-		return { record: newRecord(serialized), prompt: genericPrompt(serialized.task, sandboxDir, transcript, sharedPrompt) };
+		return { record: newRecord(serialized), prompt: genericPrompt(serialized.task, sandboxDir, transcript, sharedPrompt, childCwd) };
 	} catch (error) {
 		await Promise.all([
 			rm(sandboxDir, { recursive: true, force: true }).catch(() => {}),
@@ -1454,6 +1460,7 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		batchId: record.batchId,
 		parentAgentId: record.parentAgentId,
 		contextFiles: record.contextFiles,
+		cwd: record.cwd,
 		currentRunId: record.currentRunId,
 		activity: currentActivity(record),
 		createdAt: record.createdAt,
@@ -1541,6 +1548,7 @@ function formatStatus(record: AgentRecord): string {
 		record.parentAgentId ? `Parent subagent: ${record.parentAgentId}` : "",
 		`Context: ${record.contextMode}`,
 		`Context files: ${record.contextFiles ? "enabled" : "disabled"}`,
+		`Working directory: ${record.cwd ?? "inherited parent directory"}`,
 		record.currentRunId ? `Current/latest run: ${record.currentRunId}` : "",
 		`Task: ${oneLine(record.currentTaskSummary ?? record.task, 180)}`,
 	];
@@ -2856,6 +2864,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		model: Type.String({ minLength: 1, description: "Required exact provider/model-id. Never inherited or loosely matched." }),
 		thinking: StringEnum(THINKING_LEVELS, { description: "Required explicit Pi thinking level." }),
 		role: Type.Optional(Type.String({ minLength: 1, description: `Optional role. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
+		cwd: Type.Optional(Type.String({ minLength: 1, description: "Optional child working directory. Relative paths resolve from the parent working directory. Use this to place an agent in an existing Git worktree. Nested subagents inherit this directory. Defaults to the parent working directory." })),
 		context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 		context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
 		system_prompt: Type.Optional(Type.String({ minLength: 1, description: "Optional additional system prompt; fresh context only." })),
@@ -2872,7 +2881,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: START_TOOL_NAME,
 		label: "Start Subagent",
-		description: `Start one managed same-cwd Pi subagent or one formal batch and return immediately. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
+		description: `Start one managed Pi subagent or one formal batch and return immediately. Each agent can use an optional working directory, such as an existing Git worktree. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
 		parameters: Type.Object({
 			input_file: Type.Optional(Type.String({ description: "JSON file containing the same single-or-batch request object used inline. Must be supplied by itself." })),
 			batch: Type.Optional(BatchSchema),
@@ -2881,6 +2890,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			model: Type.Optional(Type.String({ description: "Required exact provider/model-id. Never inherited or loosely matched." })),
 			thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Required explicit Pi thinking level." })),
 			role: Type.Optional(Type.String({ description: `Optional role whose instructions are injected into the child system prompt. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
+			cwd: Type.Optional(Type.String({ description: "Optional child working directory. Relative paths resolve from the parent working directory. Use this to place an agent in an existing Git worktree. Nested subagents inherit this directory. Defaults to the parent working directory." })),
 			context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 			context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
 			system_prompt: Type.Optional(Type.String({ description: "Optional additional system prompt; fresh context only." })),
@@ -2902,6 +2912,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 					const model = exactModel(ctx, spec.model);
 					validateThinking(model, spec.thinking);
 					const role = exactRole(roles, spec.role);
+					spec.cwd = await resolveSubagentCwd(spec.cwd, ctx.cwd);
 					await combinedSystemPrompt(spec, role, ctx.cwd);
 				}
 				for (const spec of resolved.specs) {
@@ -2930,7 +2941,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				let text: string;
 				let handlesFile: string | undefined;
 				if (records.length <= NORMAL_LAUNCH_DETAIL_LIMIT) {
-					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
+					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}\n  cwd: ${record.cwd}\n  ${record.state} · session: ${record.sessionFile}`).join("\n\n")}`;
 				} else {
 					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
 					const running = records.length;

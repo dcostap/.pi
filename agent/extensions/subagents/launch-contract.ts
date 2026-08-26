@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { SubagentRole } from "./roles.ts";
 
@@ -14,6 +14,7 @@ export type StartSpec = {
 	model: string;
 	thinking: (typeof THINKING_LEVELS)[number];
 	role?: string;
+	cwd?: string;
 	context?: (typeof CONTEXT_MODES)[number];
 	context_files?: boolean;
 	system_prompt?: string;
@@ -45,13 +46,14 @@ function utf8Bytes(value: string): number {
 function validateStartSpec(value: unknown, location: string): string[] {
 	const errors: string[] = [];
 	if (!isRecord(value)) return [`${location}: expected object`];
-	const allowed = new Set(["title", "task", "model", "thinking", "role", "context", "context_files", "system_prompt", "system_prompt_file"]);
+	const allowed = new Set(["title", "task", "model", "thinking", "role", "cwd", "context", "context_files", "system_prompt", "system_prompt_file"]);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
 	for (const key of ["title", "task", "model"] as const) {
 		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
 	}
 	if (!(THINKING_LEVELS as readonly unknown[]).includes(value.thinking)) errors.push(`${location}.thinking: required; expected one of ${THINKING_LEVELS.join(", ")}`);
 	if (value.role !== undefined && (typeof value.role !== "string" || !cleanText(value.role))) errors.push(`${location}.role: expected non-empty string`);
+	if (value.cwd !== undefined && (typeof value.cwd !== "string" || !cleanText(value.cwd))) errors.push(`${location}.cwd: expected non-empty string`);
 	if (value.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(value.context)) errors.push(`${location}.context: expected one of ${CONTEXT_MODES.join(", ")}`);
 	if (value.context_files !== undefined && typeof value.context_files !== "boolean") errors.push(`${location}.context_files: expected boolean`);
 	if (value.system_prompt !== undefined && (typeof value.system_prompt !== "string" || !cleanText(value.system_prompt))) errors.push(`${location}.system_prompt: expected non-empty string`);
@@ -125,6 +127,15 @@ export function parseStartRequest(value: unknown, location: string): ParsedStart
 	return { specs: [normalized as StartSpec] };
 }
 
+export async function resolveSubagentCwd(requested: string | undefined, parentCwd: string): Promise<string> {
+	const resolved = path.resolve(parentCwd, requested === undefined ? "." : cleanText(requested));
+	const info = await stat(resolved).catch(() => {
+		throw new Error(`cwd does not exist or is unavailable: ${resolved}`);
+	});
+	if (!info.isDirectory()) throw new Error(`cwd is not a directory: ${resolved}`);
+	return realpath(resolved);
+}
+
 async function readCustomSystemPrompt(spec: Pick<StartSpec, "system_prompt" | "system_prompt_file">, cwd: string): Promise<Buffer | undefined> {
 	if (spec.system_prompt !== undefined) {
 		const bytes = Buffer.from(spec.system_prompt, "utf8");
@@ -153,10 +164,11 @@ export async function combinedSystemPrompt(spec: StartSpec, role: SubagentRole |
 	return bytes;
 }
 
-export function genericPrompt(task: string, sandboxDir: string, transcript?: string, sharedPrompt?: string): string {
+export function genericPrompt(task: string, sandboxDir: string, transcript?: string, sharedPrompt?: string, workingDir?: string): string {
 	return [
 		transcript ? `<main_session_transcript>\n${transcript}\n</main_session_transcript>\n` : "",
 		"You are a managed Pi subagent. Complete the assigned task independently.",
+		workingDir ? `Your working directory is: ${workingDir}` : "",
 		`Your scratch sandbox is: ${sandboxDir}`,
 		"Use the sandbox for temporary files. Do not treat the project cwd as scratch space.",
 		"Do not make durable project changes unless the task explicitly asks for them.",
@@ -181,6 +193,7 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>, canRepor
 - Every new subagent requires an exact provider/model-id and an explicit thinking level. Never inherit or guess either value from the main session.
 - Before launching, the user must have established a clear contract for which exact model and thinking level to use for that task or class of tasks. If no such contract exists, ask the user before launching. Use \`pi --list-models <query>\` to search exact IDs as needed.
 - A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
+- Children inherit the parent's working directory by default. Set cwd to use a different existing directory. For example, set cwd to a lead's Git worktree so its nested subagents inherit that worktree.
 - Child Pi context-file discovery defaults to enabled. Set context_files to false only when the user wants the child to ignore AGENTS.md and CLAUDE.md files; this does not restrict filesystem access or disable other project resources.
 - Reuse an existing subagent with subagent_send only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
 - Use subagent_status only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.

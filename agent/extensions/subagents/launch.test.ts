@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { buildMainInstructions, combinedSystemPrompt, genericPrompt, parseStartRequest } from "./launch-contract.ts";
+import { realpath } from "node:fs/promises";
+import { buildMainInstructions, combinedSystemPrompt, genericPrompt, parseStartRequest, resolveSubagentCwd } from "./launch-contract.ts";
 import type { SubagentRole } from "./roles.ts";
 
 const reviewRole: SubagentRole = {
@@ -37,6 +38,33 @@ describe("subagent launch requests", () => {
 			thinking: "high",
 			context_files: "no",
 		}, "tool input")).toThrow("context_files: expected boolean");
+	});
+
+	test("accepts an optional child working directory", () => {
+		const request = parseStartRequest({
+			title: "Worktree lead",
+			task: "Work in the assigned tree",
+			model: "p/m",
+			thinking: "high",
+			cwd: "../feature-worktree",
+		}, "tool input");
+		expect(request.specs[0]?.cwd).toBe("../feature-worktree");
+	});
+
+	test("rejects an empty child working directory", () => {
+		expect(() => parseStartRequest({
+			title: "Worktree lead",
+			task: "Work",
+			model: "p/m",
+			thinking: "high",
+			cwd: " ",
+		}, "tool input")).toThrow("cwd: expected non-empty string");
+	});
+
+	test("resolves child working directories from the parent", async () => {
+		expect(await resolveSubagentCwd(".", process.cwd())).toBe(await realpath(process.cwd()));
+		await expect(resolveSubagentCwd("agent/extensions/subagents/launch-contract.ts", process.cwd())).rejects.toThrow("cwd is not a directory");
+		await expect(resolveSubagentCwd("missing-worktree", process.cwd())).rejects.toThrow("cwd does not exist or is unavailable");
 	});
 
 	test("requires a non-empty shared prompt for formal batches", () => {
@@ -83,7 +111,8 @@ describe("subagent launch requests", () => {
 	});
 
 	test("keeps shared and individual assignments distinct", () => {
-		const prompt = genericPrompt("Individual focus", "C:/scratch", undefined, "Shared target");
+		const prompt = genericPrompt("Individual focus", "C:/scratch", undefined, "Shared target", "C:/worktree");
+		expect(prompt).toContain("Your working directory is: C:/worktree");
 		expect(prompt).toContain("<shared_assignment>\nShared target\n</shared_assignment>");
 		expect(prompt).toContain("<individual_task>\nIndividual focus\n</individual_task>");
 		expect(prompt).not.toContain("subagent_role");
@@ -104,6 +133,7 @@ describe("subagent launch requests", () => {
 		const instructions = buildMainInstructions(new Map([[reviewRole.name, reviewRole]]));
 		expect(instructions).toContain("Available roles:\n- review: Independent read-only code review.");
 		expect(instructions).toContain("Never start Pi through bash as a substitute for subagent_start.");
+		expect(instructions).toContain("For example, set cwd to a lead's Git worktree");
 		expect(instructions).toContain('When the user requests "<role> subagents", use that role for each launched subagent.');
 		expect(instructions).not.toContain("For example, \"launch 3 review subagents\"");
 	});
