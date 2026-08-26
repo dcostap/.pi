@@ -68,6 +68,8 @@ import {
 	PARENT_REPORT_DELIVERIES,
 	parentReportNotification,
 	parseParentReportEvent,
+	takeParentReportBatch,
+	type ParentReportDeliveryOpportunity,
 	type ParentReportDelivery,
 } from "./parent-report.ts";
 
@@ -284,6 +286,10 @@ type ParentMessage = {
 	id: string;
 	message: string;
 	delivery: ParentReportDelivery;
+};
+
+type PendingParentMessage = ParentMessage & {
+	title: string;
 };
 
 type ActiveWait = {
@@ -2644,6 +2650,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let hierarchyPublishing = false;
 	let hierarchyRefreshing = false;
 	let hierarchyPublishedFingerprint: string | undefined;
+	const pendingParentReports: PendingParentMessage[] = [];
+	let parentReportFlushScheduled = false;
 	let completionFlushScheduled = false;
 	let completionFlushRunning = false;
 	let widgetInstalled = false;
@@ -2782,6 +2790,47 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		}, WIDGET_STATE_REFRESH_MS);
 	};
 
+	const flushParentReports = (opportunity: ParentReportDeliveryOpportunity): boolean => {
+		if (shuttingDown || pendingParentReports.length === 0) return false;
+		const reports = takeParentReportBatch(pendingParentReports, opportunity);
+		if (reports.length === 0) return false;
+		const content = reports.length === 1
+			? `Mid-task message from ${reports[0]!.id} · ${reports[0]!.title}:\n\n${reports[0]!.message}`
+			: `Mid-task reports (${reports.length}):\n\n${reports.map((report, index) => `${index + 1}. ${report.id} · ${report.title}\n${report.message}`).join("\n\n")}`;
+		const deliverAs = opportunity === "turn_end" ? "steer" : "followUp";
+		const reportDetails = reports.map((report) => ({
+			agentId: report.id,
+			title: report.title,
+			message: report.message,
+			delivery: report.delivery,
+		}));
+		try {
+			pi.sendMessage({
+				customType: "subagent-parent-report",
+				content,
+				display: true,
+				details: {
+					reports: reportDetails,
+					...(reportDetails.length === 1 ? reportDetails[0] : {}),
+				},
+			}, { deliverAs, triggerTurn: true });
+			return true;
+		} catch (error) {
+			pendingParentReports.unshift(...reports);
+			if (latestCtx?.hasUI) latestCtx.ui.notify(`Could not deliver subagent report: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return false;
+		}
+	};
+
+	const scheduleParentReportFlush = () => {
+		if (parentReportFlushScheduled || shuttingDown || !latestCtx?.isIdle()) return;
+		parentReportFlushScheduled = true;
+		queueMicrotask(() => {
+			parentReportFlushScheduled = false;
+			flushParentReports("idle");
+		});
+	};
+
 	const flushCompletions = async () => {
 		if (completionFlushRunning || shuttingDown || !latestCtx?.isIdle() || !manager) return;
 		const deliverable = manager.getDeliverable();
@@ -2836,12 +2885,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			if (event.kind === "settled") scheduleCompletionFlush();
 			if (event.kind === "parent_message" && !event.interruptedWait) {
 				const record = manager!.get(event.id);
-				pi.sendMessage({
-					customType: "subagent-parent-report",
-					content: `Mid-task message from ${record.id} · ${record.title}:\n\n${event.message}`,
-					display: true,
-					details: { agentId: record.id, title: record.title, delivery: event.delivery },
-				}, { deliverAs: event.delivery === "steer" ? "steer" : "followUp", triggerTurn: true });
+				pendingParentReports.push({ id: record.id, title: record.title, message: event.message, delivery: event.delivery });
+				scheduleParentReportFlush();
 			}
 		});
 		refreshWidget();
@@ -2849,11 +2894,17 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		return manager;
 	};
 
-	// A child can settle while the parent is in the middle of a turn, when
+	pi.on("turn_end", (_event, ctx) => {
+		latestCtx = ctx;
+		flushParentReports("turn_end");
+	});
+
+	// A child can settle while the parent is in the middle of a run, when
 	// follow-up delivery is intentionally deferred. Re-check as soon as that
-	// parent turn ends so completed results are not stranded indefinitely.
+	// parent run ends so completed results are not stranded indefinitely.
 	pi.on("agent_end", (_event, ctx) => {
 		latestCtx = ctx;
+		flushParentReports("agent_end");
 		queueMicrotask(scheduleCompletionFlush);
 	});
 
@@ -3349,11 +3400,13 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		latestCtx = ctx;
-		await flushCompletions();
+		if (!flushParentReports("idle")) await flushCompletions();
 	});
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		pendingParentReports.length = 0;
+		parentReportFlushScheduled = false;
 		if (hierarchyTimer) clearInterval(hierarchyTimer);
 		if (hierarchyPublishTimer) clearTimeout(hierarchyPublishTimer);
 		hierarchyTimer = undefined;
