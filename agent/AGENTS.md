@@ -8,4 +8,3 @@ This rule applies to all prose you write: docs, commit messages, PR descriptions
 - Write short sentences. Use 20 words or less for instructions.
 - Use active voice. Write "Turn the switch", not "The switch must be turned".
 - Write short paragraphs. Keep one topic in each paragraph.
-
