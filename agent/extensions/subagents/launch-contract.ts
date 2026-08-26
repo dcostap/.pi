@@ -169,8 +169,11 @@ export function genericPrompt(task: string, sandboxDir: string, transcript?: str
 	].filter(Boolean).join("\n");
 }
 
-export function buildMainInstructions(roles: Map<string, SubagentRole>): string {
+export function buildMainInstructions(roles: Map<string, SubagentRole>, canReportToParent = false): string {
 	const roleText = [...roles.values()].map((role) => `- ${role.name}: ${role.description}`).join("\n");
+	const parentReportRule = canReportToParent
+		? "\n- Use subagent_report only for mid-task messages that the parent needs while you continue. A report ends a parent wait that includes you. Do not use it to report task or work completion. Do not use it for final reports. Pi sends your final answer to the parent automatically when you stop."
+		: "";
 	return `Managed subagents:
 - Do not launch subagents unless the user explicitly asks for delegated/subagent work or has already established that subagents should be used for the current task.
 - Use subagent_start for ordinary delegated work and formal batches. subagent_start returns immediately; continue useful work instead of polling.
@@ -186,7 +189,7 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>): string 
 - Cancelling or timing out subagent_wait leaves unfinished subagents running.
 - Use subagent_result for unattended, historical, or specific completed runs when their answer is needed outside the original batch wait.
 - subagent_stop stops current work but preserves the child Pi session for later continuation.
-- Multiple subagent_start calls in one assistant turn may run in parallel. For large programmatic launches, subagent_start accepts input_file by itself containing the same single-or-batch request object used inline.
+- Multiple subagent_start calls in one assistant turn may run in parallel. For large programmatic launches, subagent_start accepts input_file by itself containing the same single-or-batch request object used inline.${parentReportRule}
 
 Available roles${roleText ? ":" : ": none"}
 ${roleText}

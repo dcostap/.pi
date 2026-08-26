@@ -107,4 +107,13 @@ describe("subagent launch requests", () => {
 		expect(instructions).toContain('When the user requests "<role> subagents", use that role for each launched subagent.');
 		expect(instructions).not.toContain("For example, \"launch 3 review subagents\"");
 	});
+
+	test("limits parent reports to mid-task messages", () => {
+		const instructions = buildMainInstructions(new Map(), true);
+		expect(instructions).toContain("Use subagent_report only for mid-task messages");
+		expect(instructions).toContain("A report ends a parent wait that includes you.");
+		expect(instructions).toContain("Do not use it to report task or work completion.");
+		expect(instructions).toContain("Do not use it for final reports.");
+		expect(instructions).toContain("Pi sends your final answer to the parent automatically when you stop.");
+	});
 });

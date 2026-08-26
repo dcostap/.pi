@@ -63,12 +63,19 @@ import {
 	type HierarchySnapshot,
 } from "./hierarchy-registry.ts";
 import { isUnusedRpcStreamEvent } from "./rpc-event-filter.ts";
+import {
+	PARENT_REPORT_DELIVERIES,
+	parentReportNotification,
+	parseParentReportEvent,
+	type ParentReportDelivery,
+} from "./parent-report.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
 const START_TOOL_NAME = "subagent_start";
 const LIST_TOOL_NAME = "subagent_list";
 const STATUS_TOOL_NAME = "subagent_status";
 const SEND_TOOL_NAME = "subagent_send";
+const REPORT_TOOL_NAME = "subagent_report";
 const WAIT_TOOL_NAME = "subagent_wait";
 const RESULT_TOOL_NAME = "subagent_result";
 const STOP_TOOL_NAME = "subagent_stop";
@@ -268,13 +275,27 @@ type PreparedAgent = {
 
 type ManagerEvent =
 	| { kind: "changed"; id: string }
-	| { kind: "settled"; id: string };
+	| { kind: "settled"; id: string }
+	| { kind: "parent_message"; id: string; message: string; delivery: ParentReportDelivery; interruptedWait: boolean };
+
+type ParentMessage = {
+	id: string;
+	message: string;
+	delivery: ParentReportDelivery;
+};
+
+type ActiveWait = {
+	ids: Set<string>;
+	report?: ParentMessage;
+	resolveReport: (report: ParentMessage) => void;
+};
 
 type WaitResult = {
 	mode: WaitMode;
 	selected: AgentRecord[];
 	settled: AgentRecord[];
 	pending: AgentRecord[];
+	report?: ParentMessage;
 };
 
 type LaunchManifestMetadata = {
@@ -790,6 +811,7 @@ class SubagentManager {
 	private readonly batches = new Map<string, BatchRecord>();
 	private readonly queue: AgentRecord[] = [];
 	private readonly listeners = new Set<(event: ManagerEvent) => void>();
+	private readonly activeWaits = new Set<ActiveWait>();
 	private disposed = false;
 
 	constructor(
@@ -904,8 +926,12 @@ class SubagentManager {
 		this.assertActive();
 		const records = [...new Set(ids)].map((id) => this.get(id));
 		for (const record of records) record.waiters++;
-		let completed = false;
+		let deliveryHandled = false;
 		let abortHandler: (() => void) | undefined;
+		let resolveReport!: (report: ParentMessage) => void;
+		const reportPromise = new Promise<ParentMessage>((resolve) => { resolveReport = resolve; });
+		const activeWait: ActiveWait = { ids: new Set(records.map((record) => record.id)), resolveReport };
+		this.activeWaits.add(activeWait);
 		const abortPromise = signal ? new Promise<never>((_resolve, reject) => {
 			abortHandler = () => reject(new SubagentWaitAbortedError());
 			signal.addEventListener("abort", abortHandler, { once: true });
@@ -917,33 +943,45 @@ class SubagentManager {
 			if (mode === "any") {
 				while (true) {
 					({ settled, pending } = incrementalWaitState(records));
-					if (settled.length > 0 || pending.length === 0) break;
+					if (activeWait.report || settled.length > 0 || pending.length === 0) break;
 					await Promise.race([
 						Promise.race(pending.map((record) => record.completion ?? Promise.resolve())),
+						reportPromise,
 						abortPromise,
 					]);
 				}
 			} else {
 				await Promise.race([
 					Promise.all(records.map((record) => record.completion ?? Promise.resolve())),
+					reportPromise,
 					abortPromise,
 				]);
 				settled = records;
 				pending = [];
+			}
+			if (activeWait.report) {
+				return {
+					mode,
+					selected: records,
+					settled: [],
+					pending: records.filter((record) => record.state !== "cold"),
+					report: activeWait.report,
+				};
 			}
 			if (consumeDelivery) {
 				for (const record of settled) {
 					record.deliveryConsumed = true;
 					record.deliveryPending = false;
 				}
+				deliveryHandled = true;
 			}
-			completed = true;
 			return { mode, selected: records, settled, pending };
 		} finally {
+			this.activeWaits.delete(activeWait);
 			if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
 			for (const record of records) {
 				record.waiters = Math.max(0, record.waiters - 1);
-				if (!completed && record.waiters === 0 && record.state === "cold" && !record.deliveryConsumed) {
+				if (!deliveryHandled && record.waiters === 0 && record.state === "cold" && !record.deliveryConsumed) {
 					record.deliveryPending = true;
 					this.emit({ kind: "settled", id: record.id });
 				}
@@ -1143,6 +1181,20 @@ class SubagentManager {
 		const now = Date.now();
 		record.updatedAt = now;
 		record.lastObservedAt = now;
+		const parentReport = parseParentReportEvent(event);
+		if (parentReport) {
+			addActivity(record, `reported to parent: ${oneLine(parentReport.message, 90)}`, now);
+			const message = { id: record.id, ...parentReport };
+			let interruptedWait = false;
+			for (const activeWait of this.activeWaits) {
+				if (!activeWait.ids.has(record.id) || activeWait.report) continue;
+				activeWait.report = message;
+				activeWait.resolveReport(message);
+				interruptedWait = true;
+			}
+			this.emit({ kind: "parent_message", ...message, interruptedWait });
+			return true;
+		}
 		const runtimeActivity = applyRuntimeStatusEvent(record, event);
 		if (runtimeActivity) addActivity(record, runtimeActivity, now);
 		if (event.type === "agent_start") {
@@ -2436,7 +2488,8 @@ function completionSummaryResult(resultValue: any, options: { expanded: boolean;
  */
 function waitSummaryResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown): Text | ReturnType<typeof completionSummaryResult> {
 	const noEligibleAgents = resultValue?.details?.noEligibleAgents === true;
-	if (options.expanded && !options.isPartial && !resultValue?.details?.timedOut && !noEligibleAgents) {
+	const parentReport = resultValue?.details?.parentReport;
+	if (options.expanded && !options.isPartial && !resultValue?.details?.timedOut && !noEligibleAgents && !parentReport) {
 		return completionSummaryResult(resultValue, options, theme, lastComponent);
 	}
 	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
@@ -2450,6 +2503,11 @@ function waitSummaryResult(resultValue: any, options: { expanded: boolean; isPar
 	}
 	const agents = displayAgents(resultValue?.details);
 	const pending = displayAgents({ agents: resultValue?.details?.pendingAgents });
+	if (!options.isPartial && isRecord(parentReport) && typeof parentReport.id === "string" && typeof parentReport.message === "string") {
+		const pendingText = pending.length > 0 ? `\n${theme.fg("dim", `${pending.length} still running`)}` : "";
+		component.setText(`${theme.fg("warning", `◆ Mid-task report · ${parentReport.id}`)}\n${oneLine(parentReport.message, 500)}${pendingText}`);
+		return component;
+	}
 	const timedOut = resultValue?.details?.timedOut === true;
 	const failures = agents.filter((agent) => displayState(agent) === "failed").length;
 	const settled = agents.filter((agent) => displayState(agent) === "completed" || displayState(agent) === "failed" || displayState(agent) === "stopped" || displayState(agent) === "interrupted").length;
@@ -2768,6 +2826,15 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			scheduleWidgetRefresh();
 			scheduleHierarchyPublish();
 			if (event.kind === "settled") scheduleCompletionFlush();
+			if (event.kind === "parent_message" && !event.interruptedWait) {
+				const record = manager!.get(event.id);
+				pi.sendMessage({
+					customType: "subagent-parent-report",
+					content: `Mid-task message from ${record.id} · ${record.title}:\n\n${event.message}`,
+					display: true,
+					details: { agentId: record.id, title: record.title, delivery: event.delivery },
+				}, { deliverAs: event.delivery === "steer" ? "steer" : "followUp", triggerTurn: true });
+			}
 		});
 		refreshWidget();
 		scheduleHierarchyPublish();
@@ -2782,7 +2849,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		queueMicrotask(scheduleCompletionFlush);
 	});
 
-	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions(roles)}` }));
+	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions(roles, Boolean(currentAgentId))}` }));
 	const AgentSpecSchema = Type.Object({
 		title: Type.String({ minLength: 1, description: "Short human-readable subagent title." }),
 		task: Type.String({ minLength: 1, description: "Complete individual task for this subagent." }),
@@ -3008,7 +3075,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: WAIT_TOOL_NAME,
 		label: "Wait for Subagents",
-		description: "Wait for subagents by ids, formal batch_id, or handle file. Omit selectors with wait_mode \"any\" to wait for the next result from any active direct subagent. wait_mode \"all\" requires a selector and returns every selected result. An \"any\" wait returns only new results and leaves the rest running. Cancellation or timeout leaves unfinished subagents running.",
+		description: "Wait for subagents by ids, formal batch_id, or handle file. A mid-task report from a selected subagent ends the wait immediately. Omit selectors with wait_mode \"any\" to wait for the next result from any active direct subagent. wait_mode \"all\" requires a selector and returns every selected result. An \"any\" wait returns only new results and leaves the rest running. Cancellation, timeout, or a report leaves unfinished subagents running.",
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, description: "Selected subagent IDs. Omit every selector with wait_mode any to use all active direct subagents." })),
 			batch_id: Type.Optional(Type.String({ minLength: 1, description: "Select every member of one formal batch. Mutually exclusive with ids and input_file." })),
@@ -3048,6 +3115,19 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				}, 1_000);
 				try {
 					const waited = await activeManager.wait(ids, waitController.signal, true, waitMode);
+					if (waited.report) {
+						const source = activeManager.get(waited.report.id);
+						const pendingText = waited.pending.length > 0
+							? `\n\nStill running (${waited.pending.length}):\n${formatList(waited.pending, selectedBatches)}`
+							: "";
+						return result(`Wait ended by a mid-task report from ${source.id} · ${source.title}:\n\n${waited.report.message}${pendingText}`, {
+							agents: selectedRecords.map(compactRecord),
+							batches: selectedBatches.map(compactBatch),
+							pendingAgents: waited.pending.map(compactRecord),
+							waitMode,
+							parentReport: waited.report,
+						});
+					}
 					const snapshots = waited.settled.map((record) => record.latestCompletion ?? completionSnapshot(record));
 					const completion = await buildCompletionResult(
 						snapshots,
@@ -3214,6 +3294,30 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 					overlayOptions: { anchor: "center", width: "90%", minWidth: 72, maxHeight: "90%", margin: 1 },
 				},
 			);
+		},
+	});
+
+	if (currentAgentId) pi.registerTool({
+		name: REPORT_TOOL_NAME,
+		label: "Report to Parent",
+		description: "Send a mid-task message to this subagent's parent without stopping. The report immediately ends a parent wait that includes this subagent. Use it only for blockers, major issues, and coordination decisions. Use it only when the parent needs information while work continues. Do not use it to report task or work completion. Do not use it for final reports. Pi sends the final answer automatically when this subagent stops.",
+		parameters: Type.Object({
+			message: Type.String({ minLength: 1, description: "Mid-task message for the parent." }),
+			delivery: Type.Optional(StringEnum(PARENT_REPORT_DELIVERIES, { description: "steer delivers after the parent's current tool calls. follow_up waits until the parent finishes its current run. Defaults to follow_up." })),
+		}, { additionalProperties: false }),
+		async execute(_toolId, params, _signal, _onUpdate, ctx) {
+			const message = cleanText(params.message);
+			if (!message) throw new Error("message must not be empty");
+			const delivery = params.delivery ?? "follow_up";
+			ctx.ui.notify(parentReportNotification({ message, delivery }), "info");
+			return result(`Sent mid-task message to parent with ${delivery} delivery. Continue the assigned work.`, { delivery });
+		},
+		renderCall(args, theme, context) {
+			const input = args as any;
+			return toolHeader("Report to parent", `${input?.delivery ?? "follow_up"} · ${oneLine(input?.message ?? "", 70)}`, theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			return textOrMarkdownResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent);
 		},
 	});
 
