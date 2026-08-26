@@ -1,5 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { incrementalWaitState } from "./wait-policy.ts";
+import { implicitAnyWaitCandidates, incrementalWaitState } from "./wait-policy.ts";
+
+describe("implicit any waits", () => {
+	test("selects active records and pending deliveries", () => {
+		const records = [
+			{ id: "queued", state: "queued", deliveryPending: false, deliveryConsumed: false },
+			{ id: "running", state: "running", deliveryPending: false, deliveryConsumed: false },
+			{ id: "fresh", state: "cold", deliveryPending: true, deliveryConsumed: false },
+			{ id: "historical", state: "cold", deliveryPending: false, deliveryConsumed: false },
+			{ id: "stopping-consumed", state: "stopping", deliveryPending: false, deliveryConsumed: true },
+			{ id: "consumed", state: "cold", deliveryPending: true, deliveryConsumed: true },
+		];
+
+		expect(implicitAnyWaitCandidates(records).map((record) => record.id)).toEqual(["queued", "running", "fresh"]);
+	});
+});
 
 describe("incremental subagent waits", () => {
 	test("returns only undelivered settled records", () => {

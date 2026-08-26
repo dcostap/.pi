@@ -182,6 +182,7 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>): string 
 - Reuse an existing subagent with subagent_send only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
 - Use subagent_status only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
 - For work sharing common context, launch a formal batch with a shared_prompt and individual agent tasks. Then call subagent_wait once with its batch_id and required wait_mode. Use wait_mode "all" for the complete batch; use wait_mode "any" when the first settled result is sufficient. An "any" wait returns the settled subset and leaves the remaining agents running.
+- Call subagent_wait with only wait_mode "any" to wait for the next result from any active direct subagent.
 - Cancelling or timing out subagent_wait leaves unfinished subagents running.
 - Use subagent_result for unattended, historical, or specific completed runs when their answer is needed outside the original batch wait.
 - subagent_stop stops current work but preserves the child Pi session for later continuation.

@@ -55,7 +55,7 @@ import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/align
 import { SPINNER_INTERVAL_MS, spinnerFrame } from "../_shared/spinner.ts";
 import { buildVisibleTree } from "./tree.ts";
 import { MAX_LISTED_SUBAGENTS, takeRecent } from "./list-policy.ts";
-import { incrementalWaitState } from "./wait-policy.ts";
+import { implicitAnyWaitCandidates, incrementalWaitState } from "./wait-policy.ts";
 import {
 	publishHierarchySnapshot as writeHierarchySnapshot,
 	readHierarchyRegistry,
@@ -2435,12 +2435,17 @@ function completionSummaryResult(resultValue: any, options: { expanded: boolean;
  * completion report through completionSummaryResult.
  */
 function waitSummaryResult(resultValue: any, options: { expanded: boolean; isPartial: boolean; isError?: boolean }, theme: Theme, lastComponent?: unknown): Text | ReturnType<typeof completionSummaryResult> {
-	if (options.expanded && !options.isPartial && !resultValue?.details?.timedOut) {
+	const noEligibleAgents = resultValue?.details?.noEligibleAgents === true;
+	if (options.expanded && !options.isPartial && !resultValue?.details?.timedOut && !noEligibleAgents) {
 		return completionSummaryResult(resultValue, options, theme, lastComponent);
 	}
 	const component = lastComponent instanceof Text ? lastComponent : new Text("", 0, 0);
 	if (options.isError) {
 		component.setText(theme.fg("error", `! ${oneLine(resultText(resultValue) || "Wait failed", 500)}`));
+		return component;
+	}
+	if (noEligibleAgents) {
+		component.setText(theme.fg("muted", "· No active direct subagents or undelivered results"));
 		return component;
 	}
 	const agents = displayAgents(resultValue?.details);
@@ -2509,6 +2514,18 @@ async function resolveIds(params: { ids?: string[]; batch_id?: string; input_fil
 	const ids = [...new Set(params.ids.map((id) => cleanText(id)).filter(Boolean))];
 	if (ids.length === 0) throw new Error("ids must contain at least one non-empty ID");
 	return ids;
+}
+
+async function resolveWaitIds(
+	params: { ids?: string[]; batch_id?: string; input_file?: string },
+	cwd: string,
+	manager: SubagentManager,
+	mode: WaitMode,
+): Promise<string[]> {
+	const hasSelector = params.ids !== undefined || params.batch_id !== undefined || params.input_file !== undefined;
+	if (hasSelector) return resolveIds(params, cwd, manager);
+	if (mode !== "any") throw new Error("ids, batch_id, or input_file is required for wait_mode \"all\"");
+	return implicitAnyWaitCandidates(manager.list()).map((record) => record.id);
 }
 
 export default async function subagentsExtension(pi: ExtensionAPI) {
@@ -2991,20 +3008,29 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: WAIT_TOOL_NAME,
 		label: "Wait for Subagents",
-		description: "Wait for selected subagents by ids, formal batch_id, or handle file. Required wait_mode \"all\" waits for every selected agent and returns their integrated results; \"any\" waits for the next undelivered completion, returns only new results, and leaves the rest running. Cancellation or timeout leaves unfinished subagents running.",
+		description: "Wait for subagents by ids, formal batch_id, or handle file. Omit selectors with wait_mode \"any\" to wait for the next result from any active direct subagent. wait_mode \"all\" requires a selector and returns every selected result. An \"any\" wait returns only new results and leaves the rest running. Cancellation or timeout leaves unfinished subagents running.",
 		parameters: Type.Object({
-			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, description: "Selected subagent IDs. Omit every selector with wait_mode any to use all active direct subagents." })),
 			batch_id: Type.Optional(Type.String({ minLength: 1, description: "Select every member of one formal batch. Mutually exclusive with ids and input_file." })),
-			input_file: Type.Optional(Type.String()),
-			wait_mode: StringEnum(["all", "any"] as const, { description: "Required: all waits for every selected agent; any waits for and returns only the next undelivered completion set." }),
+			input_file: Type.Optional(Type.String({ description: "Handle JSON file returned by a large subagent_start call. Mutually exclusive with ids and batch_id." })),
+			wait_mode: StringEnum(["all", "any"] as const, { description: "Required: all waits for every selected agent; any waits for the next undelivered completion. Omit selectors with any to use all active direct subagents." }),
 			timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400 })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			try {
 				const activeManager = ensureManager(ctx);
-				const ids = await resolveIds(params, ctx.cwd, activeManager);
 				if (params.wait_mode !== "all" && params.wait_mode !== "any") throw new Error("wait_mode is required and must be \"all\" or \"any\"");
 				const waitMode = params.wait_mode as WaitMode;
+				const ids = await resolveWaitIds(params, ctx.cwd, activeManager, waitMode);
+				if (ids.length === 0) {
+					return result("No active direct subagents or undelivered results are available.", {
+						agents: [],
+						batches: [],
+						pendingAgents: [],
+						waitMode,
+						noEligibleAgents: true,
+					});
+				}
 				const selectedRecords = ids.map((id) => activeManager.get(id));
 				const selectedBatchIds = new Set(selectedRecords.map((record) => record.batchId).filter((id): id is string => Boolean(id)));
 				const selectedBatches = activeManager.listBatches().filter((batch) => selectedBatchIds.has(batch.id));
@@ -3061,7 +3087,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			renderCall(args, theme, context) {
 			const input = args as any;
 			const count = Array.isArray(input?.ids) ? input.ids.length : undefined;
-			const selected = input?.batch_id ? `batch ${input.batch_id}` : count !== undefined ? "" : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "";
+			const selected = input?.batch_id ? `batch ${input.batch_id}` : count !== undefined ? "" : input?.input_file ? `manifest ${path.basename(input.input_file)}` : input?.wait_mode === "any" ? "any active" : "";
 			const waitMode = input?.wait_mode === "any" || input?.wait_mode === "all" ? input.wait_mode : "";
 			const timeout = input?.timeout_seconds ? `· timeout ${formatDuration(input.timeout_seconds * 1_000)}` : "";
 			return toolHeader("Wait for subagents", [selected, waitMode ? `· ${waitMode}` : "", timeout].filter(Boolean).join(" "), theme, context.lastComponent);
