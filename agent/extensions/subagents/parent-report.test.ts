@@ -5,6 +5,7 @@ import {
 	parentReportNotification,
 	parseParentReportEvent,
 	takeParentReportBatch,
+	takeParentReportForWait,
 } from "./parent-report.ts";
 
 describe("subagent parent reports", () => {
@@ -46,6 +47,26 @@ describe("subagent parent reports", () => {
 			expect(takeParentReportBatch(pending, "idle")).toHaveLength(expected);
 			expect(pending).toHaveLength(queued - expected);
 		}
+	});
+
+	test("lets a wait claim an earlier report from a selected subagent", () => {
+		const pending = [
+			{ id: "sa-one", message: "first", delivery: "follow_up" as const },
+			{ id: "sa-two", message: "selected", delivery: "steer" as const },
+			{ id: "sa-one", message: "last", delivery: "steer" as const },
+		];
+		expect(takeParentReportForWait(pending, new Set(["sa-two"]))).toEqual({
+			id: "sa-two",
+			message: "selected",
+			delivery: "steer",
+		});
+		expect(pending.map((report) => report.message)).toEqual(["first", "last"]);
+	});
+
+	test("keeps queued reports when none match a wait", () => {
+		const pending = [{ id: "sa-one", message: "keep", delivery: "follow_up" as const }];
+		expect(takeParentReportForWait(pending, new Set(["sa-two"]))).toBeUndefined();
+		expect(pending).toHaveLength(1);
 	});
 
 	test("takes only steering reports at a turn boundary", () => {

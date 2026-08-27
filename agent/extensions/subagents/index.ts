@@ -69,6 +69,7 @@ import {
 	parentReportNotification,
 	parseParentReportEvent,
 	takeParentReportBatch,
+	takeParentReportForWait,
 	type ParentReportDeliveryOpportunity,
 	type ParentReportDelivery,
 } from "./parent-report.ts";
@@ -286,10 +287,6 @@ type ParentMessage = {
 	id: string;
 	message: string;
 	delivery: ParentReportDelivery;
-};
-
-type PendingParentMessage = ParentMessage & {
-	title: string;
 };
 
 type ActiveWait = {
@@ -820,6 +817,7 @@ class SubagentManager {
 	private readonly records = new Map<string, AgentRecord>();
 	private readonly batches = new Map<string, BatchRecord>();
 	private readonly queue: AgentRecord[] = [];
+	private readonly pendingParentReports: ParentMessage[] = [];
 	private readonly listeners = new Set<(event: ManagerEvent) => void>();
 	private readonly activeWaits = new Set<ActiveWait>();
 	private disposed = false;
@@ -948,6 +946,13 @@ class SubagentManager {
 		}) : new Promise<never>(() => {});
 		try {
 			if (signal?.aborted) throw new SubagentWaitAbortedError();
+			// Register first, then claim an earlier report. New reports now resolve
+			// this active wait, so no report can fall between both paths.
+			const pendingReport = takeParentReportForWait(this.pendingParentReports, activeWait.ids);
+			if (pendingReport) {
+				activeWait.report = pendingReport;
+				activeWait.resolveReport(pendingReport);
+			}
 			let settled: AgentRecord[];
 			let pending: AgentRecord[];
 			if (mode === "any") {
@@ -997,6 +1002,18 @@ class SubagentManager {
 				}
 			}
 		}
+	}
+
+	hasPendingParentReports(): boolean {
+		return this.pendingParentReports.length > 0;
+	}
+
+	takePendingParentReportBatch(opportunity: ParentReportDeliveryOpportunity): ParentMessage[] {
+		return takeParentReportBatch(this.pendingParentReports, opportunity);
+	}
+
+	requeuePendingParentReports(reports: ParentMessage[]): void {
+		this.pendingParentReports.unshift(...reports);
 	}
 
 	async stop(ids: string[]): Promise<AgentRecord[]> {
@@ -1062,6 +1079,7 @@ class SubagentManager {
 		const active = this.list().filter((record) => record.state === "running" || record.state === "starting" || record.state === "queued" || record.state === "stopping");
 		await this.stop(active.map((record) => record.id)).catch(() => {});
 		await Promise.all(active.map((record) => record.client?.terminate().catch(() => {})));
+		this.pendingParentReports.length = 0;
 		this.listeners.clear();
 	}
 
@@ -1202,6 +1220,7 @@ class SubagentManager {
 				activeWait.resolveReport(message);
 				interruptedWait = true;
 			}
+			if (!interruptedWait) this.pendingParentReports.push(message);
 			this.emit({ kind: "parent_message", ...message, interruptedWait });
 			return true;
 		}
@@ -2650,7 +2669,6 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let hierarchyPublishing = false;
 	let hierarchyRefreshing = false;
 	let hierarchyPublishedFingerprint: string | undefined;
-	const pendingParentReports: PendingParentMessage[] = [];
 	let parentReportFlushScheduled = false;
 	let completionFlushScheduled = false;
 	let completionFlushRunning = false;
@@ -2791,20 +2809,22 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	const flushParentReports = (opportunity: ParentReportDeliveryOpportunity): boolean => {
-		if (shuttingDown || pendingParentReports.length === 0) return false;
-		const reports = takeParentReportBatch(pendingParentReports, opportunity);
+		const activeManager = manager;
+		if (shuttingDown || !activeManager?.hasPendingParentReports()) return false;
+		const reports = activeManager.takePendingParentReportBatch(opportunity);
 		if (reports.length === 0) return false;
-		const content = reports.length === 1
-			? `Mid-task message from ${reports[0]!.id} · ${reports[0]!.title}:\n\n${reports[0]!.message}`
-			: `Mid-task reports (${reports.length}):\n\n${reports.map((report, index) => `${index + 1}. ${report.id} · ${report.title}\n${report.message}`).join("\n\n")}`;
-		const deliverAs = opportunity === "turn_end" ? "steer" : "followUp";
-		const reportDetails = reports.map((report) => ({
-			agentId: report.id,
-			title: report.title,
-			message: report.message,
-			delivery: report.delivery,
-		}));
 		try {
+			const titledReports = reports.map((report) => ({ ...report, title: activeManager.get(report.id).title }));
+			const content = titledReports.length === 1
+				? `Mid-task message from ${titledReports[0]!.id} · ${titledReports[0]!.title}:\n\n${titledReports[0]!.message}`
+				: `Mid-task reports (${titledReports.length}):\n\n${titledReports.map((report, index) => `${index + 1}. ${report.id} · ${report.title}\n${report.message}`).join("\n\n")}`;
+			const deliverAs = opportunity === "turn_end" ? "steer" : "followUp";
+			const reportDetails = titledReports.map((report) => ({
+				agentId: report.id,
+				title: report.title,
+				message: report.message,
+				delivery: report.delivery,
+			}));
 			pi.sendMessage({
 				customType: "subagent-parent-report",
 				content,
@@ -2816,14 +2836,14 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			}, { deliverAs, triggerTurn: true });
 			return true;
 		} catch (error) {
-			pendingParentReports.unshift(...reports);
+			activeManager.requeuePendingParentReports(reports);
 			if (latestCtx?.hasUI) latestCtx.ui.notify(`Could not deliver subagent report: ${error instanceof Error ? error.message : String(error)}`, "error");
 			return false;
 		}
 	};
 
 	const scheduleParentReportFlush = () => {
-		if (parentReportFlushScheduled || shuttingDown || !latestCtx?.isIdle()) return;
+		if (parentReportFlushScheduled || shuttingDown || !manager?.hasPendingParentReports() || !latestCtx?.isIdle()) return;
 		parentReportFlushScheduled = true;
 		queueMicrotask(() => {
 			parentReportFlushScheduled = false;
@@ -2884,8 +2904,6 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			scheduleHierarchyPublish();
 			if (event.kind === "settled") scheduleCompletionFlush();
 			if (event.kind === "parent_message" && !event.interruptedWait) {
-				const record = manager!.get(event.id);
-				pendingParentReports.push({ id: record.id, title: record.title, message: event.message, delivery: event.delivery });
 				scheduleParentReportFlush();
 			}
 		});
@@ -3405,7 +3423,6 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
-		pendingParentReports.length = 0;
 		parentReportFlushScheduled = false;
 		if (hierarchyTimer) clearInterval(hierarchyTimer);
 		if (hierarchyPublishTimer) clearTimeout(hierarchyPublishTimer);

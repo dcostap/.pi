@@ -13,6 +13,15 @@ export type ParentReport = {
 
 export type ParentReportDeliveryOpportunity = "turn_end" | "agent_end" | "idle";
 
+export function takeParentReportForWait<T extends ParentReport & { id: string }>(
+	pending: T[],
+	selectedIds: ReadonlySet<string>,
+): T | undefined {
+	const index = pending.findIndex((report) => selectedIds.has(report.id));
+	if (index < 0) return undefined;
+	return pending.splice(index, 1)[0];
+}
+
 /**
  * Remove one delivery batch from a pending report queue.
  * A turn boundary can accept steering reports only. Later boundaries can
