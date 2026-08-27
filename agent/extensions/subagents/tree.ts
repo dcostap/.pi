@@ -17,6 +17,24 @@ export type VisibleTree<T extends TreeItem> = {
 	omitted: number;
 };
 
+/** Count hierarchy levels without treating synthetic tree rows as parents. */
+export function buildHierarchyLevels(items: Array<Pick<TreeItem, "id" | "parentId">>): Map<string, number> {
+	const byId = new Map(items.map((item) => [item.id, item]));
+	const levels = new Map<string, number>();
+	for (const item of items) {
+		let level = 1;
+		let parentId = item.parentId;
+		const seen = new Set([item.id]);
+		while (parentId && !seen.has(parentId)) {
+			level++;
+			seen.add(parentId);
+			parentId = byId.get(parentId)?.parentId;
+		}
+		levels.set(item.id, level);
+	}
+	return levels;
+}
+
 /** Keep every active node and its known ancestors, then render a bounded depth-first tree. */
 export function buildVisibleTree<T extends TreeItem>(items: T[], maxRows: number): VisibleTree<T> {
 	const byId = new Map(items.map((item) => [item.id, item]));

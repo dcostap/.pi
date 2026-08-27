@@ -54,7 +54,7 @@ import {
 import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 import { SPINNER_INTERVAL_MS, spinnerFrame } from "../_shared/spinner.ts";
-import { buildVisibleTree } from "./tree.ts";
+import { buildHierarchyLevels, buildVisibleTree } from "./tree.ts";
 import { MAX_LISTED_SUBAGENTS, takeRecent } from "./list-policy.ts";
 import { implicitAnyWaitCandidates, incrementalWaitState } from "./wait-policy.ts";
 import {
@@ -134,6 +134,13 @@ const SUBAGENT_COLUMNS: readonly AlignedColumn<keyof SubagentDisplayRow>[] = [
 	{ key: "cache", minWidth: 6, maxWidth: 9, align: "right", optional: true, hidePriority: 5 },
 	{ key: "activity", minWidth: 12, maxWidth: 70, shrinkPriority: 4 },
 ];
+
+const SUBAGENT_LEVEL_COLORS = ["accent", "thinkingLow", "thinkingHigh", "thinkingXhigh", "thinkingMax"] as const;
+
+function styledHierarchyText(text: string, level: number, theme: Theme): string {
+	const color = SUBAGENT_LEVEL_COLORS[(Math.max(level, 1) - 1) % SUBAGENT_LEVEL_COLORS.length]!;
+	return theme.fg(color, text);
+}
 
 function renderSubagentTable(rows: SubagentDisplayRow[], width: number): string[] {
 	return renderIndentedAlignedTable(rows, width, SUBAGENT_COLUMNS, {
@@ -1834,6 +1841,7 @@ function widgetLines(
 			record,
 		})),
 	];
+	const levels = buildHierarchyLevels(records.map((record) => ({ id: record.id, parentId: record.parentAgentId })));
 	const tree = buildVisibleTree(nodes, Number.POSITIVE_INFINITY);
 	const rows = tree.rows.map(({ item, prefix, isLast }): SubagentDisplayRow => {
 		const connector = `${isLast ? "└─" : "├─"} `;
@@ -1850,8 +1858,8 @@ function widgetLines(
 			return {
 				indent: theme.fg("dim", prefix),
 				connector: theme.fg("dim", connector),
-				state: styledState(state, theme, "▾"),
-				id: theme.fg("accent", item.batch.id),
+				state: theme.fg("muted", `▾ ${state}`),
+				id: theme.fg("muted", item.batch.id),
 				role: item.batch.role ? theme.fg("accent", `[${item.batch.role}]`) : "",
 				title: theme.bold(oneLine(item.batch.title, 70)),
 				model: "",
@@ -1876,13 +1884,14 @@ function widgetLines(
 		const context = contextMeter(record, theme);
 		const cost = record.usage.cost ? formatCost(record.usage.cost) : "";
 		const cache = formatCacheHitRate(record.usage.latestCacheHitRate, record.usage.cacheRead > 0 || record.usage.cacheWrite > 0);
+		const level = levels.get(record.id) ?? 1;
 		// Activity changes frequently; keep it last so duration and cost remain
 		// stable columns while the value itself updates.
 		return {
 			indent: theme.fg("dim", prefix),
 			connector: theme.fg("dim", connector),
-			state: styledState(state, theme, glyph),
-			id: theme.fg("accent", record.id),
+			state: styledHierarchyText(`${glyph} ${state}`, level, theme),
+			id: styledHierarchyText(record.id, level, theme),
 			role: record.role && batches.find((batch) => batch.id === record.batchId)?.role !== record.role ? theme.fg("accent", `[${record.role}]`) : "",
 			title: theme.fg("muted", oneLine(record.title, 70)),
 			model: theme.fg("dim", `${record.modelRef} [${record.thinking}]`),

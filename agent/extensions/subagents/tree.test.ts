@@ -1,11 +1,26 @@
 import { describe, expect, test } from "bun:test";
-import { buildVisibleTree, type TreeItem } from "./tree.ts";
+import { buildHierarchyLevels, buildVisibleTree, type TreeItem } from "./tree.ts";
 
 type Item = TreeItem & { label: string };
 
 const item = (id: string, parentId: string | undefined, active: boolean, createdAt: number): Item => ({ id, parentId, active, createdAt, label: id });
 
 describe("subagent hierarchy", () => {
+	test("counts agent levels without synthetic batch rows", () => {
+		const levels = buildHierarchyLevels([
+			{ id: "direct" },
+			{ id: "child", parentId: "direct" },
+			{ id: "grandchild", parentId: "child" },
+			{ id: "batch-member" },
+		]);
+		expect([...levels.entries()]).toEqual([
+			["direct", 1],
+			["child", 2],
+			["grandchild", 3],
+			["batch-member", 1],
+		]);
+	});
+
 	test("keeps inactive ancestors of active descendants", () => {
 		const tree = buildVisibleTree([
 			item("parent", undefined, false, 1),
