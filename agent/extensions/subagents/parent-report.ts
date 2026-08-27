@@ -24,8 +24,10 @@ export function takeParentReportBatch<T extends ParentReport>(
 	limit = MAX_PARENT_REPORTS_PER_DELIVERY,
 ): T[] {
 	if (limit <= 0) return [];
+	let batchLimit = limit;
+	while (pending.length >= Math.floor(batchLimit * 2.5)) batchLimit++;
 	const batch: T[] = [];
-	for (let index = 0; index < pending.length && batch.length < limit;) {
+	for (let index = 0; index < pending.length && batch.length < batchLimit;) {
 		const report = pending[index]!;
 		if (opportunity === "turn_end" && report.delivery !== "steer") {
 			index++;

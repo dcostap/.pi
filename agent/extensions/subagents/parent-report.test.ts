@@ -40,6 +40,14 @@ describe("subagent parent reports", () => {
 		expect(pending.map((report) => report.message)).toEqual(["four"]);
 	});
 
+	test("increases the batch limit as the pending queue grows", () => {
+		for (const [queued, expected] of [[6, 3], [7, 4], [9, 4], [10, 5], [11, 5], [12, 6]] as const) {
+			const pending = Array.from({ length: queued }, (_, index) => ({ message: String(index), delivery: "follow_up" as const }));
+			expect(takeParentReportBatch(pending, "idle")).toHaveLength(expected);
+			expect(pending).toHaveLength(queued - expected);
+		}
+	});
+
 	test("takes only steering reports at a turn boundary", () => {
 		const pending = [
 			{ message: "later", delivery: "follow_up" as const },
