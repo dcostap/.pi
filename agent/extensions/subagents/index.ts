@@ -57,6 +57,7 @@ import { SPINNER_INTERVAL_MS, spinnerFrame } from "../_shared/spinner.ts";
 import { buildHierarchyLevels, buildVisibleTree } from "./tree.ts";
 import { MAX_LISTED_SUBAGENTS, takeRecent } from "./list-policy.ts";
 import { implicitAnyWaitCandidates, incrementalWaitState } from "./wait-policy.ts";
+import { widgetRefreshDelay } from "./widget-refresh-policy.ts";
 import {
 	publishHierarchySnapshot as writeHierarchySnapshot,
 	readHierarchyRegistry,
@@ -98,8 +99,6 @@ const RECENT_FINISHED_WIDGET_MS = 60_000;
 const MANUAL_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 
 const WIDGET_ID = "subagents-tree";
-const WIDGET_STATE_REFRESH_MS = 100;
-const WIDGET_CLOCK_REFRESH_MS = 1_000;
 const HIERARCHY_REFRESH_MS = 1_000;
 const HIERARCHY_STALE_MS = 5_000;
 
@@ -150,8 +149,8 @@ function renderSubagentTable(rows: SubagentDisplayRow[], width: number): string[
 	}, (row) => `${row.indent}${row.connector}`);
 }
 
-function widgetSpinnerFrame(now: number): string {
-	const clockTick = Math.floor(now / WIDGET_CLOCK_REFRESH_MS);
+function widgetSpinnerFrame(now: number, refreshDelay: number): string {
+	const clockTick = Math.floor(now / refreshDelay);
 	return spinnerFrame(clockTick * SPINNER_INTERVAL_MS);
 }
 
@@ -1803,6 +1802,29 @@ function contextMeterValues(contextWindow: number | undefined, contextTokens: nu
 	return theme.fg("muted", display);
 }
 
+type WidgetNode = { id: string; parentId?: string; createdAt: number; active: boolean; kind: "agent"; record: AgentRecord }
+	| { id: string; parentId?: string; createdAt: number; active: boolean; kind: "batch"; batch: BatchRecord };
+
+function widgetTree(records: AgentRecord[], batches: BatchRecord[], now: number, includeInactive = false) {
+	const batchIds = new Set(batches.map((batch) => batch.id));
+	const nodes: WidgetNode[] = [
+		...batches.map((batch): WidgetNode => ({ id: batch.id, parentId: batch.parentAgentId, createdAt: batch.createdAt, active: includeInactive, kind: "batch", batch })),
+		...records.map((record): WidgetNode => ({
+			id: record.id,
+			parentId: record.batchId && batchIds.has(record.batchId) ? record.batchId : record.parentAgentId,
+			createdAt: record.createdAt,
+			active: includeInactive || isActive(record) || isRecentlyFinished(record, now),
+			kind: "agent",
+			record,
+		})),
+	];
+	return buildVisibleTree(nodes, Number.POSITIVE_INFINITY);
+}
+
+function currentWidgetRefreshDelay(records: AgentRecord[], batches: BatchRecord[], now = Date.now()): number {
+	return widgetRefreshDelay(widgetTree(records, batches, now).visibleCount);
+}
+
 function widgetLines(
 	records: AgentRecord[],
 	batches: BatchRecord[],
@@ -1810,6 +1832,7 @@ function widgetLines(
 	now = Date.now(),
 	width = Number.POSITIVE_INFINITY,
 	includeInactive = false,
+	refreshDelay = currentWidgetRefreshDelay(records, batches, now),
 ): string[] {
 	const active = records.filter(isActive);
 	const inactive = records.filter((record) => !isActive(record));
@@ -1827,22 +1850,8 @@ function widgetLines(
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
 		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${costSummary}`);
-	type WidgetNode = { id: string; parentId?: string; createdAt: number; active: boolean; kind: "agent"; record: AgentRecord }
-		| { id: string; parentId?: string; createdAt: number; active: boolean; kind: "batch"; batch: BatchRecord };
-	const batchIds = new Set(batches.map((batch) => batch.id));
-	const nodes: WidgetNode[] = [
-		...batches.map((batch): WidgetNode => ({ id: batch.id, parentId: batch.parentAgentId, createdAt: batch.createdAt, active: includeInactive, kind: "batch", batch })),
-		...records.map((record): WidgetNode => ({
-			id: record.id,
-			parentId: record.batchId && batchIds.has(record.batchId) ? record.batchId : record.parentAgentId,
-			createdAt: record.createdAt,
-			active: includeInactive || isActive(record) || isRecentlyFinished(record, now),
-			kind: "agent",
-			record,
-		})),
-	];
 	const levels = buildHierarchyLevels(records.map((record) => ({ id: record.id, parentId: record.parentAgentId })));
-	const tree = buildVisibleTree(nodes, Number.POSITIVE_INFINITY);
+	const tree = widgetTree(records, batches, now, includeInactive);
 	const rows = tree.rows.map(({ item, prefix, isLast }): SubagentDisplayRow => {
 		const connector = `${isLast ? "└─" : "├─"} `;
 		if (item.kind === "batch") {
@@ -1873,7 +1882,7 @@ function widgetLines(
 		const record = item.record;
 		const state = record.state === "cold" ? record.lastOutcome : record.state;
 		const glyph = state === "running" || state === "starting" || state === "stopping"
-			? widgetSpinnerFrame(now)
+			? widgetSpinnerFrame(now, refreshDelay)
 			: stateGlyph(state);
 		const elapsedFrom = record.activeTools.size > 0
 			? Math.min(...[...record.activeTools.values()].map((tool) => tool.startedAt))
@@ -1911,6 +1920,7 @@ function widgetComponent(
 	getRecords: () => AgentRecord[],
 	getBatches: () => BatchRecord[],
 	getRevision: () => number,
+	getRefreshDelay: () => number,
 	theme: Theme,
 	onDispose: () => void,
 ) {
@@ -1928,10 +1938,11 @@ function widgetComponent(
 		render(width: number): string[] {
 			const now = Date.now();
 			const revision = getRevision();
-			const clockTick = Math.floor(now / WIDGET_CLOCK_REFRESH_MS);
+			const refreshDelay = getRefreshDelay();
+			const clockTick = Math.floor(now / refreshDelay);
 			if (cachedLines && cachedWidth === width && cachedRevision === revision && cachedClockTick === clockTick) return cachedLines;
 			const contentWidth = Math.max(0, width - 1);
-			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth).map((line) => truncateToWidth(` ${line}`, width));
+			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth, false, refreshDelay).map((line) => truncateToWidth(` ${line}`, width));
 			cachedWidth = width;
 			cachedRevision = revision;
 			cachedClockTick = clockTick;
@@ -2688,8 +2699,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let widgetStateFingerprint = "";
 	let widgetTui: Pick<TUI, "requestRender"> | undefined;
 	let widgetStateTimer: ReturnType<typeof setTimeout> | undefined;
-	let widgetAnimationTimer: ReturnType<typeof setInterval> | undefined;
-	let widgetClockTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetRefreshTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetRefreshTimerDelay: number | undefined;
 	let shuttingDown = false;
 
 	const mergedById = <T extends { id: string }>(local: T[], remote: T[]): T[] => {
@@ -2698,6 +2709,11 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		for (const item of local) values.set(item.id, item);
 		return [...values.values()].sort((left: any, right: any) => Number(left.createdAt) - Number(right.createdAt));
 	};
+
+	const adaptiveWidgetDelay = () => currentWidgetRefreshDelay(
+		mergedById(manager?.list() ?? [], hierarchyRecords),
+		mergedById(manager?.listBatches() ?? [], hierarchyBatches),
+	);
 
 	const publishCurrentHierarchy = async () => {
 		if (!currentAgentId || !hierarchyRegistryDir || !manager || hierarchyPublishing || shuttingDown) return;
@@ -2724,7 +2740,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		hierarchyPublishTimer = setTimeout(() => {
 			hierarchyPublishTimer = undefined;
 			void publishCurrentHierarchy();
-		}, WIDGET_STATE_REFRESH_MS);
+		}, adaptiveWidgetDelay());
 	};
 
 	const refreshHierarchy = async () => {
@@ -2740,35 +2756,47 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	const scheduleHierarchyRefresh = () => {
+		if (currentAgentId || hierarchyTimer || shuttingDown) return;
+		const delay = hierarchyRecords.some(isActive) ? adaptiveWidgetDelay() : HIERARCHY_REFRESH_MS;
+		hierarchyTimer = setTimeout(async () => {
+			hierarchyTimer = undefined;
+			try {
+				await refreshHierarchy();
+			} catch {
+				// Hierarchy reporting must not affect the parent session.
+			} finally {
+				scheduleHierarchyRefresh();
+			}
+		}, delay);
+	};
+
 	const clearWidgetTimers = () => {
 		if (widgetStateTimer) clearTimeout(widgetStateTimer);
-		if (widgetAnimationTimer) clearInterval(widgetAnimationTimer);
-		if (widgetClockTimer) clearInterval(widgetClockTimer);
+		if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
 		widgetStateTimer = undefined;
-		widgetAnimationTimer = undefined;
-		widgetClockTimer = undefined;
+		widgetRefreshTimer = undefined;
+		widgetRefreshTimerDelay = undefined;
 	};
 
 	const syncWidgetTimers = () => {
 		const hasActive = widgetRecords.some(isActive);
 		const hasRecentFinished = widgetRecords.some((record) => isRecentlyFinished(record, Date.now()));
-		if (hasActive) {
-			if (!widgetAnimationTimer) widgetAnimationTimer = setInterval(() => widgetTui?.requestRender(), WIDGET_CLOCK_REFRESH_MS);
-			if (widgetClockTimer) clearInterval(widgetClockTimer);
-			widgetClockTimer = undefined;
+		const shouldRefresh = hasActive || hasRecentFinished;
+		const delay = currentWidgetRefreshDelay(widgetRecords, widgetBatches);
+		if (!shouldRefresh) {
+			if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
+			widgetRefreshTimer = undefined;
+			widgetRefreshTimerDelay = undefined;
 			return;
 		}
-		if (widgetAnimationTimer) clearInterval(widgetAnimationTimer);
-		widgetAnimationTimer = undefined;
-		if (hasRecentFinished && !widgetClockTimer) {
-			widgetClockTimer = setInterval(() => {
-				widgetTui?.requestRender();
-				syncWidgetTimers();
-			}, WIDGET_CLOCK_REFRESH_MS);
-		} else if (!hasRecentFinished && widgetClockTimer) {
-			clearInterval(widgetClockTimer);
-			widgetClockTimer = undefined;
-		}
+		if (widgetRefreshTimer && widgetRefreshTimerDelay === delay) return;
+		if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
+		widgetRefreshTimerDelay = delay;
+		widgetRefreshTimer = setInterval(() => {
+			widgetTui?.requestRender();
+			syncWidgetTimers();
+		}, delay);
 	};
 
 	const refreshWidget = () => {
@@ -2799,6 +2827,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 					() => widgetRecords,
 					() => widgetBatches,
 					() => widgetRevision,
+					() => currentWidgetRefreshDelay(widgetRecords, widgetBatches),
 					theme,
 					() => { if (widgetTui === tui) widgetTui = undefined; },
 				);
@@ -2814,7 +2843,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		widgetStateTimer = setTimeout(() => {
 			widgetStateTimer = undefined;
 			refreshWidget();
-		}, WIDGET_STATE_REFRESH_MS);
+		}, adaptiveWidgetDelay());
 	};
 
 	const flushParentReports = (opportunity: ParentReportDeliveryOpportunity): boolean => {
@@ -3421,7 +3450,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			hierarchyTimer = setInterval(() => void publishCurrentHierarchy(), HIERARCHY_REFRESH_MS);
 		} else {
 			await refreshHierarchy();
-			hierarchyTimer = setInterval(() => void refreshHierarchy(), HIERARCHY_REFRESH_MS);
+			scheduleHierarchyRefresh();
 		}
 	});
 
