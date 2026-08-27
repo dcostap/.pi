@@ -5,6 +5,10 @@
   "tui.editor.yank": [],
   "app.exit": [],
   "app.model.select": ["ctrl+e"],
+  "app.model.cycleForward": [],
+  "app.model.cycleBackward": [],
+  "app.thinking.toggle": [],
+  "app.message.copy": [],
   "app.message.followUp": ["ctrl+q"],
   "app.message.dequeue": ["alt+up"]
 }
