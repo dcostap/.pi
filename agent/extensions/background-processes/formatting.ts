@@ -17,6 +17,7 @@ export const AUTO_BUDGET: OutputBudget = { maxBytes: 12 * 1024, maxLines: 80 };
 export const WAIT_ENTRY_BUDGET: OutputBudget = { maxBytes: 16 * 1024, maxLines: 250 };
 export const WAIT_TOTAL_BYTES = 48 * 1024;
 export const WAIT_LIVE_BUDGET: OutputBudget = { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES };
+export const LIST_MAX_ENTRIES = 30;
 
 export function formatDuration(milliseconds: number): string {
 	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -104,14 +105,21 @@ export function formatWaitUpdate(snapshots: BackgroundProcessSnapshot[], now = D
 
 export function formatList(snapshots: BackgroundProcessSnapshot[], now = Date.now()): string {
 	if (snapshots.length === 0) return "No background processes are tracked.";
-	return snapshots
+	const visible = recentListSnapshots(snapshots);
+	const omitted = snapshots.length - visible.length;
+	const lines = visible
 		.map((snapshot) => {
 			const elapsed = (snapshot.settledAt ?? now) - snapshot.createdAt;
 			const exit = snapshot.exitCode === undefined ? "" : ` exit=${snapshot.exitCode ?? "none"}`;
 			const stopping = snapshot.killRequested && !snapshot.settled ? " stopping" : "";
 			return `${snapshot.id} [${snapshot.status}${stopping}] ${cleanInline(snapshot.title)} • ${formatDuration(elapsed)}${exit} • ${formatSize(snapshot.output.totalBytes)} • ${cleanInline(snapshot.cwd)}`;
-		})
-		.join("\n");
+		});
+	if (omitted > 0) lines.unshift(`${omitted} older background processes omitted. Showing the ${visible.length} most recent.`);
+	return lines.join("\n");
+}
+
+export function recentListSnapshots(snapshots: BackgroundProcessSnapshot[]): BackgroundProcessSnapshot[] {
+	return snapshots.slice(-LIST_MAX_ENTRIES);
 }
 
 export function formatWaitResult(result: WaitResult): string {

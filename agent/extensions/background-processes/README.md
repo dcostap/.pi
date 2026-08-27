@@ -8,7 +8,7 @@ It reuses Pi's public `createLocalBashOperations()` backend—the same local bac
 
 - `bash_bg_start` — start a bash command and return immediately
 - `bash_bg_status` — inspect one background bash process without waiting
-- `bash_bg_list` — list tracked background bash processes
+- `bash_bg_list` — list the 30 most recent tracked processes and summarize older history
 - `bash_bg_wait` — wait without polling; timeout/cancellation leaves bash processes alive
 - `bash_bg_kill` — stop through Pi's bash abort behavior
 - `/ps` — responsive TUI dashboard or RPC textual inventory. The dashboard has live status

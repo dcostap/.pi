@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AUTO_BUDGET, formatAutomaticResults, formatKillResults, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, WAIT_TOTAL_BYTES } from "./formatting.ts";
+import { AUTO_BUDGET, formatAutomaticResults, formatKillResults, formatList, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, LIST_MAX_ENTRIES, WAIT_TOTAL_BYTES } from "./formatting.ts";
 import type { BackgroundProcessSnapshot } from "./manager.ts";
 
 function snapshot(id: string, output: string): BackgroundProcessSnapshot {
@@ -36,6 +36,18 @@ describe("bounded formatting", () => {
 		const process = { ...snapshot("bg-2", ""), title: "Dev server", status: "killed" as const };
 		const text = formatKillResults([{ id: process.id, outcome: "killed", snapshot: process }]);
 		expect(text).toBe("bg-2 (Dev server): termination observed (killed)");
+	});
+
+	test("process lists omit the oldest entries", () => {
+		const processes = Array.from({ length: LIST_MAX_ENTRIES + 3 }, (_, index) => snapshot(`bg-${index + 1}`, ""));
+		const text = formatList(processes);
+
+		expect(text).toContain(`3 older background processes omitted. Showing the ${LIST_MAX_ENTRIES} most recent.`);
+		expect(text).not.toContain("bg-1 [done]");
+		expect(text).not.toContain("bg-3 [done]");
+		expect(text).toContain("bg-4 [done]");
+		expect(text).toContain(`bg-${LIST_MAX_ENTRIES + 3} [done]`);
+		expect(text.split("\n")).toHaveLength(LIST_MAX_ENTRIES + 1);
 	});
 
 	test("automatic batches honor their total byte budget", () => {

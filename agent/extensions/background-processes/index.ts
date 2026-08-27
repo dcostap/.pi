@@ -11,6 +11,7 @@ import {
 	formatStartResult,
 	formatWaitUpdate,
 	formatWaitResult,
+	recentListSnapshots,
 } from "./formatting.ts";
 import { BackgroundProcessManager, WaitAbortedError } from "./manager.ts";
 import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
@@ -158,7 +159,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_list",
 		label: "bash background list",
-		description: "List tracked background bash processes without waiting or including bash command output.",
+		description: "List the 30 most recent tracked background bash processes without waiting or including bash command output. Older entries are summarized.",
 		parameters: Type.Object({}),
 		renderCall(args, theme, context) {
 			return renderBackgroundToolCall("bash_bg_list", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
@@ -169,9 +170,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			latestContext = ctx;
 			const snapshots = manager?.list() ?? [];
+			const visible = recentListSnapshots(snapshots);
 			return {
 				content: [{ type: "text", text: formatList(snapshots) }],
-				details: { processes: snapshots.map(compactDetails) },
+				details: { processes: visible.map(compactDetails), omitted: snapshots.length - visible.length },
 			};
 		},
 	});
