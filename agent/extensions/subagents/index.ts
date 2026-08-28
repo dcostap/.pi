@@ -2896,7 +2896,10 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		if (updates.length === 0) return false;
 		parentUpdateFlushRunning = true;
 		try {
-			const fullText = formatParentUpdates(updates);
+			const activeAgents = activeManager.list()
+				.filter(isActive)
+				.map((record) => ({ id: record.id, title: record.title, state: record.state }));
+			const fullText = formatParentUpdates(updates, { agents: activeAgents });
 			const truncated = truncateHead(fullText);
 			let content = truncated.content;
 			let outputFile: string | undefined;
