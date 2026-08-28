@@ -997,12 +997,14 @@ class SubagentManager {
 			|| Boolean(this.completionNotifications.active);
 	}
 
-	hasPendingParentUpdates(): boolean {
-		return this.pendingParentUpdates.length > 0;
+	hasPendingParentUpdates(terminalOnly = false): boolean {
+		return terminalOnly
+			? this.pendingParentUpdates.some((update) => update.kind !== "report")
+			: this.pendingParentUpdates.length > 0;
 	}
 
-	takePendingParentUpdates(): ParentUpdate[] {
-		const updates = takeParentUpdateBatch(this.pendingParentUpdates);
+	takePendingParentUpdates(terminalOnly = false): ParentUpdate[] {
+		const updates = takeParentUpdateBatch(this.pendingParentUpdates, terminalOnly ? 0 : undefined);
 		for (const key of this.parentUpdateCompletionKeys(updates)) this.inFlightCompletionKeys.add(key);
 		return updates;
 	}
@@ -2889,10 +2891,10 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		latestCtx.ui.notify(childRuntimeNotification(pendingWork), "info");
 	};
 
-	const flushParentUpdates = async (deliverAs: "steer" | "followUp"): Promise<boolean> => {
+	const flushParentUpdates = async (deliverAs: "steer" | "followUp", terminalOnly = false): Promise<boolean> => {
 		const activeManager = manager;
-		if (parentUpdateFlushRunning || shuttingDown || !activeManager?.hasPendingParentUpdates()) return false;
-		const updates = activeManager.takePendingParentUpdates();
+		if (parentUpdateFlushRunning || shuttingDown || !activeManager?.hasPendingParentUpdates(terminalOnly)) return false;
+		const updates = activeManager.takePendingParentUpdates(terminalOnly);
 		if (updates.length === 0) return false;
 		parentUpdateFlushRunning = true;
 		try {
@@ -2976,7 +2978,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("turn_end", (_event, ctx) => {
 		latestCtx = ctx;
-		void flushParentUpdates("steer");
+		// A tool turn is not an idle parent. Deliver final results promptly, but
+		// keep progress reports queued until the complete parent run settles.
+		void flushParentUpdates("steer", true);
 	});
 
 	// Re-check after each run so updates that arrived near its final turn are

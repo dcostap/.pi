@@ -65,4 +65,16 @@ describe("parent subagent updates", () => {
 		expect(selected.some((item) => item.kind === "completion")).toBe(true);
 		expect(pending.filter((item) => item.kind === "report")).toHaveLength(5);
 	});
+
+	test("can take terminal updates without interrupting a tool loop for reports", () => {
+		const pending: ParentUpdate[] = [
+			{ kind: "report", id: "sa-live", title: "Live", createdAt: 1, message: "Progress" },
+			{ kind: "completion", createdAt: 2, completion: completion("sa-done") },
+		];
+		const selected = takeParentUpdateBatch(pending, 0);
+		expect(selected).toHaveLength(1);
+		expect(selected[0]?.kind).toBe("completion");
+		expect(pending).toHaveLength(1);
+		expect(pending[0]?.kind).toBe("report");
+	});
 });
