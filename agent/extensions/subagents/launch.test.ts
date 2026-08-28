@@ -140,10 +140,10 @@ describe("subagent launch requests", () => {
 
 	test("limits parent reports to mid-task messages", () => {
 		const instructions = buildMainInstructions(new Map(), true);
-		expect(instructions).toContain("Use subagent_report only for mid-task messages");
-		expect(instructions).toContain("A report ends a parent wait that includes you.");
-		expect(instructions).toContain("Do not use it to report task or work completion.");
-		expect(instructions).toContain("Do not use it for final reports.");
-		expect(instructions).toContain("Pi sends your final answer to the parent automatically when you stop.");
+		expect(instructions).toContain("Use subagent_report only for important mid-task information");
+		expect(instructions).toContain("Do not use it for completion.");
+		expect(instructions).toContain("subagent_notify_when_all_completed");
+		expect(instructions).toContain("Pi keeps the session parked");
+		expect(instructions).not.toContain("subagent_wait");
 	});
 });

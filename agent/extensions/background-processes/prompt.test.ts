@@ -6,6 +6,7 @@ describe("background process prompt", () => {
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("bash_bg_start");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("bash_bg_wait");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("instead of polling");
+		expect(BACKGROUND_PROCESS_PROMPT).toContain("steering message interrupts the wait");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("receive no stdin");
 		expect(BACKGROUND_PROCESS_PROMPT).toContain("Do not append &");
 	});

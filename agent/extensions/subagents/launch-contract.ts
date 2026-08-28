@@ -172,7 +172,9 @@ export function genericPrompt(task: string, sandboxDir: string, transcript?: str
 		`Your scratch sandbox is: ${sandboxDir}`,
 		"Use the sandbox for temporary files. Do not treat the project cwd as scratch space.",
 		"Do not make durable project changes unless the task explicitly asks for them.",
-		"Return a concise, self-contained final answer. The parent can continue this same session later if follow-up context is useful.",
+		"Return a concise, self-contained final answer after you finish the assigned task.",
+		"If you own active subagents when your model run ends, Pi parks this session and keeps those subagents running.",
+		"Pi wakes you for subagent updates or parent instructions. Process required child results before you give your final answer.",
 		sharedPrompt ? `\n<shared_assignment>\n${cleanText(sharedPrompt)}\n</shared_assignment>` : "",
 		"",
 		"<individual_task>",
@@ -184,7 +186,7 @@ export function genericPrompt(task: string, sandboxDir: string, transcript?: str
 export function buildMainInstructions(roles: Map<string, SubagentRole>, canReportToParent = false): string {
 	const roleText = [...roles.values()].map((role) => `- ${role.name}: ${role.description}`).join("\n");
 	const parentReportRule = canReportToParent
-		? "\n- Use subagent_report only for mid-task messages that the parent needs while you continue. A report ends a parent wait that includes you. Do not use it to report task or work completion. Do not use it for final reports. Pi sends your final answer to the parent automatically when you stop."
+		? "\n- Use subagent_report only for important mid-task information that the parent needs now. Do not use it for completion. Pi sends your final answer after your complete managed task finishes."
 		: "";
 	return `Managed subagents:
 - Do not launch subagents unless the user explicitly asks for delegated/subagent work or has already established that subagents should be used for the current task.
@@ -195,13 +197,16 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>, canRepor
 - A subagent's model and thinking level remain fixed for its lifetime. Create a new subagent to change either.
 - Children inherit the parent's working directory by default. Set cwd to use a different existing directory. For example, set cwd to a lead's Git worktree so its nested subagents inherit that worktree.
 - Child Pi context-file discovery defaults to enabled. Set context_files to false only when the user wants the child to ignore AGENTS.md and CLAUDE.md files; this does not restrict filesystem access or disable other project resources.
-- Reuse an existing subagent with subagent_send only for a direct continuation or follow-up where its previous context is useful. Create a new subagent for unrelated work, independent verification, or a fresh opinion.
+- Reuse an existing subagent with subagent_send only when its previous context is useful. The tool accepts one ID, explicit IDs, one batch, or all active and parked direct agents.
+- Set all_active_and_parked to true only when the same instruction must reach every live direct subagent. Multi-target sends never continue completed sessions.
 - Use subagent_status only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
-- For work sharing common context, launch a formal batch with a shared_prompt and individual agent tasks. Then call subagent_wait once with its batch_id and required wait_mode. Use wait_mode "all" for the complete batch; use wait_mode "any" when the first settled result is sufficient. An "any" wait returns the settled subset and leaves the remaining agents running.
-- Call subagent_wait with only wait_mode "any" to wait for the next result from any active direct subagent.
-- Cancelling or timing out subagent_wait leaves unfinished subagents running.
-- Use subagent_result for unattended, historical, or specific completed runs when their answer is needed outside the original batch wait.
-- subagent_stop stops current work but preserves the child Pi session for later continuation.
+- Every subagent notifies you separately when its complete managed task finishes.
+- Use subagent_notify_when_all_completed only when you need one combined update after every selected current run finishes. It returns immediately and suppresses separate completion updates for those runs.
+- Do not use subagent_notify_when_all_completed for ordinary independent work. Continue useful work after launch, or end your response and let Pi park the session.
+- A model run can settle while owned subagents remain active. Pi keeps the session parked and wakes it for updates or parent instructions.
+- Process all required subagent results before you give your final task answer.
+- Use subagent_result for unattended, historical, or specific completed runs when their answer is needed later.
+- subagent_stop stops selected subagent trees but preserves their Pi session files for later continuation.
 - Multiple subagent_start calls in one assistant turn may run in parallel. For large programmatic launches, subagent_start accepts input_file by itself containing the same single-or-batch request object used inline.${parentReportRule}
 
 Available roles${roleText ? ":" : ": none"}

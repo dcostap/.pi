@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+	hierarchyDirectoryForSession,
 	publishHierarchySnapshot,
 	readHierarchyRegistry,
 	type HierarchySnapshot,
@@ -32,6 +33,15 @@ afterEach(async () => {
 });
 
 describe("subagent hierarchy registry", () => {
+	test("finds a child-specific registry from its session file", () => {
+		const root = path.join("C:", "Temp", "pi-subagent-hierarchy", "root-session");
+		const session = path.join("C:", "sessions", "2026-08-28T10-30-47Z_01a047ec-0ce5-7999-a38e-ed9b04d4d838.jsonl");
+
+		expect(hierarchyDirectoryForSession(root, session)).toBe(
+			path.join("C:", "Temp", "pi-subagent-hierarchy", "01a047ec-0ce5-7999-a38e-ed9b04d4d838"),
+		);
+	});
+
 	test("does not retain empty reporter snapshots", async () => {
 		const directory = await temporaryDirectory();
 		const file = await writeSnapshot(directory, { ownerAgentId: "sa-empty", publishedAt: 1, agents: [], batches: [] });

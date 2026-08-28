@@ -13,6 +13,11 @@ function reporterPath(registryDir: string, ownerAgentId: string): string {
 	return path.join(registryDir, `${ownerAgentId}.json`);
 }
 
+export function hierarchyDirectoryForSession(registryDir: string, sessionFile: string): string | undefined {
+	const match = path.basename(sessionFile).match(/_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i);
+	return match ? path.join(path.dirname(registryDir), match[1]!) : undefined;
+}
+
 async function removeFile(file: string): Promise<void> {
 	try {
 		await unlink(file);

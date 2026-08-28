@@ -19,6 +19,8 @@ import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
 import { processWidgetComponent } from "./ui/process-widget.ts";
 import { renderBackgroundToolCall, renderBackgroundToolResult } from "./ui/tool-call.ts";
+import { MANAGED_WORK_STATE_EVENT } from "../_shared/managed-work.ts";
+import { WaitInterruptRegistry } from "./wait-interrupt.ts";
 
 const StartParameters = Type.Object({
 	command: Type.String({ minLength: 1, description: "Non-interactive bash command to run using the same local backend as Pi's built-in bash tool" }),
@@ -48,6 +50,12 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	let widgetRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	let widgetLastRefreshAt = 0;
 	let shuttingDown = false;
+	const waitInterrupts = new WaitInterruptRegistry();
+
+	const publishManagedWork = () => {
+		const pending = manager?.list().some((snapshot) => !snapshot.settled) ?? false;
+		pi.events.emit(MANAGED_WORK_STATE_EVENT, { source: "background-processes", pending });
+	};
 
 	const updateWidget = () => {
 		const ctx = latestContext;
@@ -87,9 +95,13 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		});
 		managerWidgetSubscription = manager.subscribe((event) => {
 			if (event.kind === "output") scheduleWidgetUpdate();
-			else if (event.kind === "started" || event.kind === "settled" || event.kind === "pruned") updateWidget();
+			else if (event.kind === "started" || event.kind === "settled" || event.kind === "pruned") {
+				updateWidget();
+				publishManagedWork();
+			}
 		});
 		updateWidget();
+		publishManagedWork();
 		return manager;
 	};
 
@@ -181,7 +193,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_wait",
 		label: "bash background wait",
-		description: "Wait for selected background bash processes to settle while streaming a bounded live output preview. Timeout or cancellation leaves them running.",
+		description: "Wait for selected background bash processes. The tool streams a bounded live output preview. A steering message interrupts only the wait. Timeout, steering, or cancellation leaves unfinished processes running.",
 		parameters: WaitParameters,
 		renderCall(args, theme, context) {
 			return renderBackgroundToolCall("bash_bg_wait", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
@@ -191,10 +203,11 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const activeManager = requireManager(ctx);
+			const wait = waitInterrupts.begin(signal);
 			try {
 				const result = await activeManager.wait(params.ids, {
 					timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
-					signal,
+					signal: wait.signal,
 					updateIntervalMs: 100,
 					onUpdate: (runningIds, snapshots) => {
 						onUpdate?.({
@@ -216,11 +229,29 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 				};
 			} catch (error) {
 				if (error instanceof WaitAbortedError) {
+					if (wait.reason() === "steer") {
+						const snapshots = params.ids.map((id) => activeManager.get(id));
+						return {
+							content: [{ type: "text", text: "Background wait interrupted by a steering message. Unfinished processes remain active." }],
+							details: {
+								interruptedBySteer: true,
+								processes: snapshots.map(compactDetails),
+								runningIds: snapshots.filter((snapshot) => !snapshot.settled).map((snapshot) => snapshot.id),
+							},
+						};
+					}
 					throw new Error("Background wait aborted; all unfinished processes are still running");
 				}
 				throw error;
+			} finally {
+				wait.dispose();
 			}
 		},
+	});
+
+	pi.on("input", (event) => {
+		if (event.streamingBehavior !== "steer") return;
+		waitInterrupts.interruptForSteer();
 	});
 
 	pi.registerTool({
@@ -287,6 +318,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		latestContext = ctx;
 		shuttingDown = false;
 		updateWidget();
+		publishManagedWork();
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -297,6 +329,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		latestContext = ctx;
 		shuttingDown = true;
+		waitInterrupts.abortAll();
 		delivery?.dispose();
 		delivery = undefined;
 		managerWidgetSubscription?.();
@@ -310,6 +343,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		manager = undefined;
 		widgetLastRefreshAt = 0;
 		if (activeManager) await activeManager.dispose(5000);
+		pi.events.emit(MANAGED_WORK_STATE_EVENT, { source: "background-processes", pending: false });
 	});
 }
 

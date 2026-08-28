@@ -1,15 +1,13 @@
-export const MAX_LISTED_SUBAGENTS = 50;
+export const MAX_RECENT_COMPLETED_SUBAGENTS = 10;
 
-export type RecentItems<T> = {
-	items: T[];
-	omitted: number;
-};
-
-/** Keep the newest items from a list that is ordered from oldest to newest. */
-export function takeRecent<T>(items: readonly T[], limit = MAX_LISTED_SUBAGENTS): RecentItems<T> {
-	const start = Math.max(0, items.length - limit);
-	return {
-		items: items.slice(start),
-		omitted: start,
-	};
+export function partitionSubagentList<T extends { state: string; settledAt?: number; updatedAt: number }>(
+	items: readonly T[],
+	completedLimit = MAX_RECENT_COMPLETED_SUBAGENTS,
+): { active: T[]; completed: T[]; omittedCompleted: number } {
+	const active = items.filter((item) => item.state !== "cold");
+	const allCompleted = items
+		.filter((item) => item.state === "cold")
+		.sort((left, right) => (right.settledAt ?? right.updatedAt) - (left.settledAt ?? left.updatedAt));
+	const completed = allCompleted.slice(0, completedLimit);
+	return { active, completed, omittedCompleted: allCompleted.length - completed.length };
 }

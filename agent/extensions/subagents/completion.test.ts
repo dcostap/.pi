@@ -1,69 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { cacheHitRate, formatCacheHitRate, formatCompletionBatch, type CompletionSnapshot } from "./completion.ts";
+import { cacheHitRate, completionTokens, formatCacheHitRate } from "./completion.ts";
 
-function snapshot(id: string, outcome: CompletionSnapshot["outcome"], answer: string): CompletionSnapshot {
-	return {
-		id,
-		title: `Agent ${id}`,
-		role: "review",
-		outcome,
-		model: "provider/model-id",
-		thinking: "high",
-		runId: `${id}-r1`,
-		task: "Review target",
-		activity: outcome,
-		createdAt: 0,
-		startedAt: 0,
-		settledAt: 2000,
-		durationMs: 2000,
-		attempts: 1,
-		usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 0, latestCacheHitRate: 99.2, cost: 0.01, turns: 2 },
-		finalAnswer: answer,
-		error: outcome === "failed" ? "provider failed" : undefined,
-		sessionFile: `C:/sessions/${id}.jsonl`,
-	};
-}
-
-describe("completion batches", () => {
-	test("combines all final answers and accumulated metrics", () => {
-		const text = formatCompletionBatch([
-			snapshot("sa-1", "completed", "First answer"),
-			snapshot("sa-2", "completed", "Second answer"),
-		]);
-		expect(text).toContain("Agents: 2 · failures: 0");
-		expect(text).toContain("Tokens: 300");
-		expect(text).toContain("First answer");
-		expect(text).toContain("Second answer");
-		expect(text).toContain("provider/model-id [high]");
-		expect(text).toContain("CH99.2%");
-		expect(text).toContain("2.0s");
-		expect(text).toContain("role review");
-	});
-
+describe("subagent completion accounting", () => {
 	test("matches Pi's cache-hit rate formula and formatting", () => {
 		expect(cacheHitRate({ input: 8, cacheRead: 91, cacheWrite: 1 })).toBeCloseTo(91, 10);
 		expect(formatCacheHitRate(99.2, true)).toBe("CH99.2%");
 		expect(formatCacheHitRate(0, false)).toBe("");
 	});
 
-	test("uses a failed agent's error in the integrated result", () => {
-		const text = formatCompletionBatch([snapshot("sa-1", "failed", "partial")]);
-		expect(text).toContain("failures: 1");
-		expect(text).toContain("provider failed");
-	});
-
-	test("groups formal batch results under their persisted identity", () => {
-		const first = { ...snapshot("sa-1", "completed", "First"), batchId: "batch-123" };
-		const second = { ...snapshot("sa-2", "completed", "Second"), batchId: "batch-123" };
-		const text = formatCompletionBatch([first, second], undefined, [{
-			id: "batch-123",
-			title: "Review changes",
-			role: "review",
-			memberIds: ["sa-1", "sa-2"],
-		}]);
-		expect(text).toContain("## Batch — Review changes");
-		expect(text).toContain("> batch-123 · 2 results · role review");
-		expect(text).toContain("### Agent 1");
-		expect(text).toContain("batch batch-123");
+	test("sums stored usage for user-facing accounting", () => {
+		expect(completionTokens({ input: 8, output: 2, cacheRead: 91, cacheWrite: 1, cost: 0, turns: 1 })).toBe(102);
 	});
 });
