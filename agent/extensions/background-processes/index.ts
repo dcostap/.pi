@@ -2,7 +2,7 @@ import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	formatKillResults,
@@ -19,6 +19,7 @@ import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
 import { processWidgetComponent } from "./ui/process-widget.ts";
 import {
+	renderBackgroundCompletionMessage,
 	renderBackgroundToolCall,
 	renderBackgroundToolResult,
 	type BackgroundProcessLookup,
@@ -312,10 +313,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerMessageRenderer("background-process-result", (message, { expanded }, theme) => {
-		const text = expanded ? message.content : message.content.split("\n").slice(0, 8).join("\n");
-		const box = new Box(1, 1, (line) => theme.bg("customMessageBg", line));
-		box.addChild(new Text(theme.fg("accent", theme.bold("Background process result")) + `\n${text}`, 0, 0));
-		return box;
+		return renderBackgroundCompletionMessage(message, { expanded }, theme);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {

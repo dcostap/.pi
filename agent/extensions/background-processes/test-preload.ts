@@ -47,6 +47,27 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+	Box: class Box {
+		private readonly children: Array<{ render(width?: number): string[] }> = [];
+		constructor(
+			private readonly paddingX = 0,
+			private readonly paddingY = 0,
+			private readonly bg?: (text: string) => string,
+		) {}
+		addChild(child: { render(width?: number): string[] }) { this.children.push(child); }
+		render(width?: number) {
+			const padding = " ".repeat(this.paddingX);
+			const blank = this.bg?.(" ".repeat(Math.max(0, width ?? 0))) ?? "";
+			return [
+				...Array.from({ length: this.paddingY }, () => blank),
+				...this.children.flatMap((child) => child.render(width).map((line) => (
+					this.bg?.(`${padding}${line}${padding}`) ?? `${padding}${line}${padding}`
+				))),
+				...Array.from({ length: this.paddingY }, () => blank),
+			];
+		}
+		invalidate() {}
+	},
 	Text: class Text {
 		constructor(
 			private text: string,

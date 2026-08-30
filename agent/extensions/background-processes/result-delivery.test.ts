@@ -39,6 +39,9 @@ describe("ResultDeliveryCoordinator", () => {
 		await tick();
 		expect(port.messages).toHaveLength(1);
 		expect(port.messages[0]!.content).toContain("bg-1");
+		expect(port.messages[0]!.details).toMatchObject({
+			processes: [{ id: "bg-1", title: "A", command: "a" }],
+		});
 		delivery.flushWhenIdle();
 		expect(port.messages).toHaveLength(1);
 		delivery.dispose();

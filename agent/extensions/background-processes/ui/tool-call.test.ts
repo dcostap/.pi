@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { renderBackgroundStartCall, renderBackgroundToolCall, renderBackgroundToolResult } from "./tool-call.ts";
+import {
+	renderBackgroundCompletionMessage,
+	renderBackgroundStartCall,
+	renderBackgroundToolCall,
+	renderBackgroundToolResult,
+} from "./tool-call.ts";
 
 const theme = {
 	fg: (_color: string, text: string) => text,
+	bg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
 } as any;
 
@@ -53,6 +59,22 @@ describe("background start tool-call rendering", () => {
 });
 
 describe("background tool-result rendering", () => {
+	test("renders automatic completion as a completed tool row and keeps the output ending visible", () => {
+		const output = Array.from({ length: 30 }, (_, index) => `Completed groups: ${index + 1}/30`).join("\n");
+		const message = {
+			content: `A background process finished.\n\n---\n\nbg-1 — Build\nState: done\nElapsed: 2s\nCommand: bun run build\n\n${output}`,
+			details: { processes: [{ id: "bg-1", title: "Build", command: "bun run build" }] },
+		};
+		const collapsed = renderBackgroundCompletionMessage(message, { expanded: false }, theme).render(200).join("\n");
+		const expanded = renderBackgroundCompletionMessage(message, { expanded: true }, theme).render(200).join("\n");
+
+		expect(collapsed).toContain("bash_bg_start completion · bg-1 (Build • $ bun run build)");
+		expect(collapsed).toContain("Completed groups: 30/30");
+		expect(collapsed).not.toContain("Completed groups: 15/30");
+		expect(expanded).toContain("Completed groups: 1/30");
+		expect(collapsed).not.toContain("A background process finished.");
+	});
+
 	test("separates and styles structured status from command output", () => {
 		const styledTheme = {
 			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,

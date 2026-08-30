@@ -60,6 +60,7 @@ export class ResultDeliveryCoordinator {
 					processes: claimed.map((entry) => ({
 						id: entry.id,
 						title: entry.title,
+						command: entry.command,
 						status: entry.status,
 						exitCode: entry.exitCode,
 						capturedBytes: entry.output.totalBytes,

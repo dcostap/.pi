@@ -1,6 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { highlightCode, keyHint } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { normalizeTitle } from "../prompt.ts";
 import { sanitizeTerminalText } from "../sanitize.ts";
 
@@ -33,12 +33,46 @@ export interface BackgroundToolResultOptions {
 	isPartial: boolean;
 }
 
+export interface BackgroundCompletionMessage {
+	content: string;
+	details?: unknown;
+}
+
 export interface BackgroundProcessDisplay {
 	title: string | undefined;
 	command: string | undefined;
 }
 
 export type BackgroundProcessLookup = (id: string) => BackgroundProcessDisplay | undefined;
+
+/** Render automatic completion delivery with the same shell as a completed tool row. */
+export function renderBackgroundCompletionMessage(
+	message: BackgroundCompletionMessage,
+	options: Pick<BackgroundToolResultOptions, "expanded">,
+	theme: Theme,
+): Box {
+	const processes = completionProcesses(message.details);
+	const label = processes.length === 0
+		? "completion"
+		: `completion · ${processes.map((process) => (
+			formatCompletionProcess(process)
+		)).join(", ")}`;
+	const box = new Box(1, 1, (line) => theme.bg("toolSuccessBg", line));
+	box.addChild(new Text(
+		theme.fg("toolTitle", theme.bold("bash_bg_start")) + theme.fg("muted", ` ${label}`),
+		0,
+		0,
+	));
+	box.addChild(renderBackgroundToolResult(
+		"bash_bg_status",
+		{ content: [{ type: "text", text: stripCompletionSummary(message.content) }] },
+		{ expanded: options.expanded, isPartial: false },
+		theme,
+		undefined,
+		false,
+	));
+	return box;
+}
 
 export function renderBackgroundStartCall(
 	args: BackgroundStartCallArgs,
@@ -254,4 +288,35 @@ function trimBlankLines(lines: string[]): string[] {
 	while (start < end && !lines[start]) start++;
 	while (end > start && !lines[end - 1]) end--;
 	return lines.slice(start, end);
+}
+
+function completionProcesses(details: unknown): Array<{ id: string; title?: string; command?: string }> {
+	if (!details || typeof details !== "object") return [];
+	const processes = (details as { processes?: unknown }).processes;
+	if (!Array.isArray(processes)) return [];
+	return processes.flatMap((value) => {
+		if (!value || typeof value !== "object") return [];
+		const process = value as { id?: unknown; title?: unknown; command?: unknown };
+		if (typeof process.id !== "string") return [];
+		return [{
+			id: cleanInline(process.id),
+			title: typeof process.title === "string" ? process.title : undefined,
+			command: typeof process.command === "string" ? process.command : undefined,
+		}];
+	});
+}
+
+function formatCompletionProcess(process: { id: string; title?: string; command?: string }): string {
+	const details = [
+		process.title ? cleanInline(process.title) : "",
+		process.command ? `$ ${cleanInline(process.command)}` : "",
+	].filter(Boolean);
+	return details.length > 0 ? `${process.id} (${details.join(" • ")})` : process.id;
+}
+
+function stripCompletionSummary(content: string): string {
+	return content.replace(
+		/^(?:A background process finished\.|\d+ background processes finished\.)(?:\r?\n){2}---(?:\r?\n){2}/u,
+		"",
+	);
 }
