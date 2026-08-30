@@ -3560,7 +3560,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			}
 		} else if (hierarchyRegistryDir) {
 			await rm(hierarchyRegistryDir, { recursive: true, force: true }).catch(() => {});
-			hierarchySnapshotCache.clear();
+			hierarchySnapshotCaches.clear();
 		}
 	});
 }
