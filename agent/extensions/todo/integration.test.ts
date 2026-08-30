@@ -44,6 +44,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 
 const { default: todoExtension } = await import("./index.ts");
+const { todoWidgetLines } = await import("./widget.ts");
 
 type Handler = (...args: any[]) => any;
 
@@ -98,6 +99,40 @@ async function invoke(harness: ReturnType<typeof makeHarness>, event: string, ..
 }
 
 describe("todo extension integration", () => {
+	test("summarizes hidden completed tasks inside each visible widget group", () => {
+		const item = (id: string, group: string, done: boolean, completedAt?: number) => ({
+			id,
+			kind: "task" as const,
+			text: id,
+			group,
+			done,
+			createdAt: 1,
+			updatedAt: completedAt ?? 1,
+			completedAt,
+		});
+		const state = {
+			version: 1 as const,
+			enabled: true,
+			scriptsEnabled: true,
+			nextSequence: 15,
+			items: [
+				item("g1-open", "Group 1", false),
+				...Array.from({ length: 6 }, (_, index) => item(`g1-done-${index + 1}`, "Group 1", true, index * 2 + 1)),
+				item("g2-open", "Group 2", false),
+				...Array.from({ length: 6 }, (_, index) => item(`g2-done-${index + 1}`, "Group 2", true, index * 2 + 2)),
+			],
+		};
+		const theme = {
+			fg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+			strikethrough: (text: string) => text,
+		};
+		const lines = todoWidgetLines(state, theme as any, () => undefined, 1);
+		expect(lines).toContain("  … 3 others completed");
+		expect(lines).toContain("  … 2 others completed");
+		expect(lines.filter((line) => line.includes("✓")).length).toBe(7);
+	});
+
 	test("loads only the command, then activates the tool and persists state", async () => {
 		const harness = makeHarness();
 		await invoke(harness, "session_start", {}, harness.ctx);

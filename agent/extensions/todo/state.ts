@@ -67,7 +67,7 @@ export function getCurrentTaskId(state: TodoState): string | undefined {
 	return item?.kind === "task" && !item.done ? item.id : undefined;
 }
 
-export function getRecentCompletedTasks(state: TodoState, limit = 4): TodoItem[] {
+export function getRecentCompletedTasks(state: TodoState, limit = 7): TodoItem[] {
 	if (limit <= 0) return [];
 	return state.items
 		.filter((item) => item.kind === "task" && item.done)

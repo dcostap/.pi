@@ -20,17 +20,17 @@ describe("todo state formatting", () => {
 		expect(secondPage).toContain("t-3 Third");
 	});
 
-	test("shows no more than four completed tasks", () => {
+	test("shows no more than seven completed tasks", () => {
 		let state = createTodoState();
-		for (let index = 1; index <= 6; index++) {
+		for (let index = 1; index <= 9; index++) {
 			state = applyTodoChanges(state, [{ action: "add", kind: "task", text: `Task ${index}` }], index);
 			state = applyTodoChanges(state, [{ action: "complete", id: `t-${index}` }], 100 + index);
 		}
 		const output = formatTodoState(state);
-		expect(output).toContain("Recently completed (4 of 6)");
+		expect(output).toContain("Recently completed (7 of 9)");
 		expect(output).not.toContain("t-1 Task 1");
 		expect(output).not.toContain("t-2 Task 2");
-		expect(output.indexOf("t-3 Task 3")).toBeLessThan(output.indexOf("t-6 Task 6"));
+		expect(output.indexOf("t-3 Task 3")).toBeLessThan(output.indexOf("t-9 Task 9"));
 	});
 
 	test("keeps a page below the tool output limit", () => {

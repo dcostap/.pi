@@ -89,12 +89,12 @@ describe("todo state", () => {
 		expect(getCurrentTaskId(state)).toBeUndefined();
 	});
 
-	test("keeps the four latest completed tasks in completion order", () => {
+	test("keeps the seven latest completed tasks in completion order", () => {
 		let state = createTodoState();
-		for (let index = 1; index <= 6; index++) {
+		for (let index = 1; index <= 9; index++) {
 			state = applyTodoChanges(state, [{ action: "add", kind: "task", text: `Task ${index}` }], index);
 			state = applyTodoChanges(state, [{ action: "complete", id: `t-${index}` }], 100 + index);
 		}
-		expect(getRecentCompletedTasks(state).map((item) => item.id)).toEqual(["t-3", "t-4", "t-5", "t-6"]);
+		expect(getRecentCompletedTasks(state).map((item) => item.id)).toEqual(["t-3", "t-4", "t-5", "t-6", "t-7", "t-8", "t-9"]);
 	});
 });

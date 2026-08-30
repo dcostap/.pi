@@ -127,7 +127,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 			description: `Manage the enabled session todo list.
 
 Operations:
-- view: return a bounded page of active items plus the four most recently completed tasks. Use offset and limit to page active items.
+- view: return a bounded page of active items plus the seven most recently completed tasks. Use offset and limit to page active items.
 - apply: atomically apply changes and return the first bounded page.
 - run: run one configured command watch now; pass its stable ID in id.
 

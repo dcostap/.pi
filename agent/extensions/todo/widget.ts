@@ -26,24 +26,64 @@ export function todoWidgetLines(
 		...state.items.filter((item) => item.kind === "watch"),
 	];
 	const recentCompleted = getRecentCompletedTasks(state);
-	const visible = [
-		...active.slice(0, Math.max(0, MAX_ITEM_ROWS - recentCompleted.length)),
-		...recentCompleted,
-	];
+	const visibleActive = active.slice(0, Math.max(0, MAX_ITEM_ROWS - recentCompleted.length));
+	const groups = groupVisibleItems(visibleActive, recentCompleted);
+	const completedByGroup = countCompletedByGroup(state);
 	const lines = [header];
-	let lastGroup: string | undefined | null = null;
-	for (const item of visible) {
-		if (item.group && item.group !== lastGroup) lines.push(theme.fg("accent", `  ${item.group}`));
-		lastGroup = item.group;
-		lines.push(renderItem(item, item.id === currentTaskId, theme, nextDue(item.id), now));
+	for (const group of groups) {
+		if (group.name) lines.push(theme.fg("accent", `  ${group.name}`));
+		for (const item of [...group.active, ...group.completed]) {
+			lines.push(renderItem(item, item.id === currentTaskId, theme, nextDue(item.id), now));
+		}
+		const hiddenCompleted = (completedByGroup.get(group.name) ?? 0) - group.completed.length;
+		if (hiddenCompleted > 0) {
+			lines.push(theme.fg("dim", `  … ${hiddenCompleted} ${hiddenCompleted === 1 ? "other" : "others"} completed`));
+		}
 	}
 	if (state.items.length === 0) lines.push(theme.fg("dim", "  No items. The agent or /todo can add one."));
-	const omitted = state.items.length - visible.length;
-	if (omitted > 0) lines.push(theme.fg("dim", `  … ${omitted} more item${omitted === 1 ? "" : "s"}`));
+	const hiddenActive = active.length - visibleActive.length;
+	if (hiddenActive > 0) lines.push(theme.fg("dim", `  … ${hiddenActive} more active item${hiddenActive === 1 ? "" : "s"}`));
+	const renderedGroups = new Set(groups.map((group) => group.name));
+	const completedInOtherGroups = [...completedByGroup]
+		.filter(([group]) => !renderedGroups.has(group))
+		.reduce((total, [, count]) => total + count, 0);
+	if (completedInOtherGroups > 0) {
+		lines.push(theme.fg("dim", `  … ${completedInOtherGroups} completed item${completedInOtherGroups === 1 ? "" : "s"} in other groups`));
+	}
 	if (!state.scriptsEnabled && watches.some((item) => item.schedule?.action === "command")) {
 		lines.push(theme.fg("warning", "  Automatic watch commands are disabled."));
 	}
 	return lines;
+}
+
+interface VisibleGroup {
+	name?: string;
+	active: TodoItem[];
+	completed: TodoItem[];
+}
+
+function groupVisibleItems(active: TodoItem[], completed: TodoItem[]): VisibleGroup[] {
+	const groups = new Map<string | undefined, VisibleGroup>();
+	for (const [items, key] of [[active, "active"], [completed, "completed"]] as const) {
+		for (const item of items) {
+			let group = groups.get(item.group);
+			if (!group) {
+				group = { name: item.group, active: [], completed: [] };
+				groups.set(item.group, group);
+			}
+			group[key].push(item);
+		}
+	}
+	return [...groups.values()];
+}
+
+function countCompletedByGroup(state: TodoState): Map<string | undefined, number> {
+	const counts = new Map<string | undefined, number>();
+	for (const item of state.items) {
+		if (item.kind !== "task" || !item.done) continue;
+		counts.set(item.group, (counts.get(item.group) ?? 0) + 1);
+	}
+	return counts;
 }
 
 export function todoWidgetComponent(state: TodoState, theme: Theme, scheduler: TodoScheduler, requestRender: () => void) {
