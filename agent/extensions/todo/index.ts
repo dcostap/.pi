@@ -7,6 +7,7 @@ import {
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { TodoDashboard, type DashboardAction } from "./dashboard.ts";
+import { buildTodoDiff, type TodoDiffLine } from "./diff.ts";
 import { formatReminder, formatRunResult, formatTodoItemDetails, formatTodoState } from "./format.ts";
 import { WatchRunner } from "./runner.ts";
 import { TodoScheduler } from "./scheduler.ts";
@@ -162,9 +163,14 @@ Tasks are checkable and can repeat text reminders. Task order controls list layo
 				const params = rawParams as TodoToolInput;
 				if (params.op === "view") return todoResult("view", state, params);
 				if (params.op === "apply") {
-					const next = await serialize(() => applyTodoChanges(state, params.changes ?? []));
-					persist(next, ctx);
-					return todoResult("apply", state);
+					const diff = await serialize(() => {
+						const before = cloneTodoState(state);
+						const next = applyTodoChanges(state, params.changes ?? []);
+						const result = buildTodoDiff(before, next, params.changes ?? []);
+						persist(next, ctx);
+						return result;
+					});
+					return todoResult("apply", state, {}, diff);
 				}
 				if (params.op === "run") {
 					const id = params.id?.trim();
@@ -188,6 +194,15 @@ Tasks are checkable and can repeat text reminders. Task order controls list layo
 				const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 				const body = result.content.find((part) => part.type === "text")?.text ?? "";
 				const lines = body.split("\n");
+				const details = result.details as { op?: string; diff?: TodoDiffLine[] } | undefined;
+				if (!context.isError && details?.op === "apply" && details.diff) {
+					const diffLimit = options.expanded ? details.diff.length : 12;
+					const rendered = details.diff.slice(0, diffLimit).map((line) => renderDiffLine(line, theme));
+					if (details.diff.length > diffLimit) rendered.push(theme.fg("dim", `… ${details.diff.length - diffLimit} more diff lines`));
+					const summary = lines.slice(0, 2).join("\n");
+					text.setText(`${rendered.join("\n")}\n\n${theme.fg("muted", options.expanded ? body : summary)}`);
+					return text;
+				}
 				text.setText(theme.fg(context.isError ? "error" : "muted", options.expanded ? body : lines.slice(0, 10).join("\n")));
 				return text;
 			},
@@ -476,11 +491,23 @@ Tasks are checkable and can repeat text reminders. Task order controls list layo
 	});
 }
 
-function todoResult(op: "view" | "apply", state: TodoState, options: Pick<TodoToolInput, "offset" | "limit"> = {}) {
+function todoResult(
+	op: "view" | "apply",
+	state: TodoState,
+	options: Pick<TodoToolInput, "offset" | "limit"> = {},
+	diff?: TodoDiffLine[],
+) {
 	return {
 		content: [{ type: "text" as const, text: formatTodoState(state, options) }],
-		details: { op, state: cloneTodoState(state) },
+		details: { op, state: cloneTodoState(state), ...(diff ? { diff } : {}) },
 	};
+}
+
+function renderDiffLine(line: TodoDiffLine, theme: { fg: (color: "success" | "error" | "warning" | "muted", text: string) => string }): string {
+	if (line.kind === "add") return theme.fg("success", `+ ${line.text}`);
+	if (line.kind === "remove") return theme.fg("error", `- ${line.text}`);
+	if (line.kind === "move") return theme.fg("warning", `~ ${line.text}`);
+	return theme.fg("muted", line.text);
 }
 
 class WakeQueue {

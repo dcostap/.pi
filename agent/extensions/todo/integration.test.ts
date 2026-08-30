@@ -163,6 +163,14 @@ describe("todo extension integration", () => {
 		expect(applied.details.state.items.map((item: any) => item.id)).toEqual(["t-1", "w-2"]);
 		expect(applied.details.state.items[0].group).toBe("Smoke");
 		expect(applied.content[0].text).toContain("Review code · CURRENT");
+		const theme = {
+			fg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		};
+		const rendered = tool.renderResult(applied, { expanded: false }, theme, { isError: false }).render().join("\n");
+		expect(rendered).toContain("+ [ ] t-1 [Smoke] Review code");
+		expect(rendered).toContain("+ CURRENT t-1 · Review code");
+		expect(rendered).not.toContain("\nSmoke:");
 
 		const run = await tool.execute("call-2", { op: "run", id: "w-2" }, undefined, undefined, harness.ctx);
 		expect(run.details.run.status).toBe("success");
