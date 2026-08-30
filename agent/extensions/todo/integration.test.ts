@@ -175,7 +175,12 @@ describe("todo extension integration", () => {
 		const rendered = tool.renderResult(applied, { expanded: false }, theme, { isError: false }).render().join("\n");
 		expect(rendered).toContain("+ [ ] t-1 [Smoke] Review code");
 		expect(rendered).toContain("+ CURRENT t-1 · Review code");
+		expect(rendered).not.toContain("Todo list ·");
+		expect(rendered).not.toContain("Current task:");
 		expect(rendered).not.toContain("\nSmoke:");
+		const expanded = tool.renderResult(applied, { expanded: true }, theme, { isError: false }).render().join("\n");
+		expect(expanded).not.toContain("Todo list ·");
+		expect(expanded).not.toContain("Current task:");
 
 		const run = await tool.execute("call-2", { op: "run", id: "w-2" }, undefined, undefined, harness.ctx);
 		expect(run.details.run.status).toBe("success");

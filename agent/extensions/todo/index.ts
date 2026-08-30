@@ -221,8 +221,7 @@ Tasks are checkable and can repeat text reminders. Task order controls list layo
 					const diffLimit = options.expanded ? details.diff.length : 12;
 					const rendered = details.diff.slice(0, diffLimit).map((line) => renderDiffLine(line, theme));
 					if (details.diff.length > diffLimit) rendered.push(theme.fg("dim", `… ${details.diff.length - diffLimit} more diff lines`));
-					const summary = lines.slice(0, 2).join("\n");
-					text.setText(`${rendered.join("\n")}\n\n${theme.fg("muted", options.expanded ? body : summary)}`);
+					text.setText(rendered.join("\n"));
 					return text;
 				}
 				text.setText(theme.fg(context.isError ? "error" : "muted", options.expanded ? body : lines.slice(0, 10).join("\n")));
