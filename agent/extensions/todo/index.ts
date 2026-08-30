@@ -34,6 +34,8 @@ const ChangeSchema = Type.Object({
 		"reopen",
 		"remove",
 		"move",
+		"set_current",
+		"clear_current",
 		"set_schedule",
 		"disable_schedule",
 		"rename_group",
@@ -56,6 +58,8 @@ const TodoParameters = Type.Object({
 	op: StringEnum(["view", "apply", "run"] as const),
 	changes: Type.Optional(Type.Array(ChangeSchema, { minItems: 1, maxItems: 100 })),
 	id: Type.Optional(Type.String({ description: "Command watch ID for run" })),
+	offset: Type.Optional(Type.Integer({ minimum: 0, description: "Active-item offset for view" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 60, description: "Maximum active items for view" })),
 });
 
 export default function todoExtension(pi: ExtensionAPI): void {
@@ -123,8 +127,8 @@ export default function todoExtension(pi: ExtensionAPI): void {
 			description: `Manage the enabled session todo list.
 
 Operations:
-- view: return the authoritative list.
-- apply: atomically apply changes and return the authoritative list.
+- view: return a bounded page of active items plus the four most recently completed tasks. Use offset and limit to page active items.
+- apply: atomically apply changes and return the first bounded page.
 - run: run one configured command watch now; pass its stable ID in id.
 
 Apply actions:
@@ -132,18 +136,20 @@ Apply actions:
 - edit: id; optional text, group, or clear_group.
 - complete/reopen/remove: id.
 - move: id; optional before_id and group. Omit before_id to move to the end.
+- set_current: id of the one open task now being worked on.
+- clear_current: clear the current task without completing it.
 - set_schedule: id, every, and schedule_action. Command schedules also require command and support cwd and timeout_seconds.
 - disable_schedule: id.
 - rename_group: group and new_group.
 
-Tasks are checkable and can repeat text reminders. Task order is work order: the first open task is current. Watches and completed tasks do not affect the current task. Watches stay until removed and can repeat reminders or non-interactive commands. Intervals use values such as 30s, 10m, 2h, or 1d. IDs are authoritative; do not identify items by text.`,
+Tasks are checkable and can repeat text reminders. Task order controls list layout only. Exactly zero or one open task can be current. Watches stay until removed and can repeat reminders or non-interactive commands. Intervals use values such as 30s, 10m, 2h, or 1d. IDs are authoritative; do not identify items by text.`,
 			promptSnippet: "View or update the enabled session todo list and its recurring watches",
 			promptGuidelines: [
 				"Use todo only when a persistent list helps; do not create a list for each small task.",
 				"Use todo apply with multiple changes when related list edits can be atomic.",
-				"Treat the first open todo task as the current task; watches and completed tasks do not affect the current task.",
-				"Work on only the current todo task unless the user changes the task order.",
-				"Use todo move before the current task to change which todo task is current.",
+				"Do not infer the current todo task from list order or group order.",
+				"Use todo set_current before work starts on a todo task; work on only that current task.",
+				"When work continues after completing the current todo task, complete it and set the next current task in one todo apply call.",
 				"Complete todo tasks only after their work is complete.",
 				"Use todo watches for standing rules, repeating reminders, and recurring command checks.",
 				"After setting or changing a todo command watch, use todo run once to verify the command.",
@@ -154,7 +160,7 @@ Tasks are checkable and can repeat text reminders. Task order is work order: the
 				latestContext = ctx;
 				if (!state.enabled) throw new Error("The todo feature is disabled. The user must run /todo on.");
 				const params = rawParams as TodoToolInput;
-				if (params.op === "view") return todoResult("view", state);
+				if (params.op === "view") return todoResult("view", state, params);
 				if (params.op === "apply") {
 					const next = await serialize(() => applyTodoChanges(state, params.changes ?? []));
 					persist(next, ctx);
@@ -331,6 +337,10 @@ Tasks are checkable and can repeat text reminders. Task order is work order: the
 			await applyUiChanges([{ action: "add", kind: action.type === "add_task" ? "task" : "watch", text, group: group?.trim() || undefined }], ctx);
 			return;
 		}
+		if (action.type === "clear_current") {
+			await applyUiChanges([{ action: "clear_current" }], ctx);
+			return;
+		}
 		if (!("id" in action)) return;
 		const item = state.items.find((candidate) => candidate.id === action.id);
 		if (!item) return;
@@ -340,6 +350,10 @@ Tasks are checkable and can repeat text reminders. Task order is work order: the
 		}
 		if (action.type === "toggle") {
 			await applyUiChanges([{ action: item.done ? "reopen" : "complete", id: item.id }], ctx);
+			return;
+		}
+		if (action.type === "set_current") {
+			await applyUiChanges([{ action: "set_current", id: item.id }], ctx);
 			return;
 		}
 		if (action.type === "edit") {
@@ -462,9 +476,9 @@ Tasks are checkable and can repeat text reminders. Task order is work order: the
 	});
 }
 
-function todoResult(op: "view" | "apply", state: TodoState) {
+function todoResult(op: "view" | "apply", state: TodoState, options: Pick<TodoToolInput, "offset" | "limit"> = {}) {
 	return {
-		content: [{ type: "text" as const, text: formatTodoState(state) }],
+		content: [{ type: "text" as const, text: formatTodoState(state, options) }],
 		details: { op, state: cloneTodoState(state) },
 	};
 }

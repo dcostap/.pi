@@ -5,8 +5,9 @@ import type { TodoItem, TodoState } from "./types.ts";
 
 export type DashboardAction =
 	| { type: "close" }
+	| { type: "clear_current" }
 	| { type: "add_task" | "add_watch" }
-	| { type: "inspect" | "edit" | "delete" | "group" | "schedule" | "run" | "toggle" | "move_up" | "move_down"; id: string };
+	| { type: "inspect" | "edit" | "delete" | "group" | "schedule" | "run" | "toggle" | "set_current" | "move_up" | "move_down"; id: string };
 
 export class TodoDashboard {
 	private selected = 0;
@@ -36,6 +37,9 @@ export class TodoDashboard {
 			if (data === "e" || data === "E") return this.close({ type: "edit", id: item.id });
 			if (data === "d" || data === "D") return this.close({ type: "delete", id: item.id });
 			if (data === "g" || data === "G") return this.close({ type: "group", id: item.id });
+			if ((data === "f" || data === "F") && item.kind === "task" && !item.done) {
+				return this.close(item.id === getCurrentTaskId(this.state) ? { type: "clear_current" } : { type: "set_current", id: item.id });
+			}
 			if (data === "s" || data === "S") return this.close({ type: "schedule", id: item.id });
 			if (data === "r" || data === "R") return this.close({ type: "run", id: item.id });
 			if (data === "K") return this.close({ type: "move_up", id: item.id });
@@ -48,9 +52,10 @@ export class TodoDashboard {
 		const tasks = this.state.items.filter((item) => item.kind === "task");
 		const done = tasks.filter((item) => item.done).length;
 		const watches = this.state.items.filter((item) => item.kind === "watch").length;
+		const currentTaskId = getCurrentTaskId(this.state);
 		const lines = [
 			this.border("Todos", width, "top"),
-			this.frame(`${this.theme.fg("muted", `${done}/${tasks.length} tasks done · ${watches} watches · scripts ${this.state.scriptsEnabled ? "on" : "off"}`)}`, inner),
+			this.frame(`${this.theme.fg("muted", `${done}/${tasks.length} tasks done · ${watches} watches · current ${currentTaskId ?? "none"} · scripts ${this.state.scriptsEnabled ? "on" : "off"}`)}`, inner),
 			this.separator(width),
 		];
 		if (this.state.items.length === 0) {
@@ -75,7 +80,7 @@ export class TodoDashboard {
 		}
 		lines.push(this.separator(width));
 		lines.push(this.frame(this.theme.fg("dim", "↑↓/jk select · Enter inspect · e edit · Space check · a task · w watch"), inner));
-		lines.push(this.frame(this.theme.fg("dim", "g group · r run · d delete · Shift+J/K move · Esc close"), inner));
+		lines.push(this.frame(this.theme.fg("dim", "f set/clear current · g group · r run · d delete · Shift+J/K move · Esc close"), inner));
 		lines.push(this.border("", width, "bottom"));
 		return lines;
 	}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TODO_STATE_ENTRY, applyTodoChanges, createTodoState, getCurrentTaskId, restoreTodoState } from "./state.ts";
+import { TODO_STATE_ENTRY, applyTodoChanges, createTodoState, getCurrentTaskId, getRecentCompletedTasks, restoreTodoState } from "./state.ts";
 
 describe("todo state", () => {
 	test("adds grouped tasks and command watches with stable IDs", () => {
@@ -59,15 +59,42 @@ describe("todo state", () => {
 		expect(() => applyTodoChanges(state, [{ action: "complete", id: "w-1" }])).toThrow("cannot be checked");
 	});
 
-	test("uses the first open task as the current task", () => {
+	test("sets current task independently from list order", () => {
 		let state = applyTodoChanges(createTodoState(), [
 			{ action: "add", kind: "watch", text: "Watch first" },
 			{ action: "add", kind: "task", text: "First task" },
 			{ action: "add", kind: "task", text: "Second task" },
 		]);
-		expect(getCurrentTaskId(state)).toBe("t-2");
+		expect(getCurrentTaskId(state)).toBeUndefined();
 
-		state = applyTodoChanges(state, [{ action: "complete", id: "t-2" }]);
+		state = applyTodoChanges(state, [{ action: "set_current", id: "t-3" }]);
 		expect(getCurrentTaskId(state)).toBe("t-3");
+		expect(state.items.map((item) => item.id)).toEqual(["w-1", "t-2", "t-3"]);
+
+		state = applyTodoChanges(state, [{ action: "complete", id: "t-3" }]);
+		expect(getCurrentTaskId(state)).toBeUndefined();
+	});
+
+	test("rejects completed tasks as current and can clear current", () => {
+		let state = applyTodoChanges(createTodoState(), [
+			{ action: "add", kind: "task", text: "Open" },
+			{ action: "add", kind: "task", text: "Done" },
+			{ action: "complete", id: "t-2" },
+			{ action: "set_current", id: "t-1" },
+		]);
+		expect(() => applyTodoChanges(state, [{ action: "set_current", id: "t-2" }])).toThrow("cannot be current");
+		const withWatch = applyTodoChanges(state, [{ action: "add", kind: "watch", text: "Watch" }]);
+		expect(() => applyTodoChanges(withWatch, [{ action: "set_current", id: "w-3" }])).toThrow("cannot be current");
+		state = applyTodoChanges(state, [{ action: "clear_current" }]);
+		expect(getCurrentTaskId(state)).toBeUndefined();
+	});
+
+	test("keeps the four latest completed tasks in completion order", () => {
+		let state = createTodoState();
+		for (let index = 1; index <= 6; index++) {
+			state = applyTodoChanges(state, [{ action: "add", kind: "task", text: `Task ${index}` }], index);
+			state = applyTodoChanges(state, [{ action: "complete", id: `t-${index}` }], 100 + index);
+		}
+		expect(getRecentCompletedTasks(state).map((item) => item.id)).toEqual(["t-3", "t-4", "t-5", "t-6"]);
 	});
 });

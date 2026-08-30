@@ -1,23 +1,56 @@
 import { formatElapsed } from "./duration.ts";
-import { getCurrentTaskId } from "./state.ts";
+import { getCurrentTaskId, getRecentCompletedTasks } from "./state.ts";
 import type { TodoItem, TodoRunSummary, TodoState } from "./types.ts";
 
-export function formatTodoState(state: TodoState): string {
+const DEFAULT_PAGE_SIZE = 40;
+const MAX_PAGE_SIZE = 60;
+const ACTIVE_PAGE_BYTE_BUDGET = 32 * 1024;
+
+export interface TodoFormatOptions {
+	offset?: number;
+	limit?: number;
+}
+
+export function formatTodoState(state: TodoState, options: TodoFormatOptions = {}): string {
 	const open = state.items.filter((item) => item.kind === "task" && !item.done).length;
 	const done = state.items.filter((item) => item.kind === "task" && item.done).length;
 	const watches = state.items.filter((item) => item.kind === "watch").length;
+	const active = state.items.filter((item) => item.kind === "watch" || !item.done);
+	const offset = Math.min(active.length, Math.max(0, Math.floor(options.offset ?? 0)));
+	const limit = Math.min(MAX_PAGE_SIZE, Math.max(1, Math.floor(options.limit ?? DEFAULT_PAGE_SIZE)));
 	const lines = [
 		`Todo list · ${open} open · ${done} completed · ${watches} watches · scripts ${state.scriptsEnabled ? "on" : "off"}`,
 	];
 	if (state.items.length === 0) return `${lines[0]}\n\nNo todo items.`;
 	const currentTaskId = getCurrentTaskId(state);
+	const currentTask = state.items.find((item) => item.id === currentTaskId);
+	lines.push(currentTask ? `Current task: ${currentTask.id} · ${currentTask.text}` : "Current task: none");
+	if (offset > 0) lines.push(`… ${offset} earlier active item${offset === 1 ? "" : "s"} omitted.`);
+	const page = active.slice(offset, offset + limit);
 	let group: string | undefined | null = null;
-	for (const item of state.items) {
+	let shown = 0;
+	let activeBytes = 0;
+	for (const item of page) {
+		const itemLines: string[] = [];
 		if (item.group !== group) {
 			group = item.group;
-			if (group) lines.push("", `${group}:`);
+			if (group) itemLines.push("", `${group}:`);
 		}
-		lines.push(formatItem(item, item.id === currentTaskId));
+		itemLines.push(formatItem(item, item.id === currentTaskId));
+		const chunkBytes = Buffer.byteLength(itemLines.join("\n"), "utf8");
+		if (shown > 0 && activeBytes + chunkBytes > ACTIVE_PAGE_BYTE_BUDGET) break;
+		lines.push(...itemLines);
+		activeBytes += chunkBytes;
+		shown++;
+	}
+	const nextOffset = offset + shown;
+	if (nextOffset < active.length) {
+		lines.push("", `… ${active.length - nextOffset} more active item${active.length - nextOffset === 1 ? "" : "s"}. Use todo view with offset ${nextOffset}.`);
+	}
+	const recentCompleted = getRecentCompletedTasks(state);
+	if (recentCompleted.length > 0) {
+		lines.push("", `Recently completed (${recentCompleted.length} of ${done}):`);
+		for (const item of recentCompleted) lines.push(formatItem(item));
 	}
 	return lines.join("\n");
 }

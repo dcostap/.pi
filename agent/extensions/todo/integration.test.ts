@@ -122,6 +122,7 @@ describe("todo extension integration", () => {
 			changes: [
 				{ action: "add", kind: "task", text: "Review code", group: "Smoke" },
 				{ action: "add", kind: "watch", text: "Tests stay green", every: "10m", schedule_action: "command", command: "npm test" },
+				{ action: "set_current", id: "t-1" },
 			],
 		}, undefined, undefined, harness.ctx);
 		expect(applied.details.state.items.map((item: any) => item.id)).toEqual(["t-1", "w-2"]);

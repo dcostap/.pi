@@ -63,7 +63,16 @@ export function findItem(state: TodoState, id: string): TodoItem {
 }
 
 export function getCurrentTaskId(state: TodoState): string | undefined {
-	return state.items.find((item) => item.kind === "task" && !item.done)?.id;
+	const item = state.items.find((candidate) => candidate.id === state.currentTaskId);
+	return item?.kind === "task" && !item.done ? item.id : undefined;
+}
+
+export function getRecentCompletedTasks(state: TodoState, limit = 4): TodoItem[] {
+	if (limit <= 0) return [];
+	return state.items
+		.filter((item) => item.kind === "task" && item.done)
+		.sort((left, right) => (left.completedAt ?? left.updatedAt) - (right.completedAt ?? right.updatedAt))
+		.slice(-limit);
 }
 
 function applyChange(state: TodoState, change: TodoChange, now: number): void {
@@ -83,6 +92,7 @@ function applyChange(state: TodoState, change: TodoChange, now: number): void {
 			item.done = true;
 			item.completedAt = now;
 			item.updatedAt = now;
+			if (state.currentTaskId === item.id) state.currentTaskId = undefined;
 			return;
 		}
 		case "reopen": {
@@ -97,10 +107,21 @@ function applyChange(state: TodoState, change: TodoChange, now: number): void {
 			const index = state.items.findIndex((item) => item.id === id);
 			if (index < 0) throw new Error(`Unknown todo item: ${id}`);
 			state.items.splice(index, 1);
+			if (state.currentTaskId === id) state.currentTaskId = undefined;
 			return;
 		}
 		case "move":
 			moveItem(state, change);
+			return;
+		case "set_current": {
+			const item = findItem(state, required(change.id, "id"));
+			if (item.kind !== "task") throw new Error(`${item.id} is a watch and cannot be current`);
+			if (item.done) throw new Error(`${item.id} is completed and cannot be current`);
+			state.currentTaskId = item.id;
+			return;
+		}
+		case "clear_current":
+			state.currentTaskId = undefined;
 			return;
 		case "set_schedule": {
 			const item = findItem(state, required(change.id, "id"));
@@ -215,11 +236,14 @@ function normalizeStoredState(value: unknown): TodoState | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const state = value as Partial<TodoState>;
 	if (state.version !== 1 || !Array.isArray(state.items)) return undefined;
+	const items = structuredClone(state.items);
+	const current = items.find((item) => item.id === state.currentTaskId);
 	return {
 		version: 1,
 		enabled: state.enabled === true,
 		scriptsEnabled: state.scriptsEnabled !== false,
 		nextSequence: Number.isInteger(state.nextSequence) ? Math.max(1, state.nextSequence!) : state.items.length + 1,
-		items: structuredClone(state.items),
+		currentTaskId: current?.kind === "task" && !current.done ? current.id : undefined,
+		items,
 	};
 }

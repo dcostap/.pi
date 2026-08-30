@@ -44,6 +44,7 @@ export interface TodoState {
 	enabled: boolean;
 	scriptsEnabled: boolean;
 	nextSequence: number;
+	currentTaskId?: string;
 	items: TodoItem[];
 }
 
@@ -55,6 +56,8 @@ export interface TodoChange {
 		| "reopen"
 		| "remove"
 		| "move"
+		| "set_current"
+		| "clear_current"
 		| "set_schedule"
 		| "disable_schedule"
 		| "rename_group";
@@ -76,6 +79,8 @@ export interface TodoToolInput {
 	op: "view" | "apply" | "run";
 	changes?: TodoChange[];
 	id?: string;
+	offset?: number;
+	limit?: number;
 }
 
 export interface ScheduledTodoItem {
