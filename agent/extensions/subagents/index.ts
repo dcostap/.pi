@@ -91,7 +91,7 @@ const LIST_TOOL_NAME = "subagent_list";
 const STATUS_TOOL_NAME = "subagent_status";
 const SEND_TOOL_NAME = "subagent_send";
 const REPORT_TOOL_NAME = "subagent_report";
-const NOTIFY_ALL_TOOL_NAME = "subagent_notify_when_all_completed";
+const NOTIFY_ONLY_ONCE_TOOL_NAME = "subagent_notify_only_once_when_all_completed";
 const RESULT_TOOL_NAME = "subagent_result";
 const STOP_TOOL_NAME = "subagent_stop";
 const STOP_TREE_COMMAND = "managed-subagent-stop-tree";
@@ -947,7 +947,7 @@ class SubagentManager {
 	armCompletionNotification(ids: string[], label: string): { notification?: CompletionNotification; completions?: CompletionSnapshot[] } {
 		this.assertActive();
 		if (this.completionNotifications.active) {
-			throw new Error(`A completion notification is already armed (${this.completionNotifications.active.id} · ${this.completionNotifications.active.label})`);
+			throw new Error(`A notify-only-once request is already armed (${this.completionNotifications.active.id} · ${this.completionNotifications.active.label})`);
 		}
 		const records = [...new Set(ids)].map((id) => this.get(id));
 		if (records.length === 0) throw new Error("At least one subagent is required");
@@ -955,7 +955,7 @@ class SubagentManager {
 			if (!record.currentRunId) throw new Error(`${record.id} has no managed run`);
 			const key = `${record.id}:${record.currentRunId}`;
 			if (this.deliveredCompletionKeys.has(key)) {
-				throw new Error(`${record.id} ${record.currentRunId} already sent its completion update; arm all-complete notifications immediately after launch`);
+				throw new Error(`${record.id} ${record.currentRunId} already sent its completion update; call ${NOTIFY_ONLY_ONCE_TOOL_NAME} immediately after launch`);
 			}
 			if (this.inFlightCompletionKeys.has(key)) throw new Error(`${record.id} ${record.currentRunId} has a completion update in delivery`);
 			return {
@@ -3262,9 +3262,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: NOTIFY_ALL_TOOL_NAME,
-		label: "Notify When All Subagents Complete",
-		description: "Arm one nonblocking completion notification for selected direct subagents. Use it only when further work needs the complete set. The tool returns immediately. Selected current runs stop sending separate completion updates. Pi sends one combined update after all selected runs finish. Do not use it for normal launches. Each subagent notifies separately by default. Only one all-complete notification can be active.",
+		name: NOTIFY_ONLY_ONCE_TOOL_NAME,
+		label: "Notify Only Once When All Subagents Complete",
+		description: "Arm one nonblocking notification that fires only once after all selected direct subagents complete. Use it only when further work needs the complete set. The tool returns immediately. Selected current runs stop sending separate completion updates. Pi sends one combined update after all selected runs finish. Do not use it for normal launches. Each subagent notifies separately by default. Only one notify-only-once request can be active.",
 		parameters: IdSelector,
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const activeManager = ensureManager(ctx);
@@ -3290,7 +3290,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			const completed = notification.targets.filter((target) => target.completion).length;
 			const active = notification.targets.length - completed;
 			return result([
-				`All-complete notification armed: ${notification.id} · ${notification.label}`,
+				`Notify-only-once request armed: ${notification.id} · ${notification.label}`,
 				`Selected current runs: ${notification.targets.length} · already finished: ${completed} · active: ${active}`,
 				"Selected subagents will not send separate completion updates.",
 				"Continue useful work or end this response. Pi will send one combined update after every selected run finishes.",
@@ -3303,7 +3303,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			const input = args as any;
 			const count = Array.isArray(input?.ids) ? input.ids.length : undefined;
 			const detail = input?.batch_id ? `batch ${input.batch_id}` : count !== undefined ? `${count} agents` : input?.input_file ? `manifest ${path.basename(input.input_file)}` : "subagents";
-			return toolHeader("Notify when all complete", detail, theme, context.lastComponent);
+			return toolHeader("Notify only once when all complete", detail, theme, context.lastComponent);
 		},
 		renderResult(resultValue, options, theme, context) {
 			return textOrMarkdownResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent);

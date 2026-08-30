@@ -201,8 +201,8 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>, canRepor
 - Set all_active_and_parked to true only when the same instruction must reach every live direct subagent. Multi-target sends never continue completed sessions.
 - Use subagent_status only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
 - Every subagent notifies you separately when its complete managed task finishes.
-- Use subagent_notify_when_all_completed only when you need one combined update after every selected current run finishes. It returns immediately and suppresses separate completion updates for those runs.
-- Do not use subagent_notify_when_all_completed for ordinary independent work. Continue useful work after launch, or end your response and let Pi park the session.
+- Use subagent_notify_only_once_when_all_completed only when you need one combined update after every selected current run finishes. It returns immediately and suppresses separate completion updates for those runs.
+- Do not use subagent_notify_only_once_when_all_completed for ordinary independent work. Continue useful work after launch, or end your response and let Pi park the session.
 - A model run can settle while owned subagents remain active. Pi keeps the session parked and wakes it for updates or parent instructions.
 - Process all required subagent results before you give your final task answer.
 - Use subagent_result for unattended, historical, or specific completed runs when their answer is needed later.

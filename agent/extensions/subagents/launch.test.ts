@@ -142,7 +142,7 @@ describe("subagent launch requests", () => {
 		const instructions = buildMainInstructions(new Map(), true);
 		expect(instructions).toContain("Use subagent_report only for important mid-task information");
 		expect(instructions).toContain("Do not use it for completion.");
-		expect(instructions).toContain("subagent_notify_when_all_completed");
+		expect(instructions).toContain("subagent_notify_only_once_when_all_completed");
 		expect(instructions).toContain("Pi keeps the session parked");
 		expect(instructions).not.toContain("subagent_wait");
 	});
