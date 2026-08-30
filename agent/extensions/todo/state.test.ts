@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TODO_STATE_ENTRY, applyTodoChanges, createTodoState, restoreTodoState } from "./state.ts";
+import { TODO_STATE_ENTRY, applyTodoChanges, createTodoState, getCurrentTaskId, restoreTodoState } from "./state.ts";
 
 describe("todo state", () => {
 	test("adds grouped tasks and command watches with stable IDs", () => {
@@ -57,5 +57,17 @@ describe("todo state", () => {
 	test("watches cannot be completed", () => {
 		const state = applyTodoChanges(createTodoState(), [{ action: "add", kind: "watch", text: "Standing rule" }]);
 		expect(() => applyTodoChanges(state, [{ action: "complete", id: "w-1" }])).toThrow("cannot be checked");
+	});
+
+	test("uses the first open task as the current task", () => {
+		let state = applyTodoChanges(createTodoState(), [
+			{ action: "add", kind: "watch", text: "Watch first" },
+			{ action: "add", kind: "task", text: "First task" },
+			{ action: "add", kind: "task", text: "Second task" },
+		]);
+		expect(getCurrentTaskId(state)).toBe("t-2");
+
+		state = applyTodoChanges(state, [{ action: "complete", id: "t-2" }]);
+		expect(getCurrentTaskId(state)).toBe("t-3");
 	});
 });

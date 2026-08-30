@@ -7,7 +7,7 @@ import {
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { TodoDashboard, type DashboardAction } from "./dashboard.ts";
-import { formatAgentTodoContext, formatReminder, formatRunResult, formatTodoItemDetails, formatTodoState } from "./format.ts";
+import { formatReminder, formatRunResult, formatTodoItemDetails, formatTodoState } from "./format.ts";
 import { WatchRunner } from "./runner.ts";
 import { TodoScheduler } from "./scheduler.ts";
 import {
@@ -136,11 +136,14 @@ Apply actions:
 - disable_schedule: id.
 - rename_group: group and new_group.
 
-Tasks are checkable and can repeat text reminders. Watches stay until removed and can repeat reminders or non-interactive commands. Intervals use values such as 30s, 10m, 2h, or 1d. IDs are authoritative; do not identify items by text.`,
+Tasks are checkable and can repeat text reminders. Task order is work order: the first open task is current. Watches and completed tasks do not affect the current task. Watches stay until removed and can repeat reminders or non-interactive commands. Intervals use values such as 30s, 10m, 2h, or 1d. IDs are authoritative; do not identify items by text.`,
 			promptSnippet: "View or update the enabled session todo list and its recurring watches",
 			promptGuidelines: [
 				"Use todo only when a persistent list helps; do not create a list for each small task.",
 				"Use todo apply with multiple changes when related list edits can be atomic.",
+				"Treat the first open todo task as the current task; watches and completed tasks do not affect the current task.",
+				"Work on only the current todo task unless the user changes the task order.",
+				"Use todo move before the current task to change which todo task is current.",
 				"Complete todo tasks only after their work is complete.",
 				"Use todo watches for standing rules, repeating reminders, and recurring command checks.",
 				"After setting or changing a todo command watch, use todo run once to verify the command.",
@@ -427,22 +430,6 @@ Tasks are checkable and can repeat text reminders. Watches stay until removed an
 		const next = await serialize(() => applyTodoChanges(state, changes));
 		persist(next, ctx);
 	}
-
-	pi.on("context", (event) => {
-		if (!state.enabled) return;
-		return {
-			messages: [
-				...event.messages,
-				{
-					role: "custom",
-					customType: "todo-state-context",
-					content: formatAgentTodoContext(state),
-					display: false,
-					timestamp: Date.now(),
-				},
-			] as typeof event.messages,
-		};
-	});
 
 	pi.on("session_start", (_event, ctx) => {
 		latestContext = ctx;

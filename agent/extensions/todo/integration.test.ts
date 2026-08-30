@@ -126,6 +126,7 @@ describe("todo extension integration", () => {
 		}, undefined, undefined, harness.ctx);
 		expect(applied.details.state.items.map((item: any) => item.id)).toEqual(["t-1", "w-2"]);
 		expect(applied.details.state.items[0].group).toBe("Smoke");
+		expect(applied.content[0].text).toContain("Review code · CURRENT");
 
 		const run = await tool.execute("call-2", { op: "run", id: "w-2" }, undefined, undefined, harness.ctx);
 		expect(run.details.run.status).toBe("success");

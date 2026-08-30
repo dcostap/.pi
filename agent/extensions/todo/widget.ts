@@ -2,6 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatRemaining } from "./duration.ts";
 import type { TodoScheduler } from "./scheduler.ts";
+import { getCurrentTaskId } from "./state.ts";
 import type { TodoItem, TodoState } from "./types.ts";
 
 const MAX_ITEM_ROWS = 12;
@@ -26,11 +27,12 @@ export function todoWidgetLines(
 	];
 	const visible = preferred.slice(0, MAX_ITEM_ROWS);
 	const lines = [header];
+	const currentTaskId = getCurrentTaskId(state);
 	let lastGroup: string | undefined | null = null;
 	for (const item of visible) {
 		if (item.group && item.group !== lastGroup) lines.push(theme.fg("accent", `  ${item.group}`));
 		lastGroup = item.group;
-		lines.push(renderItem(item, theme, nextDue(item.id), now));
+		lines.push(renderItem(item, item.id === currentTaskId, theme, nextDue(item.id), now));
 	}
 	if (state.items.length === 0) lines.push(theme.fg("dim", "  No items. The agent or /todo can add one."));
 	const omitted = preferred.length - visible.length;
@@ -53,7 +55,7 @@ export function todoWidgetComponent(state: TodoState, theme: Theme, scheduler: T
 	};
 }
 
-function renderItem(item: TodoItem, theme: Theme, dueAt: number | undefined, now: number): string {
+function renderItem(item: TodoItem, current: boolean, theme: Theme, dueAt: number | undefined, now: number): string {
 	const connector = theme.fg("dim", "  ├─ ");
 	const marker = item.kind === "watch"
 		? watchMarker(item, theme)
@@ -66,7 +68,8 @@ function renderItem(item: TodoItem, theme: Theme, dueAt: number | undefined, now
 	const run = item.lastRun
 		? theme.fg(item.lastRun.status === "success" ? "success" : item.lastRun.status === "failed" ? "error" : "warning", ` · ${item.lastRun.status}`)
 		: "";
-	return `${connector}${marker} ${id} ${text}${due}${run}`;
+	const currentLabel = current ? theme.fg("accent", " · CURRENT") : "";
+	return `${connector}${marker} ${id} ${text}${due}${run}${currentLabel}`;
 }
 
 function watchMarker(item: TodoItem, theme: Theme): string {

@@ -1,4 +1,5 @@
 import { formatElapsed } from "./duration.ts";
+import { getCurrentTaskId } from "./state.ts";
 import type { TodoItem, TodoRunSummary, TodoState } from "./types.ts";
 
 export function formatTodoState(state: TodoState): string {
@@ -9,23 +10,15 @@ export function formatTodoState(state: TodoState): string {
 		`Todo list · ${open} open · ${done} completed · ${watches} watches · scripts ${state.scriptsEnabled ? "on" : "off"}`,
 	];
 	if (state.items.length === 0) return `${lines[0]}\n\nNo todo items.`;
+	const currentTaskId = getCurrentTaskId(state);
 	let group: string | undefined | null = null;
 	for (const item of state.items) {
 		if (item.group !== group) {
 			group = item.group;
 			if (group) lines.push("", `${group}:`);
 		}
-		lines.push(formatItem(item));
+		lines.push(formatItem(item, item.id === currentTaskId));
 	}
-	return lines.join("\n");
-}
-
-export function formatAgentTodoContext(state: TodoState): string {
-	const visible = state.items.filter((item) => item.kind === "watch" || !item.done);
-	if (visible.length === 0) return `<todo-state scripts="${state.scriptsEnabled ? "on" : "off"}">No open tasks or watches.</todo-state>`;
-	const lines = [`<todo-state scripts="${state.scriptsEnabled ? "on" : "off"}">`];
-	for (const item of visible) lines.push(formatItem(item));
-	lines.push("</todo-state>");
 	return lines.join("\n");
 }
 
@@ -69,7 +62,7 @@ export function formatTodoItemDetails(item: TodoItem): string {
 	return lines.join("\n");
 }
 
-function formatItem(item: TodoItem): string {
+function formatItem(item: TodoItem, current = false): string {
 	const marker = item.kind === "watch" ? "◆" : item.done ? "[x]" : "[ ]";
 	const group = item.group ? ` [${item.group}]` : "";
 	const schedule = item.schedule?.enabled
@@ -77,5 +70,5 @@ function formatItem(item: TodoItem): string {
 			? ` · every ${item.schedule.every} command`
 			: ` · remind every ${item.schedule.every}`
 		: "";
-	return `${marker} ${item.id}${group} ${item.text}${schedule}`;
+	return `${marker} ${item.id}${group} ${item.text}${schedule}${current ? " · CURRENT" : ""}`;
 }

@@ -62,6 +62,10 @@ export function findItem(state: TodoState, id: string): TodoItem {
 	return item;
 }
 
+export function getCurrentTaskId(state: TodoState): string | undefined {
+	return state.items.find((item) => item.kind === "task" && !item.done)?.id;
+}
+
 function applyChange(state: TodoState, change: TodoChange, now: number): void {
 	switch (change.action) {
 		case "add":

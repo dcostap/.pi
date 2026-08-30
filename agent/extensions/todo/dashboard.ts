@@ -1,5 +1,6 @@
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { getCurrentTaskId } from "./state.ts";
 import type { TodoItem, TodoState } from "./types.ts";
 
 export type DashboardAction =
@@ -90,7 +91,8 @@ export class TodoDashboard {
 		const schedule = item.schedule?.enabled
 			? this.theme.fg("dim", ` · ${item.schedule.action === "command" ? "run" : "remind"} ${item.schedule.every}`)
 			: "";
-		return truncateToWidth(`${pointer} ${marker} ${this.theme.fg("accent", item.id)}  ${text}${schedule}`, width, "…");
+		const current = item.id === getCurrentTaskId(this.state) ? this.theme.fg("accent", " · CURRENT") : "";
+		return truncateToWidth(`${pointer} ${marker} ${this.theme.fg("accent", item.id)}  ${text}${schedule}${current}`, width, "…");
 	}
 
 	private isUp(data: string): boolean {
