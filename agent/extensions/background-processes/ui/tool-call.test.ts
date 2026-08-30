@@ -39,12 +39,16 @@ describe("background start tool-call rendering", () => {
 			.toBe("bash_bg_kill bg-4");
 	});
 
-	test("shows readable process aliases beside ids when available", () => {
-		const title = (id: string) => id === "bg-2" ? "Dev server" : id === "bg-3" ? "Unit tests" : undefined;
-		expect(renderBackgroundToolCall("bash_bg_status", { id: "bg-2" }, theme, undefined, title).render(200).join("\n"))
-			.toBe("bash_bg_status bg-2 (Dev server)");
-		expect(renderBackgroundToolCall("bash_bg_wait", { ids: ["bg-2", "bg-3"] }, theme, undefined, title).render(200).join("\n"))
-			.toBe("bash_bg_wait bg-2 (Dev server), bg-3 (Unit tests)");
+	test("shows process titles and commands beside ids", () => {
+		const process = (id: string) => id === "bg-2"
+			? { title: "Dev server", command: "bun run dev" }
+			: id === "bg-3"
+				? { title: "Unit tests", command: "bun test" }
+				: undefined;
+		expect(renderBackgroundToolCall("bash_bg_status", { id: "bg-2" }, theme, undefined, process).render(200).join("\n"))
+			.toBe("bash_bg_status bg-2 (Dev server • $ bun run dev)");
+		expect(renderBackgroundToolCall("bash_bg_wait", { ids: ["bg-2", "bg-3"] }, theme, undefined, process).render(200).join("\n"))
+			.toBe("bash_bg_wait bg-2 (Dev server • $ bun run dev), bg-3 (Unit tests • $ bun test)");
 	});
 });
 
@@ -126,7 +130,7 @@ describe("background tool-result rendering", () => {
 			theme,
 			undefined,
 			false,
-			(id) => id === "bg-2" ? "Dev server" : undefined,
+			(id) => id === "bg-2" ? { title: "Dev server", command: "bun run dev" } : undefined,
 		).render(200).join("\n");
 
 		expect(rendered).toContain("bg-2 (Dev server): termination observed (killed)");

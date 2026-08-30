@@ -18,7 +18,11 @@ import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
 import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
 import { processWidgetComponent } from "./ui/process-widget.ts";
-import { renderBackgroundToolCall, renderBackgroundToolResult } from "./ui/tool-call.ts";
+import {
+	renderBackgroundToolCall,
+	renderBackgroundToolResult,
+	type BackgroundProcessLookup,
+} from "./ui/tool-call.ts";
 import { MANAGED_WORK_STATE_EVENT } from "../_shared/managed-work.ts";
 import { WaitInterruptRegistry } from "./wait-interrupt.ts";
 
@@ -118,10 +122,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		promptSnippet: "Start a long non-interactive bash command in the background; completion is delivered automatically",
 		parameters: StartParameters,
 		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_start", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
+			return renderBackgroundToolCall("bash_bg_start", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
 		},
 		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_start", result, options, theme, context.lastComponent as Text | undefined, context.isError, titleLookup(manager, result.details));
+			return renderBackgroundToolResult("bash_bg_start", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
 		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
@@ -154,10 +158,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		description: "Return a nonblocking status and bounded recent-output snapshot for one background bash process.",
 		parameters: IdParameters,
 		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_status", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
+			return renderBackgroundToolCall("bash_bg_status", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
 		},
 		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_status", result, options, theme, context.lastComponent as Text | undefined, context.isError, titleLookup(manager, result.details));
+			return renderBackgroundToolResult("bash_bg_status", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
 		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const snapshot = requireManager(ctx).get(params.id, true);
@@ -174,10 +178,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		description: "List the 30 most recent tracked background bash processes without waiting or including bash command output. Older entries are summarized.",
 		parameters: Type.Object({}),
 		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_list", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
+			return renderBackgroundToolCall("bash_bg_list", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
 		},
 		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_list", result, options, theme, context.lastComponent as Text | undefined, context.isError, titleLookup(manager, result.details));
+			return renderBackgroundToolResult("bash_bg_list", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
 		},
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			latestContext = ctx;
@@ -196,10 +200,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		description: "Wait for selected background bash processes. The tool streams a bounded live output preview. A steering message interrupts only the wait. Timeout, steering, or cancellation leaves unfinished processes running.",
 		parameters: WaitParameters,
 		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_wait", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
+			return renderBackgroundToolCall("bash_bg_wait", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
 		},
 		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_wait", result, options, theme, context.lastComponent as Text | undefined, context.isError, titleLookup(manager, result.details));
+			return renderBackgroundToolResult("bash_bg_wait", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const activeManager = requireManager(ctx);
@@ -260,10 +264,10 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		description: "Request termination of selected background bash processes through the same local backend as Pi's built-in bash tool.",
 		parameters: IdsParameters,
 		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_kill", args, theme, context.lastComponent as Text | undefined, titleLookup(manager));
+			return renderBackgroundToolCall("bash_bg_kill", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
 		},
 		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_kill", result, options, theme, context.lastComponent as Text | undefined, context.isError, titleLookup(manager, result.details));
+			return renderBackgroundToolResult("bash_bg_kill", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
 		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background stop aborted before termination began");
@@ -364,26 +368,32 @@ function compactDetails(snapshot: ReturnType<BackgroundProcessManager["get"]>) {
 	};
 }
 
-function titleLookup(manager: BackgroundProcessManager | undefined, details?: unknown): (id: string) => string | undefined {
+function processLookup(manager: BackgroundProcessManager | undefined, details?: unknown): BackgroundProcessLookup {
 	return (id) => {
-		const live = manager?.list().find((snapshot) => snapshot.id === id)?.title;
-		return live ?? findTitleInDetails(details, id);
+		const live = manager?.list().find((snapshot) => snapshot.id === id);
+		if (live) return { title: live.title, command: live.command };
+		return findProcessInDetails(details, id);
 	};
 }
 
-function findTitleInDetails(value: unknown, id: string): string | undefined {
+function findProcessInDetails(
+	value: unknown,
+	id: string,
+): { title: string | undefined; command: string | undefined } | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	if (Array.isArray(value)) {
 		for (const item of value) {
-			const found = findTitleInDetails(item, id);
+			const found = findProcessInDetails(item, id);
 			if (found) return found;
 		}
 		return undefined;
 	}
 	const record = value as Record<string, unknown>;
-	if (record.id === id && typeof record.title === "string") return record.title;
+	if (record.id === id && typeof record.title === "string") {
+		return { title: record.title, command: undefined };
+	}
 	for (const key of ["processes", "settled", "results"]) {
-		const found = findTitleInDetails(record[key], id);
+		const found = findProcessInDetails(record[key], id);
 		if (found) return found;
 	}
 	return undefined;

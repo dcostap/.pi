@@ -32,7 +32,7 @@ const theme = {
 } as any;
 
 describe("background process widget", () => {
-	test("shows each running terminal with live activity and elapsed time", () => {
+	test("shows each running terminal with its command, live activity, and elapsed time", () => {
 		const lines = processWidgetLines([
 			snapshot("bg-1"),
 			snapshot("bg-2", { title: "Dev server", killRequested: true, output: { ...snapshot("x").output, text: "listening on :3000" } }),
@@ -43,6 +43,7 @@ describe("background process widget", () => {
 		expect(text).toContain("bg-1");
 		expect(text).toContain("Tests");
 		expect(text).toContain("12s");
+		expect(text).toContain("$ bun test --watch · 42 tests passed");
 		expect(text).toContain("42 tests passed");
 		expect(text).toContain("· stopping");
 		expect(text).toContain("listening on :3000");

@@ -36,14 +36,14 @@ function stateText(snapshot: BackgroundProcessSnapshot, theme: Theme, now: numbe
 }
 
 function latestActivity(snapshot: BackgroundProcessSnapshot): string {
+	const command = cleanInline(snapshot.command);
 	const outputLines = snapshot.output.text
 		.split(/\r?\n/gu)
 		.map(cleanInline)
 		.filter(Boolean);
 	const latest = outputLines.at(-1);
-	if (latest) return latest;
-	const command = cleanInline(snapshot.command);
-	return command ? `$ ${command}` : "waiting for output";
+	if (!command) return latest || "waiting for output";
+	return latest ? `$ ${command} · ${latest}` : `$ ${command}`;
 }
 
 export function processWidgetLines(

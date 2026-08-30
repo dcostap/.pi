@@ -33,7 +33,12 @@ export interface BackgroundToolResultOptions {
 	isPartial: boolean;
 }
 
-export type BackgroundTitleLookup = (id: string) => string | undefined;
+export interface BackgroundProcessDisplay {
+	title: string | undefined;
+	command: string | undefined;
+}
+
+export type BackgroundProcessLookup = (id: string) => BackgroundProcessDisplay | undefined;
 
 export function renderBackgroundStartCall(
 	args: BackgroundStartCallArgs,
@@ -48,7 +53,7 @@ export function renderBackgroundToolCall(
 	args: BackgroundToolCallArgs,
 	theme: Theme,
 	previous?: Text,
-	lookupTitle?: BackgroundTitleLookup,
+	lookupProcess?: BackgroundProcessLookup,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 	const prefix = theme.fg("toolTitle", theme.bold(toolName));
@@ -68,19 +73,19 @@ export function renderBackgroundToolCall(
 	}
 
 	if (toolName === "bash_bg_status") {
-		component.setText(`${prefix}${formatIds([args.id], theme, lookupTitle)}`);
+		component.setText(`${prefix}${formatIds([args.id], theme, lookupProcess)}`);
 		return component;
 	}
 
 	if (toolName === "bash_bg_wait") {
 		const timeout = typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined;
 		const suffix = timeout === undefined ? "" : theme.fg("muted", ` (timeout ${timeout}s)`);
-		component.setText(`${prefix}${formatIds(args.ids, theme, lookupTitle)}${suffix}`);
+		component.setText(`${prefix}${formatIds(args.ids, theme, lookupProcess)}${suffix}`);
 		return component;
 	}
 
 	if (toolName === "bash_bg_kill") {
-		component.setText(`${prefix}${formatIds(args.ids, theme, lookupTitle)}`);
+		component.setText(`${prefix}${formatIds(args.ids, theme, lookupProcess)}`);
 		return component;
 	}
 
@@ -95,7 +100,7 @@ export function renderBackgroundToolResult(
 	theme: Theme,
 	previous?: Text,
 	isError = false,
-	lookupTitle?: BackgroundTitleLookup,
+	lookupProcess?: BackgroundProcessLookup,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 	const text = sanitizeTerminalText(
@@ -114,19 +119,23 @@ export function renderBackgroundToolResult(
 
 	const lines = text.split("\n");
 	const visible = options.expanded ? lines : collapseResult(toolName, lines, options.isPartial);
-	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme, lookupTitle));
+	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme, lookupProcess));
 	component.setText(`\n${styled.join("\n")}`);
 	return component;
 }
 
-function formatIds(value: unknown, theme: Theme, lookupTitle?: BackgroundTitleLookup): string {
+function formatIds(value: unknown, theme: Theme, lookupProcess?: BackgroundProcessLookup): string {
 	const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
 	const ids = values.filter((item): item is string => typeof item === "string").map(cleanInline);
 	if (ids.length === 0) return "";
 	const rendered = ids.map((id) => {
-		const title = lookupTitle?.(id);
-		return title
-			? `${theme.fg("accent", id)} ${theme.fg("muted", `(${cleanInline(title)})`)}`
+		const process = lookupProcess?.(id);
+		const details = [
+			process?.title ? cleanInline(process.title) : "",
+			process?.command ? `$ ${cleanInline(process.command)}` : "",
+		].filter(Boolean);
+		return details.length > 0
+			? `${theme.fg("accent", id)} ${theme.fg("muted", `(${details.join(" • ")})`)}`
 			: theme.fg("accent", id);
 	});
 	return ` ${rendered.join(", ")}`;
@@ -146,7 +155,7 @@ function styleResultLine(
 	line: string,
 	isPartial: boolean,
 	theme: Theme,
-	lookupTitle?: BackgroundTitleLookup,
+	lookupProcess?: BackgroundProcessLookup,
 ): string {
 	if (!line) return "";
 	if (line === "---") return theme.fg("borderMuted", line);
@@ -179,7 +188,7 @@ function styleResultLine(
 	const killEntry = line.match(/^(bg-\d+)(?: \((.*)\))?:\s*(.*)$/u);
 	if (toolName === "bash_bg_kill" && killEntry) {
 		const id = killEntry[1]!;
-		const title = killEntry[2] || lookupTitle?.(id);
+		const title = killEntry[2] || lookupProcess?.(id)?.title;
 		const outcome = killEntry[3]!;
 		const alias = title ? ` ${theme.fg("muted", `(${cleanInline(title)})`)}` : "";
 		const color = /pending|requested but/u.test(outcome) ? "warning" : "success";
