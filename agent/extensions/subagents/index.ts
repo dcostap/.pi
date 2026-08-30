@@ -56,6 +56,15 @@ import { materializeSessionFile } from "./session-file.ts";
 import { renderIndentedAlignedTable, type AlignedColumn } from "../_shared/aligned-table.ts";
 import { SPINNER_INTERVAL_MS, spinnerFrame } from "../_shared/spinner.ts";
 import { MANAGED_WORK_STATE_EVENT, type ManagedWorkStateEvent } from "../_shared/managed-work.ts";
+import {
+	formatTodoProgress,
+	formatTodoTask,
+	normalizeTodoStatus,
+	TODO_STATE_ENTRY,
+	TODO_STATUS_EVENT,
+	type TodoStatus,
+	type TodoStatusEvent,
+} from "../_shared/todo-status.ts";
 import { buildHierarchyLevels, buildVisibleTree } from "./tree.ts";
 import { partitionSubagentList } from "./list-policy.ts";
 import { managedSettlementAction } from "./lifecycle-policy.ts";
@@ -68,7 +77,7 @@ import {
 	type HierarchySnapshot,
 } from "./hierarchy-registry.ts";
 import { isUnusedRpcStreamEvent } from "./rpc-event-filter.ts";
-import { childReportNotification, childRuntimeNotification, parseManagedChildEvent } from "./child-protocol.ts";
+import { childReportNotification, childRuntimeNotification, childTodoNotification, parseManagedChildEvent } from "./child-protocol.ts";
 import {
 	formatParentUpdates,
 	takeParentUpdateBatch,
@@ -124,6 +133,8 @@ type SubagentDisplayRow = {
 	cwd: string;
 	model: string;
 	context: string;
+	todo: string;
+	todoProgress: string;
 	duration: string;
 	cost: string;
 	cache: string;
@@ -142,6 +153,8 @@ const SUBAGENT_COLUMNS: readonly AlignedColumn<keyof SubagentDisplayRow>[] = [
 	{ key: "cwd", minWidth: 12, maxWidth: 46, shrinkPriority: 3, optional: true, hidePriority: 1 },
 	{ key: "model", minWidth: 12, maxWidth: 42, shrinkPriority: 1 },
 	{ key: "context", minWidth: 8, maxWidth: 12, align: "right", optional: true, hidePriority: 2 },
+	{ key: "todo", minWidth: 16, maxWidth: 60, shrinkPriority: 5, optional: true },
+	{ key: "todoProgress", minWidth: 3, maxWidth: 12, align: "right" },
 	{ key: "duration", minWidth: 5, maxWidth: 10, align: "right", optional: true, hidePriority: 3 },
 	{ key: "cost", minWidth: 6, maxWidth: 9, align: "right", optional: true, hidePriority: 4 },
 	{ key: "cache", minWidth: 6, maxWidth: 9, align: "right", optional: true, hidePriority: 5 },
@@ -235,6 +248,7 @@ type SerializedAgent = {
 	parentAgentId?: string;
 	contextMode: ContextMode;
 	contextFiles: boolean;
+	todoEnabled: boolean;
 	cwd?: string;
 	sessionFile: string;
 	sandboxDir: string;
@@ -279,6 +293,7 @@ type AgentRecord = SerializedAgent & {
 	resolveCompletion?: () => void;
 	latestCompletion?: CompletionSnapshot;
 	childPendingWork: boolean;
+	todoStatus?: TodoStatus;
 };
 
 type HierarchyAgentSnapshot = SerializedAgent & {
@@ -292,6 +307,7 @@ type HierarchyAgentSnapshot = SerializedAgent & {
 	recent: Activity[];
 	usage: UsageStats;
 	contextTokens?: number;
+	todoStatus?: TodoStatus;
 };
 
 type SubagentHierarchySnapshot = HierarchySnapshot<HierarchyAgentSnapshot, SerializedBatch>;
@@ -508,6 +524,7 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 		parentAgentId: record.parentAgentId,
 		contextMode: record.contextMode,
 		contextFiles: record.contextFiles,
+		todoEnabled: record.todoEnabled,
 		cwd: record.cwd,
 		sessionFile: record.sessionFile,
 		sandboxDir: record.sandboxDir,
@@ -550,6 +567,7 @@ function completionSnapshot(record: AgentRecord): CompletionSnapshot {
 function newRecord(serialized: SerializedAgent): AgentRecord {
 	return {
 		...serialized,
+		todoEnabled: serialized.todoEnabled === true,
 		state: "cold",
 		lastOutcome: serialized.restoredOutcome ?? "none",
 		currentRunId: serialized.restoredRunId,
@@ -1281,6 +1299,10 @@ class SubagentManager {
 			addActivity(record, childEvent.pendingWork ? "owns pending managed child work" : "managed child work cleared", now);
 			return true;
 		}
+		if (childEvent?.kind === "todo") {
+			record.todoStatus = childEvent.status ?? undefined;
+			return true;
+		}
 		const runtimeActivity = applyRuntimeStatusEvent(record, event);
 		if (runtimeActivity) addActivity(record, runtimeActivity, now);
 		if (event.type === "agent_start") {
@@ -1425,6 +1447,13 @@ async function prepareAgent(
 		sessionFile = childSession.getSessionFile();
 		if (!sessionFile) throw new Error("failed to create a persisted subagent session");
 		childSession.appendSessionInfo(`[Subagent ${id}] ${sanitizeTitle(spec.title)}`);
+		childSession.appendCustomEntry(TODO_STATE_ENTRY, {
+			version: 1,
+			enabled: spec.todo === true,
+			scriptsEnabled: false,
+			nextSequence: 1,
+			items: [],
+		});
 		await materializeSessionFile(childSession);
 		// Continuations may happen long after the OS has cleared temporary files.
 		// Keep the effective role/custom system prompt beside the durable child
@@ -1444,6 +1473,7 @@ async function prepareAgent(
 			parentAgentId: process.env[CURRENT_AGENT_ENV] || undefined,
 			contextMode,
 			contextFiles: spec.context_files !== false,
+			todoEnabled: spec.todo === true,
 			cwd: childCwd,
 			sessionFile,
 			sandboxDir,
@@ -1491,6 +1521,7 @@ function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
 					...restored,
 					role: typeof restored.role === "string" ? restored.role : typeof restored.profile === "string" ? restored.profile : undefined,
 					contextFiles: restored.contextFiles !== false,
+					todoEnabled: restored.todoEnabled === true,
 				});
 				continue;
 			}
@@ -1542,6 +1573,7 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		batchId: record.batchId,
 		parentAgentId: record.parentAgentId,
 		contextFiles: record.contextFiles,
+		todoEnabled: record.todoEnabled,
 		cwd: record.cwd,
 		currentRunId: record.currentRunId,
 		activity: currentActivity(record),
@@ -1557,6 +1589,7 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		hasCacheUsage: record.usage.cacheRead > 0 || record.usage.cacheWrite > 0,
 		contextWindow: record.contextWindow,
 		contextTokens: record.contextTokens,
+		todoStatus: record.todoStatus,
 		sessionFile: record.sessionFile,
 	};
 }
@@ -1631,6 +1664,7 @@ function formatStatus(record: AgentRecord, hierarchy: AgentRecord[] = []): strin
 		record.parentAgentId ? `Parent subagent: ${record.parentAgentId}` : "",
 		`Context: ${record.contextMode}`,
 		`Context files: ${record.contextFiles ? "enabled" : "disabled"}`,
+		`Todo: ${record.todoEnabled ? "enabled" : "disabled"}`,
 		`Working directory: ${record.cwd ?? "inherited parent directory"}`,
 		record.currentRunId ? `Current/latest run: ${record.currentRunId}` : "",
 		`Task: ${oneLine(record.currentTaskSummary ?? record.task, 180)}`,
@@ -1965,6 +1999,8 @@ function widgetLines(
 				cwd: "",
 				model: "",
 				context: "",
+				todo: "",
+				todoProgress: "",
 				duration: duration ? theme.fg("dim", duration) : "",
 				cost: cost ? theme.fg("dim", formatCost(cost)) : "",
 				cache: "",
@@ -2000,6 +2036,8 @@ function widgetLines(
 			cwd: theme.fg("dim", customCwdDisplay(record.cwd, sessionCwd)),
 			model: theme.fg("dim", `${record.modelRef} [${record.thinking}]`),
 			context,
+			todo: record.todoStatus ? theme.fg(record.todoStatus.current ? "text" : "muted", formatTodoTask(record.todoStatus)) : "",
+			todoProgress: record.todoStatus ? theme.fg("dim", formatTodoProgress(record.todoStatus)) : "",
 			duration: duration ? theme.fg("dim", duration) : "",
 			cost: cost ? theme.fg("dim", cost) : "",
 			cache: cache ? theme.fg("dim", cache) : "",
@@ -2069,6 +2107,7 @@ function widgetFingerprint(records: AgentRecord[], batches: BatchRecord[]): stri
 			record.settledAt,
 			record.contextWindow,
 			record.contextTokens,
+			record.todoStatus,
 			record.usage.cost,
 			record.usage.latestCacheHitRate,
 			record.usage.cacheRead,
@@ -2421,6 +2460,7 @@ function hierarchyAgentSnapshot(record: AgentRecord): HierarchyAgentSnapshot {
 		recent: record.recent.slice(-MAX_RECENT_ACTIVITIES),
 		usage: { ...record.usage },
 		contextTokens: record.contextTokens,
+		todoStatus: record.todoStatus,
 	};
 }
 
@@ -2440,6 +2480,7 @@ function hierarchyAgentRecord(value: unknown, publishedAt: number): AgentRecord 
 	record.settledAt = typeof value.settledAt === "number" ? value.settledAt : undefined;
 	record.lastObservedAt = typeof value.lastObservedAt === "number" ? value.lastObservedAt : undefined;
 	record.contextTokens = typeof value.contextTokens === "number" ? value.contextTokens : undefined;
+	record.todoStatus = normalizeTodoStatus(value.todoStatus);
 	if (Array.isArray(value.recent)) {
 		record.recent = value.recent.filter((item): item is Activity => isRecord(item) && typeof item.at === "number" && typeof item.text === "string").slice(-MAX_RECENT_ACTIVITIES);
 	}
@@ -2548,6 +2589,8 @@ function agentRows(agents: DisplayAgent[], batches: DisplayBatch[], theme: Theme
 				cwd: "",
 				model: "",
 				context: "",
+				todo: "",
+				todoProgress: "",
 				duration: "",
 				cost: cost > 0 ? theme.fg("dim", formatCost(cost)) : "",
 				cache: "",
@@ -2572,6 +2615,8 @@ function agentRows(agents: DisplayAgent[], batches: DisplayBatch[], theme: Theme
 			cwd: "",
 			model,
 			context,
+			todo: "",
+			todoProgress: "",
 			duration,
 			cost,
 			cache: cache ? theme.fg("dim", cache) : "",
@@ -2710,6 +2755,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let parentUpdateFlushScheduled = false;
 	let parentUpdateFlushRunning = false;
 	let lastPublishedPendingWork: boolean | undefined;
+	let ownTodoStatus: TodoStatus | undefined;
 	const externalManagedWork = new Map<string, boolean>();
 	let widgetInstalled = false;
 	let widgetRecords: AgentRecord[] = [];
@@ -2957,6 +3003,12 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		publishPendingWork();
 	});
 
+	pi.events.on(TODO_STATUS_EVENT, (event: TodoStatusEvent) => {
+		ownTodoStatus = normalizeTodoStatus(event?.status);
+		if (!currentAgentId || !latestCtx || shuttingDown) return;
+		latestCtx.ui.notify(childTodoNotification(ownTodoStatus), "info");
+	});
+
 	const ensureManager = (ctx: ExtensionContext): SubagentManager => {
 		latestCtx = ctx;
 		if (shuttingDown) throw new Error("Subagent extension is shutting down");
@@ -3011,6 +3063,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		cwd: Type.Optional(Type.String({ minLength: 1, description: "Optional child working directory. Relative paths resolve from the parent working directory. Use this to place an agent in an existing Git worktree. Nested subagents inherit this directory. Defaults to the parent working directory." })),
 		context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 		context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
+		todo: Type.Optional(Type.Boolean({ description: "Enable the todo feature for this child. Defaults to false. Set true only when the user explicitly asks for or allows it." })),
 		system_prompt: Type.Optional(Type.String({ minLength: 1, description: "Optional additional system prompt; fresh context only." })),
 		system_prompt_file: Type.Optional(Type.String({ minLength: 1, description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 	}, { additionalProperties: false });
@@ -3019,13 +3072,14 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		shared_prompt: Type.String({ minLength: 1, maxLength: MAX_SHARED_PROMPT_BYTES, description: "Assignment context injected into every batch member." }),
 		role: Type.Optional(Type.String({ minLength: 1, description: `Optional role inherited by members that do not specify one. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
 		context_files: Type.Optional(Type.Boolean({ description: "Default context-file discovery for batch members. Defaults to true; an agent-level value overrides it." })),
+		todo: Type.Optional(Type.Boolean({ description: "Default todo setting for batch members. Defaults to false. Set true only when the user explicitly asks for or allows it." })),
 		agents: Type.Array(AgentSpecSchema, { minItems: 1, description: "Agents with individual tasks. An agent role overrides the batch role." }),
 	}, { additionalProperties: false });
 
 	pi.registerTool({
 		name: START_TOOL_NAME,
 		label: "Start Subagent",
-		description: `Start one managed Pi subagent or one formal batch and return immediately. Each agent can use an optional working directory, such as an existing Git worktree. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
+		description: `Start one managed Pi subagent or one formal batch and return immediately. Each agent can use an optional working directory, such as an existing Git worktree. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Todo support defaults to off and requires explicit user permission. Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
 		parameters: Type.Object({
 			input_file: Type.Optional(Type.String({ description: "JSON file containing the same single-or-batch request object used inline. Must be supplied by itself." })),
 			batch: Type.Optional(BatchSchema),
@@ -3037,6 +3091,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			cwd: Type.Optional(Type.String({ description: "Optional child working directory. Relative paths resolve from the parent working directory. Use this to place an agent in an existing Git worktree. Nested subagents inherit this directory. Defaults to the parent working directory." })),
 			context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 			context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
+			todo: Type.Optional(Type.Boolean({ description: "Enable the todo feature for this child. Defaults to false. Set true only when the user explicitly asks for or allows it." })),
 			system_prompt: Type.Optional(Type.String({ description: "Optional additional system prompt; fresh context only." })),
 			system_prompt_file: Type.Optional(Type.String({ description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 		}, { additionalProperties: false }),
@@ -3085,7 +3140,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				let text: string;
 				let handlesFile: string | undefined;
 				if (records.length <= NORMAL_LAUNCH_DETAIL_LIMIT) {
-					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}\n  cwd: ${record.cwd}\n  ${record.state}`).join("\n\n")}`;
+					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}${record.todoEnabled ? " · todo enabled" : ""}\n  cwd: ${record.cwd}\n  ${record.state}`).join("\n\n")}`;
 				} else {
 					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
 					const running = records.length;
@@ -3109,8 +3164,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			const detail = typeof input?.input_file === "string"
 				? `manifest ${path.basename(input.input_file)}`
 				: input?.batch
-					? `${oneLine(input.batch.title ?? "batch", 60)} · ${Array.isArray(input.batch.agents) ? input.batch.agents.length : "?"} agents${input.batch.role ? ` · [${input.batch.role}]` : ""}`
-					: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}${input?.role ? ` · [${input.role}]` : ""}`;
+					? `${oneLine(input.batch.title ?? "batch", 60)} · ${Array.isArray(input.batch.agents) ? input.batch.agents.length : "?"} agents${input.batch.role ? ` · [${input.batch.role}]` : ""}${input.batch.todo ? " · todo" : ""}`
+					: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}${input?.role ? ` · [${input.role}]` : ""}${input?.todo ? " · todo" : ""}`;
 			return toolHeader("Start subagent", detail, theme, context.lastComponent);
 		},
 		renderResult(resultValue, options, theme, context) {
@@ -3464,6 +3519,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		await mkdir(hierarchyRegistryDir, { recursive: true });
 		ensureManager(ctx);
 		publishPendingWork();
+		if (currentAgentId && ownTodoStatus) ctx.ui.notify(childTodoNotification(ownTodoStatus), "info");
 		if (currentAgentId) {
 			await publishCurrentHierarchy();
 			hierarchyTimer = setInterval(() => void publishCurrentHierarchy(), HIERARCHY_REFRESH_MS);

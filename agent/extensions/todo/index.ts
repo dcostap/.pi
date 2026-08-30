@@ -6,6 +6,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+	TODO_STATUS_EVENT,
+	type TodoStatus,
+} from "../_shared/todo-status.ts";
 import { TodoDashboard, type DashboardAction } from "./dashboard.ts";
 import { buildTodoDiff, type TodoDiffLine } from "./diff.ts";
 import { formatReminder, formatRunResult, formatTodoItemDetails, formatTodoState } from "./format.ts";
@@ -16,6 +20,7 @@ import {
 	applyTodoChanges,
 	cloneTodoState,
 	findItem,
+	getCurrentTaskId,
 	replaceItem,
 	restoreTodoState,
 	setFeatureEnabled,
@@ -99,6 +104,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 
 	function refreshRuntime(ctx?: ExtensionContext): void {
 		if (ctx) latestContext = ctx;
+		publishTodoStatus();
 		if (!state.enabled) {
 			scheduler.stop();
 			wakeQueue.clear();
@@ -110,6 +116,22 @@ export default function todoExtension(pi: ExtensionAPI): void {
 		activateTool();
 		scheduler.sync(state);
 		updateWidget();
+	}
+
+	function publishTodoStatus(): void {
+		const tasks = state.items.filter((item) => item.kind === "task");
+		if (!state.enabled || tasks.length === 0) {
+			pi.events.emit(TODO_STATUS_EVENT, { status: undefined });
+			return;
+		}
+		const currentTaskId = getCurrentTaskId(state);
+		const current = tasks.find((item) => item.id === currentTaskId);
+		const status: TodoStatus = {
+			...(current ? { current: { id: current.id, text: current.text } } : {}),
+			completed: tasks.filter((item) => item.done).length,
+			total: tasks.length,
+		};
+		pi.events.emit(TODO_STATUS_EVENT, { status });
 	}
 
 	function updateWidget(): void {
@@ -473,6 +495,7 @@ Tasks are checkable and can repeat text reminders. Task order controls list layo
 			deactivateTool();
 			ctx.ui.setWidget("todo", undefined);
 		}
+		publishTodoStatus();
 	});
 
 	pi.on("session_tree", (_event, ctx) => {

@@ -55,6 +55,7 @@ function makeHarness() {
 	const tools = new Map<string, any>();
 	const widgetValues: unknown[] = [];
 	const notices: string[] = [];
+	const emitted: Array<{ name: string; value: unknown }> = [];
 	let customCalls = 0;
 	let activeTools = ["read", "bash"];
 	const pi = {
@@ -72,7 +73,7 @@ function makeHarness() {
 			entries.push({ type: "custom", customType, data });
 		},
 		sendMessage() {},
-		events: { emit() {} },
+		events: { emit(name: string, value: unknown) { emitted.push({ name, value }); } },
 	};
 	const ctx: any = {
 		mode: "rpc",
@@ -91,7 +92,7 @@ function makeHarness() {
 		},
 	};
 	todoExtension(pi as any);
-	return { entries, handlers, commands, tools, widgetValues, notices, getActiveTools: () => activeTools, getCustomCalls: () => customCalls, ctx };
+	return { entries, handlers, commands, tools, widgetValues, notices, emitted, getActiveTools: () => activeTools, getCustomCalls: () => customCalls, ctx };
 }
 
 async function invoke(harness: ReturnType<typeof makeHarness>, event: string, ...args: any[]): Promise<void> {
@@ -163,6 +164,10 @@ describe("todo extension integration", () => {
 		expect(applied.details.state.items.map((item: any) => item.id)).toEqual(["t-1", "w-2"]);
 		expect(applied.details.state.items[0].group).toBe("Smoke");
 		expect(applied.content[0].text).toContain("Review code · CURRENT");
+		expect(harness.emitted.at(-1)).toEqual({
+			name: "todo:status",
+			value: { status: { current: { id: "t-1", text: "Review code" }, completed: 0, total: 1 } },
+		});
 		const theme = {
 			fg: (_color: string, text: string) => text,
 			bold: (text: string) => text,

@@ -1,3 +1,5 @@
+import { normalizeTodoStatus, type TodoStatus } from "../_shared/todo-status.ts";
+
 export const MANAGED_CHILD_EVENT_TYPE = "managed_subagent_child_event";
 
 export type ChildReportEvent = {
@@ -12,7 +14,13 @@ export type ChildRuntimeEvent = {
 	pendingWork: boolean;
 };
 
-export type ManagedChildEvent = ChildReportEvent | ChildRuntimeEvent;
+export type ChildTodoEvent = {
+	type: typeof MANAGED_CHILD_EVENT_TYPE;
+	kind: "todo";
+	status: TodoStatus | null;
+};
+
+export type ManagedChildEvent = ChildReportEvent | ChildRuntimeEvent | ChildTodoEvent;
 
 export function childReportNotification(message: string): string {
 	return JSON.stringify({ type: MANAGED_CHILD_EVENT_TYPE, kind: "report", message } satisfies ChildReportEvent);
@@ -20,6 +28,10 @@ export function childReportNotification(message: string): string {
 
 export function childRuntimeNotification(pendingWork: boolean): string {
 	return JSON.stringify({ type: MANAGED_CHILD_EVENT_TYPE, kind: "runtime", pendingWork } satisfies ChildRuntimeEvent);
+}
+
+export function childTodoNotification(status: TodoStatus | undefined): string {
+	return JSON.stringify({ type: MANAGED_CHILD_EVENT_TYPE, kind: "todo", status: status ?? null } satisfies ChildTodoEvent);
 }
 
 export function parseManagedChildEvent(value: unknown): ManagedChildEvent | undefined {
@@ -40,6 +52,11 @@ export function parseManagedChildEvent(value: unknown): ManagedChildEvent | unde
 	}
 	if (event.kind === "runtime" && typeof event.pendingWork === "boolean") {
 		return { type: MANAGED_CHILD_EVENT_TYPE, kind: "runtime", pendingWork: event.pendingWork };
+	}
+	if (event.kind === "todo") {
+		if (event.status === null) return { type: MANAGED_CHILD_EVENT_TYPE, kind: "todo", status: null };
+		const status = normalizeTodoStatus(event.status);
+		if (status) return { type: MANAGED_CHILD_EVENT_TYPE, kind: "todo", status };
 	}
 	return undefined;
 }

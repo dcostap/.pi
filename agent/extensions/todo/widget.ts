@@ -105,7 +105,9 @@ function renderItem(item: TodoItem, current: boolean, theme: Theme, dueAt: numbe
 		: item.done
 			? theme.fg("success", "✓")
 			: theme.fg("dim", "○");
-	const text = item.done ? theme.fg("dim", theme.strikethrough(item.text)) : theme.fg("muted", item.text);
+	const text = item.done
+		? theme.fg("dim", theme.strikethrough(item.text))
+		: theme.fg(current ? "text" : "muted", item.text);
 	const id = theme.fg("accent", item.id);
 	const due = dueAt === undefined ? "" : theme.fg("dim", ` · ${formatRemaining(dueAt - now)}`);
 	const run = item.lastRun

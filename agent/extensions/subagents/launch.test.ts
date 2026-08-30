@@ -11,16 +11,17 @@ const reviewRole: SubagentRole = {
 };
 
 describe("subagent launch requests", () => {
-	test("resolves a formal batch and inherits its optional role and context-file setting", () => {
+	test("resolves a formal batch and inherits its optional role, context-file, and todo settings", () => {
 		const request = parseStartRequest({
 			batch: {
 				title: "Review batch",
 				shared_prompt: "Review the current diff.",
 				role: "review",
 				context_files: false,
+				todo: true,
 				agents: [
 					{ title: "Correctness", task: "Focus on lifecycle.", model: "p/m", thinking: "high" },
-					{ title: "UX", task: "Focus on UX.", model: "p/m", thinking: "high", role: "other", context_files: true },
+					{ title: "UX", task: "Focus on UX.", model: "p/m", thinking: "high", role: "other", context_files: true, todo: false },
 				],
 			},
 		}, "tool input");
@@ -28,6 +29,7 @@ describe("subagent launch requests", () => {
 		expect(request.batch?.shared_prompt).toBe("Review the current diff.");
 		expect(request.specs.map((spec) => spec.role)).toEqual(["review", "other"]);
 		expect(request.specs.map((spec) => spec.context_files)).toEqual([false, true]);
+		expect(request.specs.map((spec) => spec.todo)).toEqual([true, false]);
 	});
 
 	test("validates the context-file setting", () => {
@@ -38,6 +40,23 @@ describe("subagent launch requests", () => {
 			thinking: "high",
 			context_files: "no",
 		}, "tool input")).toThrow("context_files: expected boolean");
+	});
+
+	test("keeps todo off by default and validates explicit values", () => {
+		const request = parseStartRequest({
+			title: "Review",
+			task: "Review",
+			model: "p/m",
+			thinking: "high",
+		}, "tool input");
+		expect(request.specs[0]?.todo).toBeUndefined();
+		expect(() => parseStartRequest({
+			title: "Review",
+			task: "Review",
+			model: "p/m",
+			thinking: "high",
+			todo: "yes",
+		}, "tool input")).toThrow("todo: expected boolean");
 	});
 
 	test("accepts an optional child working directory", () => {
@@ -134,6 +153,8 @@ describe("subagent launch requests", () => {
 		expect(instructions).toContain("Available roles:\n- review: Independent read-only code review.");
 		expect(instructions).toContain("Never start Pi through bash as a substitute for subagent_start.");
 		expect(instructions).toContain("For example, set cwd to a lead's Git worktree");
+		expect(instructions).toContain("Child todo support defaults to off.");
+		expect(instructions).toContain("only when the user explicitly asks for or allows todo support");
 		expect(instructions).toContain('When the user requests "<role> subagents", use that role for each launched subagent.');
 		expect(instructions).not.toContain("For example, \"launch 3 review subagents\"");
 	});

@@ -63,4 +63,23 @@ describe("aligned subagent tables", () => {
 		expect(rows[1]!.indexOf("sa-1")).toBe(rows[0]!.indexOf("batch-1"));
 		expect(rows[2]!.indexOf("sa-2")).toBe(rows[0]!.indexOf("batch-1"));
 	});
+
+	test("omits empty todo columns and preserves progress while task text shrinks", () => {
+		type Key = "state" | "todo" | "progress";
+		const todoColumns: readonly AlignedColumn<Key>[] = [
+			{ key: "state", minWidth: 7 },
+			{ key: "todo", minWidth: 8, maxWidth: 40, shrinkPriority: 5, optional: true },
+			{ key: "progress", align: "right" },
+		];
+		const withoutTodos = renderAlignedTable([
+			{ state: "running", todo: "", progress: "" },
+		], 30, todoColumns, { visibleWidth, truncate });
+		expect(withoutTodos).toEqual(["running"]);
+
+		const withTodos = renderAlignedTable([
+			{ state: "running", todo: "○ t-44 Review include/panel implementation", progress: "3/10" },
+		], 24, todoColumns, { visibleWidth, truncate });
+		expect(withTodos[0]).toEndWith("3/10");
+		expect(visibleWidth(withTodos[0]!)).toBeLessThanOrEqual(24);
+	});
 });

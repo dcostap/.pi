@@ -1,7 +1,8 @@
 import { parseDuration } from "./duration.ts";
+import { TODO_STATE_ENTRY } from "../_shared/todo-status.ts";
 import type { TodoChange, TodoItem, TodoSchedule, TodoState } from "./types.ts";
 
-export const TODO_STATE_ENTRY = "todo-state-v1";
+export { TODO_STATE_ENTRY };
 
 export function createTodoState(): TodoState {
 	return {
