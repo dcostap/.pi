@@ -9,19 +9,37 @@ export type DashboardAction =
 	| { type: "add_task" | "add_watch" }
 	| { type: "inspect" | "edit" | "delete" | "group" | "schedule" | "run" | "toggle" | "set_current" | "move_up" | "move_down"; id: string };
 
+type DashboardView = "active" | "completed" | "all";
+
+const DASHBOARD_VIEWS: DashboardView[] = ["active", "completed", "all"];
+
 export class TodoDashboard {
 	private selected = 0;
 	private closed = false;
+	private view: DashboardView;
 
 	constructor(
 		private readonly state: TodoState,
 		private readonly theme: Theme,
 		private readonly keybindings: KeybindingsManager,
 		private readonly done: (action: DashboardAction) => void,
-	) {}
+	) {
+		this.view = state.items.some((item) => item.kind === "watch" || !item.done) ? "active" : "completed";
+		const currentTaskId = getCurrentTaskId(state);
+		const currentIndex = this.visibleItems().findIndex((item) => item.id === currentTaskId);
+		if (currentIndex >= 0) this.selected = currentIndex;
+	}
 
 	handleInput(data: string): void {
-		const items = this.state.items;
+		if (matchesKey(data, "tab")) {
+			this.cycleView();
+			return;
+		}
+		if (data === "1" || data === "2" || data === "3") {
+			this.setView(DASHBOARD_VIEWS[Number(data) - 1]!);
+			return;
+		}
+		const items = this.visibleItems();
 		if (this.isCancel(data) || data === "q" || data === "Q") return this.close({ type: "close" });
 		if (data === "a" || data === "A") return this.close({ type: "add_task" });
 		if (data === "w" || data === "W") return this.close({ type: "add_watch" });
@@ -49,6 +67,7 @@ export class TodoDashboard {
 
 	render(width: number): string[] {
 		const inner = Math.max(1, width - 2);
+		const items = this.visibleItems();
 		const tasks = this.state.items.filter((item) => item.kind === "task");
 		const done = tasks.filter((item) => item.done).length;
 		const watches = this.state.items.filter((item) => item.kind === "watch").length;
@@ -56,14 +75,18 @@ export class TodoDashboard {
 		const lines = [
 			this.border("Todos", width, "top"),
 			this.frame(`${this.theme.fg("muted", `${done}/${tasks.length} tasks done · ${watches} watches · current ${currentTaskId ?? "none"} · scripts ${this.state.scriptsEnabled ? "on" : "off"}`)}`, inner),
+			this.frame(this.renderViewTabs(), inner),
 			this.separator(width),
 		];
-		if (this.state.items.length === 0) {
-			lines.push(this.frame(this.theme.fg("dim", "No items. Press a to add a task or w to add a watch."), inner));
+		if (items.length === 0) {
+			const message = this.state.items.length === 0
+				? "No items. Press a to add a task or w to add a watch."
+				: `No ${this.view} items. Press Tab to change the view.`;
+			lines.push(this.frame(this.theme.fg("dim", message), inner));
 		} else {
 			const pageSize = this.listPageSize();
-			const start = Math.max(0, Math.min(this.selected - Math.floor(pageSize / 2), this.state.items.length - pageSize));
-			const visible = this.state.items.slice(start, start + pageSize);
+			const start = Math.max(0, Math.min(this.selected - Math.floor(pageSize / 2), items.length - pageSize));
+			const visible = items.slice(start, start + pageSize);
 			let group: string | undefined | null = null;
 			for (const [offset, item] of visible.entries()) {
 				const index = start + offset;
@@ -74,18 +97,51 @@ export class TodoDashboard {
 				const row = this.renderItem(item, index === this.selected, inner);
 				lines.push(this.frame(index === this.selected ? this.theme.bg("selectedBg", this.pad(row, inner)) : row, inner, index === this.selected));
 			}
-			if (this.state.items.length > visible.length) {
-				lines.push(this.frame(this.theme.fg("dim", `${start + 1}–${start + visible.length} of ${this.state.items.length}`), inner));
+			if (items.length > visible.length) {
+				lines.push(this.frame(this.theme.fg("dim", `${start + 1}–${start + visible.length} of ${items.length}`), inner));
 			}
 		}
 		lines.push(this.separator(width));
-		lines.push(this.frame(this.theme.fg("dim", "↑↓/jk select · Enter inspect · e edit · Space check · a task · w watch"), inner));
-		lines.push(this.frame(this.theme.fg("dim", "f set/clear current · g group · r run · d delete · Shift+J/K move · Esc close"), inner));
+		lines.push(this.frame(this.theme.fg("dim", "Tab/1–3 view · ↑↓/jk select · Enter inspect · e edit · Space check"), inner));
+		lines.push(this.frame(this.theme.fg("dim", "a task · w watch · f set/clear current · g group · r run · d delete"), inner));
+		lines.push(this.frame(this.theme.fg("dim", "Shift+J/K move · Esc close"), inner));
 		lines.push(this.border("", width, "bottom"));
 		return lines;
 	}
 
 	invalidate(): void {}
+
+	private visibleItems(): TodoItem[] {
+		if (this.view === "active") return this.state.items.filter((item) => item.kind === "watch" || !item.done);
+		if (this.view === "completed") {
+			return this.state.items
+				.filter((item) => item.kind === "task" && item.done)
+				.sort((left, right) => (right.completedAt ?? right.updatedAt) - (left.completedAt ?? left.updatedAt));
+		}
+		return this.state.items;
+	}
+
+	private renderViewTabs(): string {
+		return DASHBOARD_VIEWS.map((view, index) => {
+			const label = `${index + 1} ${view[0]!.toUpperCase()}${view.slice(1)}`;
+			return view === this.view
+				? this.theme.fg("accent", this.theme.bold(`[${label}]`))
+				: this.theme.fg("dim", ` ${label} `);
+		}).join("  ");
+	}
+
+	private cycleView(): void {
+		const index = DASHBOARD_VIEWS.indexOf(this.view);
+		this.setView(DASHBOARD_VIEWS[(index + 1) % DASHBOARD_VIEWS.length]!);
+	}
+
+	private setView(view: DashboardView): void {
+		this.view = view;
+		this.selected = 0;
+		const currentTaskId = getCurrentTaskId(this.state);
+		const currentIndex = this.visibleItems().findIndex((item) => item.id === currentTaskId);
+		if (currentIndex >= 0) this.selected = currentIndex;
+	}
 
 	private renderItem(item: TodoItem, selected: boolean, width: number): string {
 		const pointer = selected ? this.theme.fg("accent", "›") : " ";

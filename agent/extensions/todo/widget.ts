@@ -2,10 +2,11 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatRemaining } from "./duration.ts";
 import type { TodoScheduler } from "./scheduler.ts";
-import { getCurrentTaskId, getRecentCompletedTasks } from "./state.ts";
+import { getCurrentTaskId } from "./state.ts";
 import type { TodoItem, TodoState } from "./types.ts";
 
-const MAX_ITEM_ROWS = 12;
+const COMPLETED_VISIBILITY_MS = 60_000;
+const MAX_ITEM_ROWS = 5;
 
 export function todoWidgetLines(
 	state: TodoState,
@@ -18,72 +19,59 @@ export function todoWidgetLines(
 	const done = tasks.filter((item) => item.done);
 	const watches = state.items.filter((item) => item.kind === "watch");
 	const currentTaskId = getCurrentTaskId(state);
-	const header = theme.fg("toolTitle", theme.bold("Todos"))
-		+ theme.fg("muted", ` · ${done.length}/${tasks.length} done · ${watches.length} watch${watches.length === 1 ? "" : "es"} · current ${currentTaskId ?? "none"} · /todo to inspect`);
+	const current = open.find((item) => item.id === currentTaskId);
+	const watchAlerts = watches.filter((item) => item.lastRun?.status === "failed");
+	const recentCompleted = done
+		.filter((item) => now - (item.completedAt ?? item.updatedAt) < COMPLETED_VISIBILITY_MS)
+		.sort((left, right) => (right.completedAt ?? right.updatedAt) - (left.completedAt ?? left.updatedAt));
 
-	const active = [
-		...state.items.filter((item) => item.kind === "task" && !item.done),
-		...state.items.filter((item) => item.kind === "watch"),
+	const header = renderHeader(tasks.length, open.length, done.length, watches.length, currentTaskId, theme);
+	if (state.items.length === 0) {
+		return [header, theme.fg("dim", "  No items. The agent or /todo can add one.")];
+	}
+
+	const remainingOpen = open.filter((item) => item.id !== currentTaskId);
+	const activeRanked = [
+		...(current ? [{ item: current, current: true }] : []),
+		...watchAlerts.map((item) => ({ item, current: false })),
+		...remainingOpen.map((item) => ({ item, current: false })),
 	];
-	const recentCompleted = getRecentCompletedTasks(state);
-	const visibleActive = active.slice(0, Math.max(0, MAX_ITEM_ROWS - recentCompleted.length));
-	const groups = groupVisibleItems(visibleActive, recentCompleted);
-	const completedByGroup = countCompletedByGroup(state);
+	const reservedCompletedRows = Math.min(2, recentCompleted.length, MAX_ITEM_ROWS);
+	const activeRows = Math.min(activeRanked.length, MAX_ITEM_ROWS - reservedCompletedRows);
+	const completedRows = Math.min(recentCompleted.length, MAX_ITEM_ROWS - activeRows);
+	const visible = [
+		...activeRanked.slice(0, activeRows),
+		...recentCompleted.slice(0, completedRows).map((item) => ({ item, current: false })),
+	];
 	const lines = [header];
-	for (const group of groups) {
-		if (group.name) lines.push(theme.fg("accent", `  ${group.name}`));
-		for (const item of [...group.active, ...group.completed]) {
-			lines.push(renderItem(item, item.id === currentTaskId, theme, nextDue(item.id), now));
-		}
-		const hiddenCompleted = (completedByGroup.get(group.name) ?? 0) - group.completed.length;
-		if (hiddenCompleted > 0) {
-			lines.push(theme.fg("dim", `  … ${hiddenCompleted} ${hiddenCompleted === 1 ? "other" : "others"} completed`));
-		}
+	for (const entry of visible) {
+		lines.push(renderItem(entry.item, entry.current, theme, nextDue(entry.item.id), now));
 	}
-	if (state.items.length === 0) lines.push(theme.fg("dim", "  No items. The agent or /todo can add one."));
-	const hiddenActive = active.length - visibleActive.length;
-	if (hiddenActive > 0) lines.push(theme.fg("dim", `  … ${hiddenActive} more active item${hiddenActive === 1 ? "" : "s"}`));
-	const renderedGroups = new Set(groups.map((group) => group.name));
-	const completedInOtherGroups = [...completedByGroup]
-		.filter(([group]) => !renderedGroups.has(group))
-		.reduce((total, [, count]) => total + count, 0);
-	if (completedInOtherGroups > 0) {
-		lines.push(theme.fg("dim", `  … ${completedInOtherGroups} completed item${completedInOtherGroups === 1 ? "" : "s"} in other groups`));
-	}
+
+	const hidden = activeRanked.length + recentCompleted.length - visible.length;
+	if (hidden > 0) lines.push(theme.fg("dim", `  … ${hidden} more relevant item${hidden === 1 ? "" : "s"}`));
 	if (!state.scriptsEnabled && watches.some((item) => item.schedule?.action === "command")) {
 		lines.push(theme.fg("warning", "  Automatic watch commands are disabled."));
 	}
 	return lines;
 }
 
-interface VisibleGroup {
-	name?: string;
-	active: TodoItem[];
-	completed: TodoItem[];
-}
-
-function groupVisibleItems(active: TodoItem[], completed: TodoItem[]): VisibleGroup[] {
-	const groups = new Map<string | undefined, VisibleGroup>();
-	for (const [items, key] of [[active, "active"], [completed, "completed"]] as const) {
-		for (const item of items) {
-			let group = groups.get(item.group);
-			if (!group) {
-				group = { name: item.group, active: [], completed: [] };
-				groups.set(item.group, group);
-			}
-			group[key].push(item);
-		}
+function renderHeader(
+	total: number,
+	open: number,
+	done: number,
+	watches: number,
+	currentTaskId: string | undefined,
+	theme: Theme,
+): string {
+	const title = theme.fg("toolTitle", theme.bold("Todos"));
+	if (total > 0 && open === 0) {
+		return title + theme.fg("muted", ` · ✓ ${done}/${total} complete${watches ? ` · ${watches} watch${watches === 1 ? "" : "es"}` : ""} · /todo for history`);
 	}
-	return [...groups.values()];
-}
-
-function countCompletedByGroup(state: TodoState): Map<string | undefined, number> {
-	const counts = new Map<string | undefined, number>();
-	for (const item of state.items) {
-		if (item.kind !== "task" || !item.done) continue;
-		counts.set(item.group, (counts.get(item.group) ?? 0) + 1);
-	}
-	return counts;
+	const taskStatus = total > 0 ? ` · ${open} open · ${done} done` : "";
+	const watchStatus = watches ? ` · ${watches} watch${watches === 1 ? "" : "es"}` : "";
+	const currentStatus = open > 0 && !currentTaskId ? " · no current task" : "";
+	return title + theme.fg("muted", `${taskStatus}${watchStatus}${currentStatus} · /todo`);
 }
 
 export function todoWidgetComponent(state: TodoState, theme: Theme, scheduler: TodoScheduler, requestRender: () => void) {
@@ -99,22 +87,24 @@ export function todoWidgetComponent(state: TodoState, theme: Theme, scheduler: T
 }
 
 function renderItem(item: TodoItem, current: boolean, theme: Theme, dueAt: number | undefined, now: number): string {
-	const connector = theme.fg("dim", "  ├─ ");
-	const marker = item.kind === "watch"
-		? watchMarker(item, theme)
-		: item.done
-			? theme.fg("success", "✓")
-			: theme.fg("dim", "○");
+	const connector = theme.fg("dim", "  ");
+	const marker = current
+		? theme.fg("accent", "▶")
+		: item.kind === "watch"
+			? watchMarker(item, theme)
+			: item.done
+				? theme.fg("success", "✓")
+				: theme.fg("dim", "○");
 	const text = item.done
 		? theme.fg("dim", theme.strikethrough(item.text))
 		: theme.fg(current ? "text" : "muted", item.text);
 	const id = theme.fg("accent", item.id);
+	const group = item.group ? theme.fg("dim", ` · ${item.group}`) : "";
 	const due = dueAt === undefined ? "" : theme.fg("dim", ` · ${formatRemaining(dueAt - now)}`);
 	const run = item.lastRun
 		? theme.fg(item.lastRun.status === "success" ? "success" : item.lastRun.status === "failed" ? "error" : "warning", ` · ${item.lastRun.status}`)
 		: "";
-	const currentLabel = current ? theme.fg("accent", " · CURRENT") : "";
-	return `${connector}${marker} ${id} ${text}${due}${run}${currentLabel}`;
+	return `${connector}${marker} ${id} ${text}${group}${due}${run}`;
 }
 
 function watchMarker(item: TodoItem, theme: Theme): string {

@@ -24,4 +24,12 @@ describe("ANSI background preservation", () => {
 			`${GREEN_BACKGROUND}left${RESET_BACKGROUND}${GREEN_BACKGROUND}right${RESET_BACKGROUND}`,
 		);
 	});
+
+	test("keeps the background open for padding added by a parent component", () => {
+		const text = `left\u001b[0mright`;
+
+		expect(withPreservedAnsiBackground(text, green, { keepOpen: true })).toBe(
+			`${GREEN_BACKGROUND}left\u001b[0m${GREEN_BACKGROUND}right`,
+		);
+	});
 });

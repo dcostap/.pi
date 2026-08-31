@@ -100,7 +100,7 @@ async function invoke(harness: ReturnType<typeof makeHarness>, event: string, ..
 }
 
 describe("todo extension integration", () => {
-	test("summarizes hidden completed tasks inside each visible widget group", () => {
+	test("puts open work before recent completed work in the widget", () => {
 		const item = (id: string, group: string, done: boolean, completedAt?: number) => ({
 			id,
 			kind: "task" as const,
@@ -128,10 +128,11 @@ describe("todo extension integration", () => {
 			bold: (text: string) => text,
 			strikethrough: (text: string) => text,
 		};
-		const lines = todoWidgetLines(state, theme as any, () => undefined, 1);
-		expect(lines).toContain("  … 3 others completed");
-		expect(lines).toContain("  … 2 others completed");
-		expect(lines.filter((line) => line.includes("✓")).length).toBe(7);
+		const lines = todoWidgetLines(state, theme as any, () => undefined, 20);
+		expect(lines[1]).toContain("g1-open");
+		expect(lines[2]).toContain("g2-open");
+		expect(lines.filter((line) => line.includes("✓")).length).toBe(3);
+		expect(lines).toContain("  … 9 more relevant items");
 	});
 
 	test("loads only the command, then activates the tool and persists state", async () => {

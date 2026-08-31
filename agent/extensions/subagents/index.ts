@@ -2645,7 +2645,7 @@ function agentSummaryResult(resultValue: any, options: { expanded: boolean; isPa
 	const summary = `${prefix}${counts ? ` · ${counts}` : ""}${totalCost > 0 ? ` · ${formatCost(totalCost)}` : ""}${omitted > 0 ? ` · ${omitted} older omitted` : ""}`;
 	const background = options.isPartial ? "toolPendingBg" : "toolSuccessBg";
 	const content = `${summary}\n${agentRows(agents, batches, theme, options.expanded)}`;
-	component.setText(withPreservedAnsiBackground(content, (text) => theme.bg(background, text)));
+	component.setText(withPreservedAnsiBackground(content, (text) => theme.bg(background, text), { keepOpen: true }));
 	return component;
 }
 
