@@ -3303,6 +3303,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		input_file: Type.Optional(Type.String({ description: "Handle JSON file returned by a large subagent_start call. Mutually exclusive with ids and batch_id." })),
 	});
 
+	/* Disabled: grouped completion notifications hide useful per-agent results.
 	pi.registerTool({
 		name: NOTIFY_ONLY_ONCE_TOOL_NAME,
 		label: "Notify Only Once When All Subagents Complete",
@@ -3351,6 +3352,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			return textOrMarkdownResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent);
 		},
 	});
+	*/
 
 	pi.registerTool({
 		name: RESULT_TOOL_NAME,
