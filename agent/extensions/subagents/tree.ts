@@ -17,6 +17,34 @@ export type VisibleTree<T extends TreeItem> = {
 	omitted: number;
 };
 
+/** Count matching descendants at every level below one tree node. */
+export function countDescendants<T extends Pick<TreeItem, "id" | "parentId">>(
+	items: T[],
+	rootId: string,
+	matches: (item: T) => boolean,
+): number {
+	const children = new Map<string, T[]>();
+	for (const item of items) {
+		if (!item.parentId) continue;
+		const siblings = children.get(item.parentId) ?? [];
+		siblings.push(item);
+		children.set(item.parentId, siblings);
+	}
+	let count = 0;
+	const pending = [rootId];
+	const seen = new Set(pending);
+	while (pending.length > 0) {
+		const parentId = pending.pop()!;
+		for (const child of children.get(parentId) ?? []) {
+			if (seen.has(child.id)) continue;
+			seen.add(child.id);
+			if (matches(child)) count++;
+			pending.push(child.id);
+		}
+	}
+	return count;
+}
+
 /** Count hierarchy levels without treating synthetic tree rows as parents. */
 export function buildHierarchyLevels(items: Array<Pick<TreeItem, "id" | "parentId">>): Map<string, number> {
 	const byId = new Map(items.map((item) => [item.id, item]));

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildHierarchyLevels, buildVisibleTree, type TreeItem } from "./tree.ts";
+import { buildHierarchyLevels, buildVisibleTree, countDescendants, type TreeItem } from "./tree.ts";
 
 type Item = TreeItem & { label: string };
 
@@ -39,6 +39,21 @@ describe("subagent hierarchy", () => {
 		], 12);
 		expect(tree.rows.map((row) => row.item.id)).toEqual(["batch-1", "sa-1", "standalone"]);
 		expect(tree.rows[1]?.prefix).toBe("│  ");
+	});
+
+	test("counts active agents recursively below a synthetic batch node", () => {
+		type Node = TreeItem & { kind: "agent" | "batch" };
+		const nodes: Node[] = [
+			{ id: "batch-1", createdAt: 1, active: false, kind: "batch" },
+			{ id: "active-parent", parentId: "batch-1", createdAt: 2, active: true, kind: "agent" },
+			{ id: "batch-2", parentId: "active-parent", createdAt: 3, active: false, kind: "batch" },
+			{ id: "active-child", parentId: "batch-2", createdAt: 4, active: true, kind: "agent" },
+			{ id: "finished-child", parentId: "batch-2", createdAt: 5, active: false, kind: "agent" },
+			{ id: "other-root", createdAt: 6, active: true, kind: "agent" },
+		];
+
+		expect(countDescendants(nodes, "batch-1", (node) => node.kind === "agent" && node.active)).toBe(2);
+		expect(countDescendants(nodes, "batch-2", (node) => node.kind === "agent" && node.active)).toBe(1);
 	});
 
 	test("bounds visible nodes and reports overflow", () => {

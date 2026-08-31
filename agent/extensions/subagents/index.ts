@@ -65,7 +65,7 @@ import {
 	type TodoStatus,
 	type TodoStatusEvent,
 } from "../_shared/todo-status.ts";
-import { buildHierarchyLevels, buildVisibleTree } from "./tree.ts";
+import { buildHierarchyLevels, buildVisibleTree, countDescendants } from "./tree.ts";
 import { partitionSubagentList } from "./list-policy.ts";
 import { managedSettlementAction } from "./lifecycle-policy.ts";
 import { widgetRefreshDelay } from "./widget-refresh-policy.ts";
@@ -1606,18 +1606,6 @@ function compactBatch(batch: BatchRecord): Record<string, unknown> {
 	};
 }
 
-function aggregateState(records: Array<{ state: string; lastOutcome: RunOutcome }>): string {
-	if (records.some((record) => record.state === "running" || record.state === "starting")) return "running";
-	if (records.some((record) => record.state === "parked")) return "parked";
-	if (records.some((record) => record.state === "queued")) return "queued";
-	if (records.some((record) => record.state === "stopping")) return "stopping";
-	if (records.some((record) => record.lastOutcome === "failed")) return "failed";
-	if (records.some((record) => record.lastOutcome === "interrupted")) return "interrupted";
-	if (records.some((record) => record.lastOutcome === "stopped")) return "stopped";
-	if (records.length > 0 && records.every((record) => record.lastOutcome === "completed")) return "completed";
-	return "none";
-}
-
 function batchActivity(records: Array<{ state: string; lastOutcome: RunOutcome }>, total = records.length): string {
 	const completed = records.filter((record) => record.state === "cold" && record.lastOutcome === "completed").length;
 	const active = records.filter((record) => record.state !== "cold").length;
@@ -1639,8 +1627,8 @@ function formatTreeList(records: AgentRecord[], batches: BatchRecord[] = []): st
 		if (item.kind === "batch") {
 			const members = records.filter((record) => item.batch.memberIds.includes(record.id));
 			const partial = members.length < item.batch.memberIds.length;
-			const state = members.length > 0 ? aggregateState(members) : "not shown";
-			return `${connector}${item.batch.id} · ${state}${item.batch.role ? ` · [${item.batch.role}]` : ""} · ${item.batch.title} · ${partial ? `${members.length}/${item.batch.memberIds.length} shown · ` : ""}${batchActivity(members)}`;
+			const activeCount = countDescendants(nodes, item.id, (node) => node.kind === "agent" && isActive(node.record));
+			return `${connector}${item.batch.id} · [${activeCount}]${item.batch.role ? ` · [${item.batch.role}]` : ""} · ${item.batch.title} · ${partial ? `${members.length}/${item.batch.memberIds.length} shown · ` : ""}${batchActivity(members)}`;
 		}
 		const record = item.record;
 		const state = record.state === "cold" ? `cold; last run ${record.lastOutcome}` : record.state;
@@ -1981,7 +1969,7 @@ function widgetLines(
 		const connector = `${isLast ? "└─" : "├─"} `;
 		if (item.kind === "batch") {
 			const members = records.filter((record) => item.batch.memberIds.includes(record.id));
-			const state = aggregateState(members);
+			const activeCount = countDescendants(nodes, item.id, (node) => node.kind === "agent" && isActive(node.record));
 			const cost = members.reduce((sum, record) => sum + record.usage.cost, 0);
 			const started = members.map((record) => record.startedAt).filter((value): value is number => value !== undefined);
 			const settled = members.map((record) => record.settledAt).filter((value): value is number => value !== undefined);
@@ -1992,7 +1980,7 @@ function widgetLines(
 			return {
 				indent: theme.fg("dim", prefix),
 				connector: theme.fg("dim", connector),
-				state: theme.fg("muted", `▾ ${state}`),
+				state: theme.fg("muted", `▾ [${activeCount}]`),
 				id: theme.fg("muted", item.batch.id),
 				role: item.batch.role ? theme.fg("accent", `[${item.batch.role}]`) : "",
 				title: theme.fg("muted", oneLine(item.batch.title, 70)),
@@ -2569,10 +2557,9 @@ function agentRows(agents: DisplayAgent[], batches: DisplayBatch[], theme: Theme
 		const connector = `${isLast ? "└─" : "├─"} `;
 		if (item.kind === "batch") {
 			const members = agents.filter((agent) => item.batch.memberIds.includes(agent.id));
-			const aggregateRecords = members.map((agent) => ({ state: agent.state, lastOutcome: agent.outcome as RunOutcome }));
 			const total = Math.max(item.batch.memberIds.length, members.length);
 			const partial = members.length < total;
-			const state = members.length > 0 ? aggregateState(aggregateRecords) : "not shown";
+			const activeCount = countDescendants(nodes, item.id, (node) => node.kind === "agent" && node.agent.state !== "cold");
 			const cost = members.reduce((sum, agent) => sum + agent.cost, 0);
 			const tokens = members.reduce((sum, agent) => sum + agent.tokens, 0);
 			const completed = members.filter((agent) => displayState(agent) === "completed").length;
@@ -2582,7 +2569,7 @@ function agentRows(agents: DisplayAgent[], batches: DisplayBatch[], theme: Theme
 			return {
 				indent: theme.fg("dim", prefix),
 				connector: theme.fg("dim", connector),
-				state: styledState(state, theme, "▾"),
+				state: theme.fg("muted", `▾ [${activeCount}]`),
 				id: theme.fg("accent", item.batch.id),
 				role: item.batch.role ? theme.fg("accent", `[${item.batch.role}]`) : "",
 				title: theme.fg("muted", oneLine(item.batch.title, 70)),
