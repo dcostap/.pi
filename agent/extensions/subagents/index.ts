@@ -93,6 +93,7 @@ import { stopManagedProcessTree } from "./stop-policy.ts";
 import { terminateProcessTree } from "./process-tree.ts";
 import { isLiveMessageTarget, parseSubagentSendSelector } from "./send-policy.ts";
 import { customCwdDisplay } from "./cwd-display.ts";
+import { subagentWidgetSummary } from "./widget-summary.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
 const START_TOOL_NAME = "subagent_start";
@@ -1946,23 +1947,30 @@ function widgetLines(
 	includeInactive = false,
 	refreshDelay = currentWidgetRefreshDelay(records, batches, now),
 	sessionCwd?: string,
+	sessionStartedAt?: number,
 ): string[] {
 	const active = records.filter(isActive);
-	const inactive = records.filter((record) => !isActive(record));
 	const recentFinished = records.filter((record) => isRecentlyFinished(record, now));
-	const completed = inactive.filter((record) => record.lastOutcome === "completed").length;
-	const failed = inactive.filter((record) => record.lastOutcome === "failed").length;
-	const stopped = inactive.filter((record) => record.lastOutcome === "stopped" || record.lastOutcome === "interrupted").length;
-	const activeCost = active.reduce((sum, record) => sum + record.usage.cost, 0);
-	const totalCost = records.reduce((sum, record) => sum + record.usage.cost, 0);
-	const costSummary = ` · active ${formatCost(activeCost)} · total ${formatCost(totalCost)}`;
-	const inactiveParts = [completed ? `${completed} completed` : "", failed ? `${failed} failed` : "", stopped ? `${stopped} stopped` : ""].filter(Boolean).join(" · ");
+	const summary = subagentWidgetSummary(records.map((record) => ({
+		active: isActive(record),
+		createdAt: record.createdAt,
+		cost: record.usage.cost,
+	})), sessionStartedAt, now);
+	const recentCounts = [
+		summary.lastDay ? `${summary.lastDay.count} last day` : "",
+		summary.lastHour ? `${summary.lastHour.count} last hour` : "",
+	].filter(Boolean).join(" · ");
+	const recentCosts = [
+		summary.lastDay ? `last day ${formatCost(summary.lastDay.cost)}` : "",
+		summary.lastHour ? `last hour ${formatCost(summary.lastHour.cost)}` : "",
+	].filter(Boolean).join(" · ");
+	const costSummary = ` · active ${formatCost(summary.activeCost)} · total ${formatCost(summary.totalCost)}${recentCosts ? ` · ${recentCosts}` : ""}`;
 	if (active.length === 0) {
-		const known = records.length === 0 ? "none known" : `${records.length} total${inactiveParts ? ` · ${inactiveParts}` : ""}`;
+		const known = records.length === 0 ? "none known" : `${summary.totalCount} total${recentCounts ? ` · ${recentCounts}` : ""}`;
 		if (!includeInactive && recentFinished.length === 0) return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
-		+ theme.fg("muted", ` · ${active.length} active · ${inactive.length} inactive${inactiveParts ? ` (${inactiveParts})` : ""}${costSummary}`);
+		+ theme.fg("muted", ` · ${summary.activeCount} active · ${summary.totalCount} total${recentCounts ? ` · ${recentCounts}` : ""}${costSummary}`);
 	const levels = buildHierarchyLevels(records.map((record) => ({ id: record.id, parentId: record.parentAgentId })));
 	const tree = widgetTree(records, batches, now, includeInactive);
 	const rows = tree.rows.map(({ item, prefix, isLast }): SubagentDisplayRow => {
@@ -2043,6 +2051,7 @@ function widgetComponent(
 	getRevision: () => number,
 	getRefreshDelay: () => number,
 	getSessionCwd: () => string | undefined,
+	getSessionStartedAt: () => number | undefined,
 	theme: Theme,
 	onDispose: () => void,
 ) {
@@ -2064,7 +2073,7 @@ function widgetComponent(
 			const clockTick = Math.floor(now / refreshDelay);
 			if (cachedLines && cachedWidth === width && cachedRevision === revision && cachedClockTick === clockTick) return cachedLines;
 			const contentWidth = Math.max(0, width - 1);
-			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth, false, refreshDelay, getSessionCwd()).map((line) => truncateToWidth(` ${line}`, width));
+			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth, false, refreshDelay, getSessionCwd(), getSessionStartedAt()).map((line) => truncateToWidth(` ${line}`, width));
 			cachedWidth = width;
 			cachedRevision = revision;
 			cachedClockTick = clockTick;
@@ -2118,6 +2127,7 @@ function widgetFingerprint(records: AgentRecord[], batches: BatchRecord[]): stri
 type SubagentDashboardOptions = {
 	getRecords: () => AgentRecord[];
 	getBatches: () => BatchRecord[];
+	getSessionStartedAt: () => number | undefined;
 	tui: TUI;
 	theme: Theme;
 	keybindings: KeybindingsManager;
@@ -2206,7 +2216,7 @@ class SubagentDashboard {
 	private renderList(width: number): string[] {
 		const records = this.options.getRecords();
 		const innerWidth = width - 2;
-		const all = widgetLines(records, this.options.getBatches(), this.options.theme, Date.now(), innerWidth, true);
+		const all = widgetLines(records, this.options.getBatches(), this.options.theme, Date.now(), innerWidth, true, undefined, this.options.getSessionStartedAt());
 		const summary = all.shift() ?? "Subagents";
 		const selectedIndex = this.selectedId
 			? Math.max(0, all.findIndex((line) => line.includes(this.selectedId!)))
@@ -2728,6 +2738,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	let manager: SubagentManager | undefined;
 	let latestCtx: ExtensionContext | undefined;
+	let sessionCreatedAt: number | undefined;
 	let unsubscribe: (() => void) | undefined;
 	const currentAgentId = process.env[CURRENT_AGENT_ENV] || undefined;
 	let hierarchyRegistryDir = process.env[HIERARCHY_REGISTRY_ENV] || undefined;
@@ -2897,6 +2908,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 					() => widgetRevision,
 					() => currentWidgetRefreshDelay(widgetRecords, widgetBatches),
 					() => latestCtx?.cwd,
+					() => sessionCreatedAt,
 					theme,
 					() => { if (widgetTui === tui) widgetTui = undefined; },
 				);
@@ -3450,6 +3462,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				(tui, theme, keybindings, done) => new SubagentDashboard({
 					getRecords,
 					getBatches,
+					getSessionStartedAt: () => sessionCreatedAt,
 					tui,
 					theme,
 					keybindings,
@@ -3503,6 +3516,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		const headerTimestamp = Date.parse(String(ctx.sessionManager.getHeader().timestamp));
+		sessionCreatedAt = Number.isFinite(headerTimestamp) ? headerTimestamp : undefined;
 		shuttingDown = false;
 		hierarchyRegistryDir ??= path.join(tmpdir(), "pi-subagent-hierarchy", ctx.sessionManager.getSessionId());
 		await mkdir(hierarchyRegistryDir, { recursive: true });
