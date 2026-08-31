@@ -51,9 +51,10 @@ describe("subagent hierarchy", () => {
 			{ id: "finished-child", parentId: "batch-2", createdAt: 5, active: false, kind: "agent" },
 			{ id: "other-root", createdAt: 6, active: true, kind: "agent" },
 		];
+		const tree = buildVisibleTree(nodes, 12);
 
-		expect(countDescendants(nodes, "batch-1", (node) => node.kind === "agent" && node.active)).toBe(2);
-		expect(countDescendants(nodes, "batch-2", (node) => node.kind === "agent" && node.active)).toBe(1);
+		expect(countDescendants(tree.nodes, "batch-1", (node) => node.kind === "agent" && node.active)).toBe(2);
+		expect(countDescendants(tree.nodes, "batch-2", (node) => node.kind === "agent" && node.active)).toBe(1);
 	});
 
 	test("bounds visible nodes and reports overflow", () => {

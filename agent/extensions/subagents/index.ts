@@ -1969,7 +1969,7 @@ function widgetLines(
 		const connector = `${isLast ? "└─" : "├─"} `;
 		if (item.kind === "batch") {
 			const members = records.filter((record) => item.batch.memberIds.includes(record.id));
-			const activeCount = countDescendants(nodes, item.id, (node) => node.kind === "agent" && isActive(node.record));
+			const activeCount = countDescendants(tree.nodes, item.id, (node) => node.kind === "agent" && isActive(node.record));
 			const cost = members.reduce((sum, record) => sum + record.usage.cost, 0);
 			const started = members.map((record) => record.startedAt).filter((value): value is number => value !== undefined);
 			const settled = members.map((record) => record.settledAt).filter((value): value is number => value !== undefined);

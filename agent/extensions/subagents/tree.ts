@@ -12,6 +12,7 @@ export type TreeRow<T extends TreeItem> = {
 };
 
 export type VisibleTree<T extends TreeItem> = {
+	nodes: T[];
 	rows: TreeRow<T>[];
 	visibleCount: number;
 	omitted: number;
@@ -112,5 +113,5 @@ export function buildVisibleTree<T extends TreeItem>(items: T[], maxRows: number
 	};
 	const roots = children.get(undefined) ?? [];
 	for (const [index, root] of roots.entries()) walk(root, "", index === roots.length - 1);
-	return { rows, visibleCount: visible.length, omitted: Math.max(0, visible.length - rows.length) };
+	return { nodes: items, rows, visibleCount: visible.length, omitted: Math.max(0, visible.length - rows.length) };
 }
