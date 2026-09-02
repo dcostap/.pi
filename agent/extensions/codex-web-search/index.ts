@@ -186,10 +186,8 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 		description: "Preferred web search tool for OpenAI Codex models. Use it instead of other web search tools for discovery and result navigation. It uses the active Pi Codex login and supports search_query, open, click, and find with stable references.",
 		promptSnippet: "Preferred OpenAI Codex web search and result navigation. Use it instead of other search tools when active.",
 		promptGuidelines: [
-			"Use codex_web_search for web discovery and search when it is active; do not use firecrawl_search.",
+			"Use codex_web_search for web discovery and search when it is active; do not use another web search tool.",
 			"Use codex_web_search open, click, and find operations to inspect its search results.",
-			"Use fetch_url when the user provides one exact URL, or when exact page, PDF, or source contents are needed.",
-			"Use firecrawl_crawl only when the task needs several related pages from one site.",
 		],
 		parameters: Parameters,
 		renderCall(args, theme, context) {
