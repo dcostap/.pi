@@ -134,34 +134,47 @@ function githubPreviewOnly(output: string): string {
 	return end === undefined ? output : output.slice(0, end);
 }
 
-export default function (pi: ExtensionAPI) {
+async function hasUsableFirecrawl(config: ReturnType<typeof loadConfig>): Promise<boolean> {
+	if (!config.firecrawlApiKey) return false;
+	try {
+		const client = await getFirecrawlClient(config);
+		if (!client) return false;
+		const usage = await getFirecrawlCreditUsage(client, AbortSignal.timeout(8_000));
+		return usage.remainingCredits > config.firecrawlMinimumCredits;
+	} catch {
+		// Invalid credentials and unavailable accounts must not add unusable tools.
+		return false;
+	}
+}
+
+export default async function (pi: ExtensionAPI) {
 	const config = loadConfig();
+	const firecrawlAvailable = await hasUsableFirecrawl(config);
+	const fetchConfig = firecrawlAvailable ? config : { ...config, firecrawlApiKey: undefined };
 	const fetchLimiter = new ConcurrencyLimiter(config.maxConcurrentFetches);
 
-	pi.registerCommand("firecrawl-credits", {
-		description: "Show the Firecrawl credit balance and safety reserve",
-		handler: async (_args, ctx) => {
-			const client = await getFirecrawlClient(config);
-			if (!client) {
-				ctx.ui.notify("Firecrawl is not configured.", "error");
-				return;
-			}
-			try {
-				const usage = await getFirecrawlCreditUsage(client);
-				const reset = usage.billingPeriodEnd
-					? new Date(usage.billingPeriodEnd).toLocaleString()
-					: "unknown";
-				ctx.ui.notify(
-					`Firecrawl: ${usage.remainingCredits}/${usage.planCredits} credits. ` +
-					`Billable requests stop at ${config.firecrawlMinimumCredits}. Reset: ${reset}.`,
-					usage.remainingCredits <= config.firecrawlMinimumCredits ? "warning" : "info",
-				);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Could not read Firecrawl credits: ${message}`, "error");
-			}
-		},
-	});
+	if (firecrawlAvailable) {
+		pi.registerCommand("firecrawl-credits", {
+			description: "Show the Firecrawl credit balance and safety reserve",
+			handler: async (_args, ctx) => {
+				const client = await getFirecrawlClient(config);
+				if (!client) return;
+				try {
+					const usage = await getFirecrawlCreditUsage(client);
+					const reset = usage.billingPeriodEnd
+						? new Date(usage.billingPeriodEnd).toLocaleString()
+						: "unknown";
+					ctx.ui.notify(
+						`Firecrawl: ${usage.remainingCredits}/${usage.planCredits} credits. ` +
+						`Billable requests stop at ${config.firecrawlMinimumCredits}. Reset: ${reset}.`,
+						usage.remainingCredits <= config.firecrawlMinimumCredits ? "warning" : "info",
+					);
+				} catch {
+					// Stay quiet if credentials become unusable after startup.
+				}
+			},
+		});
+	}
 
 	pi.registerTool({
 		name: "fetch_url",
@@ -273,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const release = await fetchLimiter.acquire(signal);
 			try {
-				const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
+				const result = await fetchUrl(params.url, fetchConfig, ctx, params.prompt, onUpdate, signal);
 				return {
 					content: [{ type: "text", text: result.text }],
 					details: result.details,
@@ -283,6 +296,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 	});
+
+	if (!firecrawlAvailable) return;
 
 	pi.registerTool({
 		name: "firecrawl_search",

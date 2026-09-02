@@ -38,6 +38,8 @@ Pi extension for:
 - Firecrawl crawl failures/cancellations are errors, and crawl startup plus polling share one deadline
 - every billable Firecrawl request checks the live team balance first and fails closed if the balance cannot be read
 - Firecrawl search, scrape fallback, and crawl start stop when credits reach the configured minimum reserve
+- Firecrawl tools load only when startup validation confirms valid credentials and credits above the reserve
+- missing, invalid, unreachable, or depleted Firecrawl accounts add no tools, commands, or prompt instructions
 - fetched content is explicitly framed as untrusted data for fast-model quality checks and summaries
 
 ## Config
