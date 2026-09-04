@@ -25,7 +25,7 @@ import {
 	type BackgroundProcessLookup,
 } from "./ui/tool-call.ts";
 import { MANAGED_WORK_STATE_EVENT } from "../_shared/managed-work.ts";
-import { WaitInterruptRegistry } from "./wait-interrupt.ts";
+import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
 
 const StartParameters = Type.Object({
 	command: Type.String({ minLength: 1, description: "Non-interactive bash command to run using the same local backend as Pi's built-in bash tool" }),

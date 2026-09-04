@@ -94,11 +94,13 @@ import { terminateProcessTree } from "./process-tree.ts";
 import { isLiveMessageTarget, parseSubagentSendSelector } from "./send-policy.ts";
 import { customCwdDisplay } from "./cwd-display.ts";
 import { subagentWidgetSummary } from "./widget-summary.ts";
+import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
 
 const LEGACY_REVIEW_TOOL_NAME = "launch_review_subagents";
 const START_TOOL_NAME = "subagent_start";
 const LIST_TOOL_NAME = "subagent_list";
 const STATUS_TOOL_NAME = "subagent_status";
+const WAIT_FOR_ANY_TOOL_NAME = "subagent_wait_for_any";
 const SEND_TOOL_NAME = "subagent_send";
 const REPORT_TOOL_NAME = "subagent_report";
 const NOTIFY_ONLY_ONCE_TOOL_NAME = "subagent_notify_only_once_when_all_completed";
@@ -109,6 +111,7 @@ const STOP_TREE_COMMAND = "managed-subagent-stop-tree";
 const MANAGED_CHILD_ENV = "PI_MANAGED_SUBAGENT";
 const HIERARCHY_REGISTRY_ENV = "PI_SUBAGENT_HIERARCHY_REGISTRY";
 const CURRENT_AGENT_ENV = "PI_SUBAGENT_CURRENT_AGENT_ID";
+const MID_TASK_REPORTS_ENV = "PI_SUBAGENT_MID_TASK_REPORTS";
 const PROMPT_CACHE_ENV = "PI_SUBAGENT_PROMPT_CACHE_KEY";
 const MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
 const NORMAL_LAUNCH_DETAIL_LIMIT = 10;
@@ -250,6 +253,7 @@ type SerializedAgent = {
 	contextMode: ContextMode;
 	contextFiles: boolean;
 	todoEnabled: boolean;
+	midTaskReportsEnabled: boolean;
 	cwd?: string;
 	sessionFile: string;
 	sandboxDir: string;
@@ -322,6 +326,14 @@ type ManagerEvent =
 	| { kind: "changed"; id: string }
 	| { kind: "settled"; id: string }
 	| { kind: "parent_update" };
+
+type WaitForAnyResult = {
+	timedOut: boolean;
+	settled: CompletionSnapshot[];
+	activeIds: string[];
+};
+
+class SubagentWaitAbortedError extends Error {}
 
 type LaunchManifestMetadata = {
 	path: string;
@@ -526,6 +538,7 @@ function serializeAgent(record: AgentRecord): SerializedAgent {
 		contextMode: record.contextMode,
 		contextFiles: record.contextFiles,
 		todoEnabled: record.todoEnabled,
+		midTaskReportsEnabled: record.midTaskReportsEnabled,
 		cwd: record.cwd,
 		sessionFile: record.sessionFile,
 		sandboxDir: record.sandboxDir,
@@ -569,6 +582,7 @@ function newRecord(serialized: SerializedAgent): AgentRecord {
 	return {
 		...serialized,
 		todoEnabled: serialized.todoEnabled === true,
+		midTaskReportsEnabled: serialized.midTaskReportsEnabled === true,
 		state: "cold",
 		lastOutcome: serialized.restoredOutcome ?? "none",
 		currentRunId: serialized.restoredRunId,
@@ -717,6 +731,7 @@ class RpcClient {
 					[MANAGED_CHILD_ENV]: "1",
 					...(this.hierarchyRegistryDir ? { [HIERARCHY_REGISTRY_ENV]: this.hierarchyRegistryDir } : {}),
 					[CURRENT_AGENT_ENV]: this.record.id,
+					...(this.record.midTaskReportsEnabled ? { [MID_TASK_REPORTS_ENV]: "1" } : {}),
 					PI_SUBAGENT_SANDBOX: this.record.sandboxDir,
 				[PROMPT_CACHE_ENV]: this.record.promptCacheKey ?? this.record.sessionFile,
 			},
@@ -1016,10 +1031,62 @@ class SubagentManager {
 			|| Boolean(this.completionNotifications.active);
 	}
 
+	waitForAny(timeoutMs: number, signal?: AbortSignal): Promise<WaitForAnyResult> {
+		this.assertActive();
+		const targets = this.list()
+			.filter((record) => record.state !== "cold")
+			.map((record) => ({ id: record.id, runId: record.currentRunId }));
+		if (targets.length === 0) return Promise.resolve({ timedOut: false, settled: [], activeIds: [] });
+
+		return new Promise((resolve, reject) => {
+			let finished = false;
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const cleanup = () => {
+				unsubscribe();
+				if (timeout) clearTimeout(timeout);
+				signal?.removeEventListener("abort", onAbort);
+			};
+			const finish = (timedOut: boolean) => {
+				if (finished) return;
+				const records = targets.map(({ id }) => this.get(id));
+				const settled = records
+					.filter((record, index) => record.state === "cold" && record.currentRunId === targets[index]!.runId)
+					.map((record) => record.latestCompletion ?? completionSnapshot(record));
+				if (!timedOut && settled.length === 0) return;
+				finished = true;
+				cleanup();
+				resolve({
+					timedOut,
+					settled,
+					activeIds: records.filter((record, index) => record.state !== "cold" && record.currentRunId === targets[index]!.runId).map((record) => record.id),
+				});
+			};
+			const onAbort = () => {
+				if (finished) return;
+				finished = true;
+				cleanup();
+				reject(new SubagentWaitAbortedError("Subagent wait aborted"));
+			};
+			const unsubscribe = this.subscribe((event) => {
+				if (event.kind === "settled") finish(false);
+			});
+			timeout = setTimeout(() => finish(true), Math.max(0, timeoutMs));
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+			finish(false);
+		});
+	}
+
 	hasPendingParentUpdates(terminalOnly = false): boolean {
 		return terminalOnly
 			? this.pendingParentUpdates.some((update) => update.kind !== "report")
 			: this.pendingParentUpdates.length > 0;
+	}
+
+	pendingCompletionCount(): number {
+		return this.pendingParentUpdates.reduce((count, update) => count + (
+			update.kind === "completion" ? 1 : update.kind === "completion_group" ? update.completions.length : 0
+		), 0);
 	}
 
 	takePendingParentUpdates(terminalOnly = false): ParentUpdate[] {
@@ -1475,6 +1542,7 @@ async function prepareAgent(
 			contextMode,
 			contextFiles: spec.context_files !== false,
 			todoEnabled: spec.todo === true,
+			midTaskReportsEnabled: spec.mid_task_reports === true,
 			cwd: childCwd,
 			sessionFile,
 			sandboxDir,
@@ -1523,6 +1591,7 @@ function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
 					role: typeof restored.role === "string" ? restored.role : typeof restored.profile === "string" ? restored.profile : undefined,
 					contextFiles: restored.contextFiles !== false,
 					todoEnabled: restored.todoEnabled === true,
+					midTaskReportsEnabled: restored.midTaskReportsEnabled === true,
 				});
 				continue;
 			}
@@ -1575,6 +1644,7 @@ function compactRecord(record: AgentRecord): Record<string, unknown> {
 		parentAgentId: record.parentAgentId,
 		contextFiles: record.contextFiles,
 		todoEnabled: record.todoEnabled,
+		midTaskReportsEnabled: record.midTaskReportsEnabled,
 		cwd: record.cwd,
 		currentRunId: record.currentRunId,
 		activity: currentActivity(record),
@@ -1948,6 +2018,7 @@ function widgetLines(
 	refreshDelay = currentWidgetRefreshDelay(records, batches, now),
 	sessionCwd?: string,
 	sessionStartedAt?: number,
+	pendingCompletions = 0,
 ): string[] {
 	const active = records.filter(isActive);
 	const recentFinished = records.filter((record) => isRecentlyFinished(record, now));
@@ -1965,12 +2036,13 @@ function widgetLines(
 		summary.lastHour ? `last hour ${formatCost(summary.lastHour.cost)}` : "",
 	].filter(Boolean).join(" · ");
 	const costSummary = ` · active ${formatCost(summary.activeCost)} · total ${formatCost(summary.totalCost)}${recentCosts ? ` · ${recentCosts}` : ""}`;
+	const queuedSummary = pendingCompletions > 0 ? ` · ${pendingCompletions} completion${pendingCompletions === 1 ? "" : "s"} queued` : "";
 	if (active.length === 0) {
 		const known = records.length === 0 ? "none known" : `${summary.totalCount} total${recentCounts ? ` · ${recentCounts}` : ""}`;
-		if (!includeInactive && recentFinished.length === 0) return [theme.fg("muted", `${theme.bold("Subagents")} · ${known}${costSummary}`)];
+		if (!includeInactive && recentFinished.length === 0) return [theme.fg("muted", `${theme.bold("Subagents")}${queuedSummary} · ${known}${costSummary}`)];
 	}
 	const header = theme.fg("toolTitle", theme.bold("Subagents"))
-		+ theme.fg("muted", ` · ${summary.activeCount} active · ${summary.totalCount} total${recentCounts ? ` · ${recentCounts}` : ""}${costSummary}`);
+		+ theme.fg("muted", `${queuedSummary} · ${summary.activeCount} active · ${summary.totalCount} total${recentCounts ? ` · ${recentCounts}` : ""}${costSummary}`);
 	const levels = buildHierarchyLevels(records.map((record) => ({ id: record.id, parentId: record.parentAgentId })));
 	const tree = widgetTree(records, batches, now, includeInactive);
 	const rows = tree.rows.map(({ item, prefix, isLast }): SubagentDisplayRow => {
@@ -2048,6 +2120,7 @@ function widgetLines(
 function widgetComponent(
 	getRecords: () => AgentRecord[],
 	getBatches: () => BatchRecord[],
+	getPendingCompletions: () => number,
 	getRevision: () => number,
 	getRefreshDelay: () => number,
 	getSessionCwd: () => string | undefined,
@@ -2073,7 +2146,7 @@ function widgetComponent(
 			const clockTick = Math.floor(now / refreshDelay);
 			if (cachedLines && cachedWidth === width && cachedRevision === revision && cachedClockTick === clockTick) return cachedLines;
 			const contentWidth = Math.max(0, width - 1);
-			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth, false, refreshDelay, getSessionCwd(), getSessionStartedAt()).map((line) => truncateToWidth(` ${line}`, width));
+			cachedLines = widgetLines(getRecords(), getBatches(), theme, now, contentWidth, false, refreshDelay, getSessionCwd(), getSessionStartedAt(), getPendingCompletions()).map((line) => truncateToWidth(` ${line}`, width));
 			cachedWidth = width;
 			cachedRevision = revision;
 			cachedClockTick = clockTick;
@@ -2087,8 +2160,9 @@ function widgetComponent(
 	};
 }
 
-function widgetFingerprint(records: AgentRecord[], batches: BatchRecord[]): string {
+function widgetFingerprint(records: AgentRecord[], batches: BatchRecord[], pendingCompletions = 0): string {
 	return JSON.stringify({
+		pendingCompletions,
 		records: records.map((record) => [
 			record.id,
 			record.title,
@@ -2216,7 +2290,7 @@ class SubagentDashboard {
 	private renderList(width: number): string[] {
 		const records = this.options.getRecords();
 		const innerWidth = width - 2;
-		const all = widgetLines(records, this.options.getBatches(), this.options.theme, Date.now(), innerWidth, true, undefined, this.options.getSessionStartedAt());
+		const all = widgetLines(records, this.options.getBatches(), this.options.theme, Date.now(), innerWidth, true, undefined, undefined, this.options.getSessionStartedAt());
 		const summary = all.shift() ?? "Subagents";
 		const selectedIndex = this.selectedId
 			? Math.max(0, all.findIndex((line) => line.includes(this.selectedId!)))
@@ -2741,6 +2815,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let sessionCreatedAt: number | undefined;
 	let unsubscribe: (() => void) | undefined;
 	const currentAgentId = process.env[CURRENT_AGENT_ENV] || undefined;
+	const midTaskReportsEnabled = process.env[MID_TASK_REPORTS_ENV] === "1";
 	let hierarchyRegistryDir = process.env[HIERARCHY_REGISTRY_ENV] || undefined;
 	let hierarchyRecords: AgentRecord[] = [];
 	let hierarchyBatches: BatchRecord[] = [];
@@ -2752,12 +2827,14 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let hierarchyPublishedFingerprint: string | undefined;
 	let parentUpdateFlushScheduled = false;
 	let parentUpdateFlushRunning = false;
+	const waitInterrupts = new WaitInterruptRegistry();
 	let lastPublishedPendingWork: boolean | undefined;
 	let ownTodoStatus: TodoStatus | undefined;
 	const externalManagedWork = new Map<string, boolean>();
 	let widgetInstalled = false;
 	let widgetRecords: AgentRecord[] = [];
 	let widgetBatches: BatchRecord[] = [];
+	let widgetPendingCompletions = 0;
 	let widgetRevision = 0;
 	let widgetStateFingerprint = "";
 	let widgetTui: Pick<TUI, "requestRender"> | undefined;
@@ -2882,11 +2959,13 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		if (!latestCtx || latestCtx.mode !== "tui" || shuttingDown) return;
 		const nextRecords = mergedById(manager?.list() ?? [], hierarchyRecords);
 		const nextBatches = mergedById(manager?.listBatches() ?? [], hierarchyBatches);
-		const nextFingerprint = widgetFingerprint(nextRecords, nextBatches);
+		const nextPendingCompletions = manager?.pendingCompletionCount() ?? 0;
+		const nextFingerprint = widgetFingerprint(nextRecords, nextBatches, nextPendingCompletions);
 		const stateChanged = nextFingerprint !== widgetStateFingerprint;
 		if (stateChanged) {
 			widgetRecords = nextRecords;
 			widgetBatches = nextBatches;
+			widgetPendingCompletions = nextPendingCompletions;
 			widgetStateFingerprint = nextFingerprint;
 			widgetRevision++;
 		}
@@ -2905,6 +2984,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				return widgetComponent(
 					() => widgetRecords,
 					() => widgetBatches,
+					() => widgetPendingCompletions,
 					() => widgetRevision,
 					() => currentWidgetRefreshDelay(widgetRecords, widgetBatches),
 					() => latestCtx?.cwd,
@@ -2983,6 +3063,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			return false;
 		} finally {
 			parentUpdateFlushRunning = false;
+			scheduleWidgetRefresh();
 			publishPendingWork();
 		}
 	};
@@ -3027,13 +3108,6 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		return manager;
 	};
 
-	pi.on("turn_end", (_event, ctx) => {
-		latestCtx = ctx;
-		// A tool turn is not an idle parent. Deliver final results promptly, but
-		// keep progress reports queued until the complete parent run settles.
-		void flushParentUpdates("steer", true);
-	});
-
 	// Re-check after each run so updates that arrived near its final turn are
 	// not stranded before the next idle delivery opportunity.
 	pi.on("agent_end", (_event, ctx) => {
@@ -3052,7 +3126,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions(roles, Boolean(currentAgentId))}` }));
+	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions(roles, Boolean(currentAgentId) && midTaskReportsEnabled)}` }));
 	const AgentSpecSchema = Type.Object({
 		title: Type.String({ minLength: 1, description: "Short human-readable subagent title." }),
 		task: Type.String({ minLength: 1, description: "Complete individual task for this subagent." }),
@@ -3063,6 +3137,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 		context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
 		todo: Type.Optional(Type.Boolean({ description: "Enable the todo feature for this child. Defaults to false. Set true only when the user explicitly asks for or allows it." })),
+		mid_task_reports: Type.Optional(Type.Boolean({ description: "Allow this child to send unsolicited mid-task reports. Defaults to false." })),
 		system_prompt: Type.Optional(Type.String({ minLength: 1, description: "Optional additional system prompt; fresh context only." })),
 		system_prompt_file: Type.Optional(Type.String({ minLength: 1, description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 	}, { additionalProperties: false });
@@ -3072,13 +3147,14 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		role: Type.Optional(Type.String({ minLength: 1, description: `Optional role inherited by members that do not specify one. Available: ${[...roles.keys()].join(", ") || "none"}.` })),
 		context_files: Type.Optional(Type.Boolean({ description: "Default context-file discovery for batch members. Defaults to true; an agent-level value overrides it." })),
 		todo: Type.Optional(Type.Boolean({ description: "Default todo setting for batch members. Defaults to false. Set true only when the user explicitly asks for or allows it." })),
+		mid_task_reports: Type.Optional(Type.Boolean({ description: "Default mid-task report setting for batch members. Defaults to false." })),
 		agents: Type.Array(AgentSpecSchema, { minItems: 1, description: "Agents with individual tasks. An agent role overrides the batch role." }),
 	}, { additionalProperties: false });
 
 	pi.registerTool({
 		name: START_TOOL_NAME,
 		label: "Start Subagent",
-		description: `Start one managed Pi subagent or one formal batch and return immediately. Each agent can use an optional working directory, such as an existing Git worktree. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Todo support defaults to off and requires explicit user permission. Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
+		description: `Start one managed Pi subagent or one formal batch and return immediately. Each agent can use an optional working directory, such as an existing Git worktree. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Todo support and mid-task reports default to off. Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
 		parameters: Type.Object({
 			input_file: Type.Optional(Type.String({ description: "JSON file containing the same single-or-batch request object used inline. Must be supplied by itself." })),
 			batch: Type.Optional(BatchSchema),
@@ -3091,6 +3167,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			context: Type.Optional(StringEnum(CONTEXT_MODES, { description: "Context mode; defaults to fresh." })),
 			context_files: Type.Optional(Type.Boolean({ description: "Whether child Pi discovers AGENTS.md and CLAUDE.md context files. Defaults to true. Set false to ignore context files; this does not restrict filesystem access or disable other project resources." })),
 			todo: Type.Optional(Type.Boolean({ description: "Enable the todo feature for this child. Defaults to false. Set true only when the user explicitly asks for or allows it." })),
+			mid_task_reports: Type.Optional(Type.Boolean({ description: "Allow this child to send unsolicited mid-task reports. Defaults to false." })),
 			system_prompt: Type.Optional(Type.String({ description: "Optional additional system prompt; fresh context only." })),
 			system_prompt_file: Type.Optional(Type.String({ description: "Optional UTF-8 additional system prompt file; fresh context only." })),
 		}, { additionalProperties: false }),
@@ -3139,7 +3216,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				let text: string;
 				let handlesFile: string | undefined;
 				if (records.length <= NORMAL_LAUNCH_DETAIL_LIMIT) {
-					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}${record.todoEnabled ? " · todo enabled" : ""}\n  cwd: ${record.cwd}\n  ${record.state}`).join("\n\n")}`;
+					text = `${batchRecord ? `Started batch ${batchRecord.id} · ${batchRecord.title}\n${records.length} members` : `Started ${records.length} subagent${records.length === 1 ? "" : "s"}`}\n\n${records.map((record) => `${record.id} · ${record.title}\n  ${record.modelRef} [${record.thinking}]${record.role ? ` · role ${record.role}` : ""}${record.contextFiles ? "" : " · context files disabled"}${record.todoEnabled ? " · todo enabled" : ""}${record.midTaskReportsEnabled ? " · mid-task reports enabled" : ""}\n  cwd: ${record.cwd}\n  ${record.state}`).join("\n\n")}`;
 				} else {
 					handlesFile = path.join(tmpdir(), `pi-subagent-handles-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
 					const running = records.length;
@@ -3164,7 +3241,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				? `manifest ${path.basename(input.input_file)}`
 				: input?.batch
 					? `${oneLine(input.batch.title ?? "batch", 60)} · ${Array.isArray(input.batch.agents) ? input.batch.agents.length : "?"} agents${input.batch.role ? ` · [${input.batch.role}]` : ""}${input.batch.todo ? " · todo" : ""}`
-					: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}${input?.role ? ` · [${input.role}]` : ""}${input?.todo ? " · todo" : ""}`;
+					: `${oneLine(input?.title ?? "subagent", 60)}${input?.model ? ` · ${input.model}${input.thinking ? ` [${input.thinking}]` : ""}` : ""}${input?.role ? ` · [${input.role}]` : ""}${input?.todo ? " · todo" : ""}${input?.mid_task_reports ? " · reports" : ""}`;
 			return toolHeader("Start subagent", detail, theme, context.lastComponent);
 		},
 		renderResult(resultValue, options, theme, context) {
@@ -3307,6 +3384,57 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 			component.setText(`${heading}\n${resultText(resultValue)}`);
 			return component;
 		},
+	});
+
+	pi.registerTool({
+		name: WAIT_FOR_ANY_TOOL_NAME,
+		label: "Wait for Any Subagent",
+		description: "Wait until any active direct subagent finishes or the timeout expires. A steering message ends only this wait. Subagents continue running. The tool also releases queued completion updates.",
+		parameters: Type.Object({
+			timeout_seconds: Type.Integer({ minimum: 1, maximum: 86400, description: "Maximum wait time in seconds." }),
+		}, { additionalProperties: false }),
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const activeManager = ensureManager(ctx);
+			if (activeManager.hasPendingParentUpdates(true)) {
+				const delivered = await flushParentUpdates("steer", true);
+				return result("Released queued subagent completion updates without waiting.", { delivered, timedOut: false, settled: [], activeIds: activeManager.list().filter(isActive).map((record) => record.id) });
+			}
+			const wait = waitInterrupts.begin(signal);
+			try {
+				const waited = await activeManager.waitForAny(params.timeout_seconds * 1000, wait.signal);
+				const delivered = await flushParentUpdates("steer", true);
+				const text = waited.settled.length > 0
+					? `${waited.settled.length} subagent${waited.settled.length === 1 ? "" : "s"} finished. Released queued completion updates.`
+					: waited.timedOut
+						? `Timed out after ${params.timeout_seconds}s. ${waited.activeIds.length} subagent${waited.activeIds.length === 1 ? " remains" : "s remain"} active.`
+						: "No direct subagents are active.";
+				return result(text, { ...waited, delivered });
+			} catch (error) {
+				if (error instanceof SubagentWaitAbortedError && wait.reason() === "steer") {
+					const delivered = await flushParentUpdates("steer", true);
+					return result("Subagent wait ended because a steering message arrived. Subagents continue running.", {
+						interruptedBySteer: true,
+						delivered,
+						activeIds: activeManager.list().filter(isActive).map((record) => record.id),
+					});
+				}
+				if (error instanceof SubagentWaitAbortedError) throw new Error("Subagent wait aborted. Subagents continue running.");
+				throw error;
+			} finally {
+				wait.dispose();
+			}
+		},
+		renderCall(args, theme, context) {
+			const timeout = Number((args as any)?.timeout_seconds);
+			return toolHeader("Wait for any subagent", Number.isFinite(timeout) ? `${timeout}s` : "", theme, context.lastComponent);
+		},
+		renderResult(resultValue, options, theme, context) {
+			return textOrMarkdownResult(resultValue, { ...options, isError: context.isError }, theme, context.lastComponent);
+		},
+	});
+
+	pi.on("input", (event) => {
+		if (event.streamingBehavior === "steer") waitInterrupts.interruptForSteer();
 	});
 
 	const IdSelector = Type.Object({
@@ -3492,7 +3620,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	if (currentAgentId) pi.registerTool({
+	if (currentAgentId && midTaskReportsEnabled) pi.registerTool({
 		name: REPORT_TOOL_NAME,
 		label: "Report to Parent",
 		description: "Send important mid-task information to this subagent's parent. Use it for blockers, major issues, and decisions the parent needs now. Do not use it for completion or final reports. Pi sends the final answer after the complete managed task finishes.",
@@ -3541,6 +3669,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		waitInterrupts.abortAll();
 		parentUpdateFlushScheduled = false;
 		if (hierarchyTimer) clearInterval(hierarchyTimer);
 		if (hierarchyPublishTimer) clearTimeout(hierarchyPublishTimer);

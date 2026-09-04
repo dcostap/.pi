@@ -18,6 +18,7 @@ export type StartSpec = {
 	context?: (typeof CONTEXT_MODES)[number];
 	context_files?: boolean;
 	todo?: boolean;
+	mid_task_reports?: boolean;
 	system_prompt?: string;
 	system_prompt_file?: string;
 };
@@ -28,6 +29,7 @@ export type BatchSpec = {
 	role?: string;
 	context_files?: boolean;
 	todo?: boolean;
+	mid_task_reports?: boolean;
 	agents: StartSpec[];
 };
 
@@ -48,7 +50,7 @@ function utf8Bytes(value: string): number {
 function validateStartSpec(value: unknown, location: string): string[] {
 	const errors: string[] = [];
 	if (!isRecord(value)) return [`${location}: expected object`];
-	const allowed = new Set(["title", "task", "model", "thinking", "role", "cwd", "context", "context_files", "todo", "system_prompt", "system_prompt_file"]);
+	const allowed = new Set(["title", "task", "model", "thinking", "role", "cwd", "context", "context_files", "todo", "mid_task_reports", "system_prompt", "system_prompt_file"]);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
 	for (const key of ["title", "task", "model"] as const) {
 		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
@@ -59,6 +61,7 @@ function validateStartSpec(value: unknown, location: string): string[] {
 	if (value.context !== undefined && !(CONTEXT_MODES as readonly unknown[]).includes(value.context)) errors.push(`${location}.context: expected one of ${CONTEXT_MODES.join(", ")}`);
 	if (value.context_files !== undefined && typeof value.context_files !== "boolean") errors.push(`${location}.context_files: expected boolean`);
 	if (value.todo !== undefined && typeof value.todo !== "boolean") errors.push(`${location}.todo: expected boolean`);
+	if (value.mid_task_reports !== undefined && typeof value.mid_task_reports !== "boolean") errors.push(`${location}.mid_task_reports: expected boolean`);
 	if (value.system_prompt !== undefined && (typeof value.system_prompt !== "string" || !cleanText(value.system_prompt))) errors.push(`${location}.system_prompt: expected non-empty string`);
 	if (value.system_prompt_file !== undefined && (typeof value.system_prompt_file !== "string" || !cleanText(value.system_prompt_file))) errors.push(`${location}.system_prompt_file: expected non-empty string`);
 	if (value.system_prompt !== undefined && value.system_prompt_file !== undefined) errors.push(`${location}: system_prompt and system_prompt_file are mutually exclusive`);
@@ -69,7 +72,7 @@ function validateStartSpec(value: unknown, location: string): string[] {
 function validateBatchSpec(value: unknown, location: string): string[] {
 	const errors: string[] = [];
 	if (!isRecord(value)) return [`${location}: expected object`];
-	const allowed = new Set(["title", "shared_prompt", "role", "context_files", "todo", "agents"]);
+	const allowed = new Set(["title", "shared_prompt", "role", "context_files", "todo", "mid_task_reports", "agents"]);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`${location}.${key}: unknown property`);
 	for (const key of ["title", "shared_prompt"] as const) {
 		if (typeof value[key] !== "string" || !cleanText(value[key] as string)) errors.push(`${location}.${key}: required non-empty string`);
@@ -78,6 +81,7 @@ function validateBatchSpec(value: unknown, location: string): string[] {
 	if (value.role !== undefined && (typeof value.role !== "string" || !cleanText(value.role))) errors.push(`${location}.role: expected non-empty string`);
 	if (value.context_files !== undefined && typeof value.context_files !== "boolean") errors.push(`${location}.context_files: expected boolean`);
 	if (value.todo !== undefined && typeof value.todo !== "boolean") errors.push(`${location}.todo: expected boolean`);
+	if (value.mid_task_reports !== undefined && typeof value.mid_task_reports !== "boolean") errors.push(`${location}.mid_task_reports: expected boolean`);
 	if (!Array.isArray(value.agents) || value.agents.length === 0) errors.push(`${location}.agents: required non-empty array`);
 	else {
 		errors.push(...value.agents.flatMap((agent, index) => validateStartSpec(agent, `${location}.agents[${index}]`)));
@@ -123,6 +127,7 @@ export function parseStartRequest(value: unknown, location: string): ParsedStart
 				role: agent.role ?? batch.role,
 				context_files: agent.context_files ?? batch.context_files,
 				todo: agent.todo ?? batch.todo,
+				mid_task_reports: agent.mid_task_reports ?? batch.mid_task_reports,
 			})),
 			batch,
 		};
@@ -203,9 +208,11 @@ export function buildMainInstructions(roles: Map<string, SubagentRole>, canRepor
 - Children inherit the parent's working directory by default. Set cwd to use a different existing directory. For example, set cwd to a lead's Git worktree so its nested subagents inherit that worktree.
 - Child Pi context-file discovery defaults to enabled. Set context_files to false only when the user wants the child to ignore AGENTS.md and CLAUDE.md files; this does not restrict filesystem access or disable other project resources.
 - Child todo support defaults to off. Set todo to true only when the user explicitly asks for or allows todo support for that subagent.
+- Mid-task reports default to off. Set mid_task_reports to true only when the user wants unsolicited progress or blocker reports.
 - Reuse an existing subagent with subagent_send only when its previous context is useful. The tool accepts one ID, explicit IDs, one batch, or all active and parked direct agents.
 - Set all_active_and_parked to true only when the same instruction must reach every live direct subagent. Multi-target sends never continue completed sessions.
 - Use subagent_status only when current progress matters. Do not repeatedly poll. Status is compact and does not include transcripts or raw tool output.
+- Use subagent_wait_for_any only when further work depends on one active direct subagent finishing. A steering message ends only the wait.
 - Every subagent notifies you separately when its complete managed task finishes.
 - A model run can settle while owned subagents remain active. Pi keeps the session parked and wakes it for updates or parent instructions.
 - Process all required subagent results before you give your final task answer.

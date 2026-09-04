@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { WaitInterruptRegistry } from "./wait-interrupt.ts";
+import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
 
 describe("background wait interruption", () => {
 	test("interrupts every active wait for steering", () => {
