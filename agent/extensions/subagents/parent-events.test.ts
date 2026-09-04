@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatParentUpdates, takeParentUpdateBatch, type ParentUpdate } from "./parent-events.ts";
+import { consumeQueuedCompletion, formatParentUpdates, takeParentUpdateBatch, type ParentUpdate } from "./parent-events.ts";
 
 function completion(id: string, outcome: "completed" | "failed" = "completed") {
 	return {
@@ -76,5 +76,23 @@ describe("parent subagent updates", () => {
 		expect(selected[0]?.kind).toBe("completion");
 		expect(pending).toHaveLength(1);
 		expect(pending[0]?.kind).toBe("report");
+	});
+
+	test("consumes one manually read completion and keeps other queued results", () => {
+		const run = (id: string) => ({ ...completion(id), runId: `${id}-r1` });
+		const pending: ParentUpdate[] = [
+			{ kind: "completion", createdAt: 1, completion: run("sa-one") },
+			{
+				kind: "completion_group",
+				createdAt: 2,
+				label: "Batch",
+				completions: [run("sa-two"), run("sa-three")],
+			},
+		];
+
+		expect(consumeQueuedCompletion(pending, "sa-two", "sa-two-r1")).toBe(true);
+		expect(pending).toHaveLength(2);
+		expect(pending[1]?.kind === "completion_group" ? pending[1].completions.map((item) => item.id) : []).toEqual(["sa-three"]);
+		expect(consumeQueuedCompletion(pending, "missing", "missing-r1")).toBe(false);
 	});
 });

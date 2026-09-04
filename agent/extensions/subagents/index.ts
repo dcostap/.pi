@@ -79,6 +79,7 @@ import {
 import { isUnusedRpcStreamEvent } from "./rpc-event-filter.ts";
 import { childReportNotification, childRuntimeNotification, childTodoNotification, parseManagedChildEvent } from "./child-protocol.ts";
 import {
+	consumeQueuedCompletion,
 	formatParentUpdates,
 	takeParentUpdateBatch,
 	type ParentCompletionGroupUpdate,
@@ -1087,6 +1088,14 @@ class SubagentManager {
 		return this.pendingParentUpdates.reduce((count, update) => count + (
 			update.kind === "completion" ? 1 : update.kind === "completion_group" ? update.completions.length : 0
 		), 0);
+	}
+
+	consumeQueuedCompletion(id: string, runId: string): boolean {
+		const consumed = consumeQueuedCompletion(this.pendingParentUpdates, id, runId);
+		if (!consumed) return false;
+		this.deliveredCompletionKeys.add(`${id}:${runId}`);
+		this.emit({ kind: "changed", id });
+		return true;
 	}
 
 	takePendingParentUpdates(terminalOnly = false): ParentUpdate[] {
@@ -3504,16 +3513,18 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
-				const record = ensureManager(ctx).get(params.id);
+				const activeManager = ensureManager(ctx);
+				const record = activeManager.get(params.id);
 				if (record.state !== "cold" && (params.run_id === undefined || params.run_id === record.currentRunId)) {
 					throw new Error(`${record.id} is ${record.state}; its current managed run is not complete`);
 				}
 				const found = findRunResult(record, params.run_id);
 				if (!found.text) throw new Error(`${record.id}${found.runId ? ` ${found.runId}` : ""} has no final assistant answer.`);
+				const consumedQueuedCompletion = found.runId ? activeManager.consumeQueuedCompletion(record.id, found.runId) : false;
 				const truncated = truncateHead(found.text);
 				let text = `# Subagent result — ${record.title}\n\n> ${record.id}${found.runId ? ` · ${found.runId}` : ""} · ${record.lastOutcome}\n\n${truncated.content}`;
 				if (truncated.truncated) text += `\n\n[Result truncated. The complete answer remains in ${record.sessionFile}]`;
-				return result(text, { agent: compactRecord(record), runId: found.runId, truncated: truncated.truncated });
+				return result(text, { agent: compactRecord(record), runId: found.runId, truncated: truncated.truncated, consumedQueuedCompletion });
 			} catch (error) {
 				throw error instanceof Error ? error : new Error(String(error));
 			}

@@ -64,6 +64,46 @@ export function takeParentUpdateBatch(
 	return selected.sort((left, right) => left.createdAt - right.createdAt);
 }
 
+export function consumeQueuedCompletion(pending: ParentUpdate[], id: string, runId: string): boolean {
+	let consumed = false;
+	for (let index = pending.length - 1; index >= 0; index--) {
+		const update = pending[index]!;
+		if (update.kind === "report") continue;
+		if (update.kind === "completion") {
+			if (update.completion.id !== id || update.completion.runId !== runId) continue;
+			pending.splice(index, 1);
+			consumed = true;
+			continue;
+		}
+		const remaining = update.completions.filter((completion) => completion.id !== id || completion.runId !== runId);
+		if (remaining.length === update.completions.length) continue;
+		consumed = true;
+		if (remaining.length === 0) pending.splice(index, 1);
+		else update.completions = remaining;
+	}
+	return consumed;
+}
+
+export function consumeQueuedCompletion(pending: ParentUpdate[], id: string, runId: string): boolean {
+	let consumed = false;
+	for (let index = pending.length - 1; index >= 0; index--) {
+		const update = pending[index]!;
+		if (update.kind === "report") continue;
+		if (update.kind === "completion") {
+			if (update.completion.id !== id || update.completion.runId !== runId) continue;
+			pending.splice(index, 1);
+			consumed = true;
+			continue;
+		}
+		const remaining = update.completions.filter((completion) => completion.id !== id || completion.runId !== runId);
+		if (remaining.length === update.completions.length) continue;
+		consumed = true;
+		if (remaining.length === 0) pending.splice(index, 1);
+		else update.completions = remaining;
+	}
+	return consumed;
+}
+
 function outcomeTitle(outcome: CompletionSnapshot["outcome"]): string {
 	if (outcome === "completed") return "Managed subagent finished";
 	if (outcome === "failed") return "Managed subagent failed and finished";
