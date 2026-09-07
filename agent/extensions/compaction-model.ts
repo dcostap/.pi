@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { registerAutocompact } from "./_shared/autocompact.ts";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { streamSimple, type AssistantMessageEvent, type Usage } from "@earendil-works/pi-ai/compat";
 import {
@@ -696,7 +697,9 @@ async function showStatus(ctx: any): Promise<void> {
 }
 
 export default function compactionModelExtension(pi: ExtensionAPI) {
+	const blockAutomaticCompaction = registerAutocompact(pi);
 	pi.on("session_before_compact", async (event, ctx) => {
+		if (blockAutomaticCompaction(event)) return { cancel: true };
 		let configuredModel: string | undefined;
 		try {
 			const config = readConfig();
