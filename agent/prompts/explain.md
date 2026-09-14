@@ -1,0 +1,1 @@
+Explain it in a very didactical way, meant for me to learn and understand the key info that matters. Use examples, simple direct language, and focus on the key aspects. Build up each explanation in an understandable way.
