@@ -1,1 +1,1 @@
-Launch 3 concurrent `openai-codex-secondary/gpt-5.6-luna` models on `xhigh`  reasoning. Their task is to review the changes you made. You gather all their read-only conclusions and feedback, and decide on what to iterate / change / refactor / fix, if anything.
+Launch 3 concurrent `openai-codex/gpt-6-luna` models on `xhigh`  reasoning. Their task is to review the changes you made. You gather all their read-only conclusions and feedback, and decide on what to iterate / change / refactor / fix, if anything.
