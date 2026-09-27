@@ -171,6 +171,24 @@ export class BackgroundProcessManager {
 		return this.snapshotEntry(entry);
 	}
 
+	async startWithGracePeriod(
+		command: string,
+		title: string,
+		cwd: string,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<BackgroundProcessSnapshot> {
+		const started = this.start(command, title, cwd);
+		try {
+			const result = await this.wait([started.id], { timeoutMs, signal });
+			return result.settled[0] ?? started;
+		} catch (error) {
+			if (!(error instanceof WaitAbortedError)) throw error;
+			// Stopping this wait does not stop the background process.
+			return started;
+		}
+	}
+
 	get runningCount(): number {
 		let count = 0;
 		for (const entry of this.entries.values()) if (!entry.settled) count++;

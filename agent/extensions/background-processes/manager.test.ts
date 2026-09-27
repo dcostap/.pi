@@ -50,6 +50,59 @@ describe("BackgroundProcessManager", () => {
 		expect(manager.getDeferred().map((entry) => entry.id)).toEqual(["bg-1"]);
 	});
 
+	test("a quick command returns its completion and does not schedule automatic delivery", async () => {
+		const operations = new FakeOperations();
+		const manager = new BackgroundProcessManager(operations);
+		const started = manager.startWithGracePeriod("quick", "Quick", ".", 100);
+		operations.output("quick", "finished\n");
+		operations.complete("quick");
+		const result = await started;
+		expect(result).toMatchObject({ status: "done", settled: true, exitCode: 0, output: { text: "finished\n" } });
+		expect(manager.getDeferred()).toEqual([]);
+		expect(manager.get(result.id).automaticDelivery).toBe("consumed");
+	});
+
+	test("a quick failure returns its error and does not schedule automatic delivery", async () => {
+		const operations = new FakeOperations();
+		const manager = new BackgroundProcessManager(operations);
+		const started = manager.startWithGracePeriod("quick", "Quick", ".", 100);
+		operations.fail("quick", "spawn broke");
+		const result = await started;
+		expect(result).toMatchObject({ status: "failed", settled: true, errorText: "spawn broke" });
+		expect(manager.getDeferred()).toEqual([]);
+	});
+
+	test("an immediate launch failure is returned without a second completion", async () => {
+		const manager = new BackgroundProcessManager({
+			exec() { throw new Error("could not launch"); },
+		} as BashOperations);
+		const result = await manager.startWithGracePeriod("missing", "Missing", ".", 100);
+		expect(result).toMatchObject({ status: "failed", settled: true, errorText: "could not launch" });
+		expect(manager.getDeferred()).toEqual([]);
+	});
+
+	test("a slow command returns its ID after the grace period and delivers completion later", async () => {
+		const operations = new FakeOperations();
+		const manager = new BackgroundProcessManager(operations);
+		const result = await manager.startWithGracePeriod("slow", "Slow", ".", 20);
+		expect(result).toMatchObject({ id: "bg-1", status: "running", settled: false });
+		operations.complete("slow");
+		await tick();
+		expect(manager.getDeferred().map((entry) => entry.id)).toEqual(["bg-1"]);
+	});
+
+	test("an aborted grace wait leaves the command running and available for later delivery", async () => {
+		const operations = new FakeOperations();
+		const manager = new BackgroundProcessManager(operations);
+		const controller = new AbortController();
+		const started = manager.startWithGracePeriod("slow", "Slow", ".", 100, controller.signal);
+		controller.abort();
+		expect(await started).toMatchObject({ id: "bg-1", status: "running" });
+		operations.complete("slow");
+		await tick();
+		expect(manager.getDeferred().map((entry) => entry.id)).toEqual(["bg-1"]);
+	});
+
 	test("classifies nonzero exits and backend failures", async () => {
 		const operations = new FakeOperations();
 		const manager = new BackgroundProcessManager(operations);

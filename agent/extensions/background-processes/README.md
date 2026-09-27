@@ -6,7 +6,7 @@ It reuses Pi's public `createLocalBashOperations()` backend—the same local bac
 
 ## Tools
 
-- `bash_bg_start` — start a bash command and return immediately
+- `bash_bg_start` — wait up to two seconds, then return the completion result or the background ID
 - `bash_bg_status` — inspect one background bash process without waiting
 - `bash_bg_list` — list the 30 most recent tracked processes and summarize older history
 - `bash_bg_wait` — wait without polling; steering interrupts only the wait
@@ -28,6 +28,8 @@ Bash commands receive no stdin. Do not add `&`, `start`, `Start-Process`, `nohup
 A steering message interrupts an active `bash_bg_wait`. The underlying processes continue running. Managed subagent coordinators remain parked while owned background processes are active.
 
 Output is a merged stdout/stderr stream. Waiting shows a live, auto-truncated tail like Pi's built-in bash tool. Each process retains only its newest 1 MiB in memory, and output beyond Pi's standard 50KB/2000-line inline limit is also streamed to a temporary full-output file whose path is shown in tool results.
+
+If a command finishes during the first two seconds, `bash_bg_start` returns its completion output. It does not send a second completion message. Commands that continue past two seconds still send their completion message later.
 
 ## Tests
 
