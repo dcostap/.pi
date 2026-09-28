@@ -5,6 +5,7 @@ import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+	formatAutomaticResults,
 	formatKillResults,
 	formatList,
 	formatProcess,
@@ -45,6 +46,8 @@ const WaitParameters = Type.Object({
 	ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Background bash process IDs" }),
 	timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400, description: "Maximum wait in seconds" })),
 });
+
+const START_GRACE_MS = 2_000;
 
 export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	let manager: BackgroundProcessManager | undefined;
@@ -119,8 +122,8 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_start",
 		label: "bash background start",
-		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool and return immediately. Recent merged output is retained in bounded memory. Output beyond Pi's standard 50KB/2000-line inline limit is saved to a temporary full-output file.\n\n${BACKGROUND_PROCESS_PROMPT}`,
-		promptSnippet: "Start a long non-interactive bash command in the background; completion is delivered automatically",
+		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool. Wait up to two seconds for completion. Return the completion result if it finishes, or its background ID if it remains active. Recent merged output is retained in bounded memory. Output beyond Pi's standard 50KB/2000-line inline limit is saved to a temporary full-output file.\n\n${BACKGROUND_PROCESS_PROMPT}`,
+		promptSnippet: "Start a long non-interactive bash command; wait two seconds for a quick result, then deliver later completion automatically",
 		parameters: StartParameters,
 		renderCall(args, theme, context) {
 			return renderBackgroundToolCall("bash_bg_start", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
@@ -145,7 +148,13 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 			if (!info.isDirectory()) throw new Error(`Working directory is not a directory: ${cwd}`);
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
 
-			const started = ensureManager(ctx).start(command, title, cwd);
+			const started = await ensureManager(ctx).startWithGracePeriod(command, title, cwd, START_GRACE_MS, signal);
+			if (started.settled) {
+				return {
+					content: [{ type: "text", text: formatAutomaticResults([started]) }],
+					details: compactDetails(started),
+				};
+			}
 			return {
 				content: [{ type: "text", text: formatStartResult(started) }],
 				details: { id: started.id, title, cwd, status: started.status },

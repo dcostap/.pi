@@ -151,11 +151,26 @@ export function renderBackgroundToolResult(
 		return component;
 	}
 
+	if (toolName === "bash_bg_start" && isCompletedStart(result.details)) {
+		return renderBackgroundToolResult(
+			"bash_bg_status",
+			{ content: [{ type: "text", text: stripCompletionSummary(text) }] },
+			options,
+			theme,
+			component,
+		);
+	}
+
 	const lines = text.split("\n");
 	const visible = options.expanded ? lines : collapseResult(toolName, lines, options.isPartial);
 	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme, lookupProcess));
 	component.setText(`\n${styled.join("\n")}`);
 	return component;
+}
+
+function isCompletedStart(details: unknown): boolean {
+	if (!details || typeof details !== "object") return false;
+	return (details as { settledAt?: unknown }).settledAt !== undefined;
 }
 
 function formatIds(value: unknown, theme: Theme, lookupProcess?: BackgroundProcessLookup): string {

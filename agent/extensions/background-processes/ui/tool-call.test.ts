@@ -75,6 +75,16 @@ describe("background tool-result rendering", () => {
 		expect(collapsed).not.toContain("A background process finished.");
 	});
 
+	test("renders quick start completion like an automatic completion message", () => {
+		const content = "A background process finished.\n\n---\n\nbg-1 — Quick\nState: failed\nExit code: 2\n\nerror text";
+		const result = { content: [{ type: "text", text: content }], details: { settledAt: 100 } };
+		const rendered = renderBackgroundToolResult("bash_bg_start", result, { expanded: false, isPartial: false }, theme).render(200).join("\n");
+		const automatic = renderBackgroundCompletionMessage({ content }, { expanded: false }, theme).render(200).join("\n");
+		expect(rendered).toContain("bg-1 — Quick\nState: failed\nExit code: 2\n\nerror text");
+		expect(rendered).not.toContain("A background process finished.");
+		expect(automatic.split("\n").map((line) => line.trim()).join("\n")).toContain(rendered.trim());
+	});
+
 	test("separates and styles structured status from command output", () => {
 		const styledTheme = {
 			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
