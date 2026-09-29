@@ -1,4 +1,3 @@
-import { stream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -448,7 +447,7 @@ async function runTldr(
 		compactionSummary: clippedCompactionSummary,
 	});
 
-	const events = stream(
+	const events = ctx.modelRegistry.stream(
 		model,
 		{
 			systemPrompt: TLDR_SYSTEM_PROMPT,

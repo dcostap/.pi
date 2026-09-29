@@ -1,4 +1,3 @@
-import { complete } from "@earendil-works/pi-ai";
 import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, notifyModelRoleProblem, resolveModelRole } from "../../_shared/model-roles";
 
 type SparkProcessedContent = {
@@ -135,7 +134,7 @@ export async function processExtractedContentWithSpark(
 			.filter(Boolean)
 			.join("\n");
 
-		const response = await complete(
+		const response = await ctx.modelRegistry.complete(
 			model,
 			{
 				messages: [

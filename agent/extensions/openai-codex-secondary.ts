@@ -1,4 +1,5 @@
 import { ModelRuntime, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { providerAlias } from "./_shared/provider-alias.ts";
 
 const PRIMARY_PROVIDER_ID = "openai-codex";
 const SECONDARY_PROVIDER_ID = "openai-codex-secondary";
@@ -19,10 +20,5 @@ export default async function openaiCodexSecondary(pi: ExtensionAPI) {
   const primary = runtime.getProvider(PRIMARY_PROVIDER_ID);
   if (!primary) throw new Error(`${PRIMARY_PROVIDER_ID} is unavailable`);
 
-  pi.registerProvider({
-    ...primary,
-    id: SECONDARY_PROVIDER_ID,
-    name: SECONDARY_PROVIDER_NAME,
-    getModels: () => primary.getModels().map((model) => ({ ...model, provider: SECONDARY_PROVIDER_ID })),
-  });
+  pi.registerProvider(providerAlias(primary, SECONDARY_PROVIDER_ID, SECONDARY_PROVIDER_NAME));
 }

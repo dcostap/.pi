@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { registerAutocompact } from "./_shared/autocompact.ts";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
-import { streamSimple, type AssistantMessageEvent, type Usage } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessageEvent, Usage } from "@earendil-works/pi-ai";
 import {
 	compact,
 	convertToLlm,
@@ -348,7 +348,7 @@ function createProgressStreamFn(state: CompactionProgress): any {
 
 		let stream: any;
 		try {
-			stream = streamSimple(model, context, options);
+			stream = state.ctx.modelRegistry.streamSimple(model, context, options);
 		} catch (error) {
 			state.currentTerminal = "error";
 			state.currentPhase = `${state.currentPurpose} failed`;

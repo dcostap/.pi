@@ -5,7 +5,7 @@
  * then replaces the editor with `/name <suggestion>` so the user can press Enter.
  */
 
-import { complete, type Message } from "@earendil-works/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, resolveModelRole } from "./_shared/model-roles";
@@ -213,7 +213,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 					loader.onAbort = () => done(null);
 
 					const generate = async () => {
-						const response = await complete(
+						const response = await ctx.modelRegistry.complete(
 							model,
 							{
 								systemPrompt: SYSTEM_PROMPT,
