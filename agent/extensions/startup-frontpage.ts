@@ -613,10 +613,12 @@ function formatLineageRows(rows: LineageRow[], width: number, theme: Theme): str
 
 function brandLines(theme: Theme): string[] {
 	const art = [
-		"   __ ____",
-		"  | _ \\_ _|",
-		"  |  _/| |",
-		"  |_| |___|",
+		"",
+		"██████",
+		"██  ██",
+		"████  ██",
+		"██    ██",
+		"",
 	];
 
 	return [
