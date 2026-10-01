@@ -30,10 +30,11 @@ function fixture(mode = "regular", hardware = true) {
 
 describe("cursor render", () => {
 	test("hides the drawing cursor and ends the update after Pi restores it", () => {
-		const { tui, output } = fixture();
+		const { tui, output, writes } = fixture();
 		keepCursorInRender(tui);
 		tui.doRender();
 		expect(output()).toBe(HIDE + BEGIN + "text" + POSITION + SHOW + END);
+		expect(writes).toHaveLength(1);
 	});
 
 	test("keeps a covered cursor hidden inside the screen update", () => {
@@ -89,6 +90,8 @@ describe("cursor render", () => {
 	test("restores terminal.write and ends an open update after an error", () => {
 		const { tui, output } = fixture();
 		const write = tui.terminal.write;
+		const showCursor = tui.terminal.showCursor;
+		const hideCursor = tui.terminal.hideCursor;
 		tui.doRender = () => {
 			tui.terminal.write(BEGIN + "text");
 			throw new Error("render failed");
@@ -96,6 +99,8 @@ describe("cursor render", () => {
 		keepCursorInRender(tui);
 		expect(() => tui.doRender()).toThrow("render failed");
 		expect(tui.terminal.write).toBe(write);
+		expect(tui.terminal.showCursor).toBe(showCursor);
+		expect(tui.terminal.hideCursor).toBe(hideCursor);
 		expect(output()).toBe(HIDE + BEGIN + "text" + END);
 	});
 
@@ -129,8 +134,28 @@ describe("cursor render", () => {
 		const restore = keepCursorInRender(renderer);
 		renderer.doRender();
 		expect(Object.hasOwn(terminal, "write")).toBe(false);
+		expect(Object.hasOwn(terminal, "showCursor")).toBe(false);
+		expect(Object.hasOwn(terminal, "hideCursor")).toBe(false);
 		restore();
 		expect(Object.hasOwn(renderer, "doRender")).toBe(false);
 		expect(output()).toBe(HIDE + BEGIN + "text" + POSITION + SHOW + END);
+	});
+
+	test("streams large redraws without splitting a character", () => {
+		const { tui, output, writes } = fixture();
+		const text = "x".repeat(1024 * 1024 - HIDE.length - BEGIN.length - 1) + "😀tail";
+		tui.doRender = () => {
+			tui.terminal.write(BEGIN + text + END);
+			tui.terminal.write(POSITION);
+			tui.terminal.showCursor();
+		};
+		keepCursorInRender(tui);
+		tui.doRender();
+		expect(output()).toBe(HIDE + BEGIN + text + POSITION + SHOW + END);
+		for (const chunk of writes) {
+			expect(chunk.length).toBeLessThanOrEqual(1024 * 1024);
+			expect(chunk.endsWith("\ud83d")).toBe(false);
+			expect(chunk.startsWith("\ude00")).toBe(false);
+		}
 	});
 });
