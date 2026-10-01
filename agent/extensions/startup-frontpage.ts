@@ -623,7 +623,7 @@ function brandLines(theme: Theme): string[] {
 
 	return [
 		...art.map((line) => theme.bold(theme.fg("accent", line))),
-		theme.fg("dim", `  v${VERSION}`),
+		theme.fg("dim", `v${VERSION}`),
 	];
 }
 
