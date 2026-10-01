@@ -29,11 +29,11 @@ function fixture(mode = "regular", hardware = true) {
 }
 
 describe("cursor render", () => {
-	test("ends the screen update after cursor placement and visibility", () => {
+	test("hides the drawing cursor and ends the update after Pi restores it", () => {
 		const { tui, output } = fixture();
 		keepCursorInRender(tui);
 		tui.doRender();
-		expect(output()).toBe(BEGIN + "text" + POSITION + SHOW + END);
+		expect(output()).toBe(HIDE + BEGIN + "text" + POSITION + SHOW + END);
 	});
 
 	test("keeps a covered cursor hidden inside the screen update", () => {
@@ -44,7 +44,7 @@ describe("cursor render", () => {
 		};
 		keepCursorInRender(tui);
 		tui.doRender();
-		expect(output()).toBe(BEGIN + "dialog" + HIDE + END);
+		expect(output()).toBe(HIDE + BEGIN + "dialog" + HIDE + END);
 	});
 
 	test("passes cursor-only movement through without a screen update", () => {
@@ -71,7 +71,7 @@ describe("cursor render", () => {
 			};
 			keepCursorInRender(tui);
 			tui.doRender();
-			expect(output()).toBe(BEGIN + POSITION + SHOW + END);
+			expect(output()).toBe(HIDE + BEGIN + POSITION + SHOW + END);
 		}
 	});
 
@@ -83,7 +83,7 @@ describe("cursor render", () => {
 		};
 		keepCursorInRender(tui);
 		tui.doRender();
-		expect(output()).toBe(BEGIN + text + POSITION + END);
+		expect(output()).toBe(HIDE + BEGIN + text + POSITION + END);
 	});
 
 	test("restores terminal.write and ends an open update after an error", () => {
@@ -96,7 +96,7 @@ describe("cursor render", () => {
 		keepCursorInRender(tui);
 		expect(() => tui.doRender()).toThrow("render failed");
 		expect(tui.terminal.write).toBe(write);
-		expect(output()).toBe(BEGIN + "text" + END);
+		expect(output()).toBe(HIDE + BEGIN + "text" + END);
 	});
 
 	test("does not alter fullscreen or hidden-cursor rendering", () => {
@@ -117,7 +117,7 @@ describe("cursor render", () => {
 		expect(tui.doRender).toBe(render);
 		const restoreAgain = keepCursorInRender(tui);
 		tui.doRender();
-		expect(output()).toBe(BEGIN + "text" + POSITION + SHOW + END);
+		expect(output()).toBe(HIDE + BEGIN + "text" + POSITION + SHOW + END);
 		restoreAgain();
 	});
 
@@ -131,6 +131,6 @@ describe("cursor render", () => {
 		expect(Object.hasOwn(terminal, "write")).toBe(false);
 		restore();
 		expect(Object.hasOwn(renderer, "doRender")).toBe(false);
-		expect(output()).toBe(BEGIN + "text" + POSITION + SHOW + END);
+		expect(output()).toBe(HIDE + BEGIN + "text" + POSITION + SHOW + END);
 	});
 });

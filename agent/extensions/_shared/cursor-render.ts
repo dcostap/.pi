@@ -36,8 +36,11 @@ export function keepCursorInRender(tui: CursorRenderTui): () => void {
 			suffix = data.slice(end);
 			const complete = data.slice(0, end);
 			const output = complete.replaceAll(END_SYNCHRONIZED_OUTPUT, "");
+			// ConPTY can emit the drawing cursor before its final cursor update.
+			// Hide it during painting. Pi still owns the final visibility decision.
+			const hideCursor = !pendingEnd && complete.includes(BEGIN_SYNCHRONIZED_OUTPUT);
 			if (complete.includes(BEGIN_SYNCHRONIZED_OUTPUT) || output.length !== complete.length) pendingEnd = true;
-			if (output) write.call(terminal, output);
+			if (output) write.call(terminal, (hideCursor ? "\x1b[?25l" : "") + output);
 		};
 
 		try {
