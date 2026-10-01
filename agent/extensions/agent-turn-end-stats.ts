@@ -3,28 +3,26 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 
 export default function (pi: ExtensionAPI) {
   let totalStartMs = 0;
-  let estimatedOutputTokens = 0;
-  let activeStreamStartMs = 0;
-  let streamMs = 0;
+  let requestMs = 0;
+  let timedAssistantMessages = 0;
+  let requestTimingValid = true;
   let providerRequestCount = 0;
   let pendingProviderLatencyStartMs = 0;
   const providerLatenciesMs: number[] = [];
   let lastStats: string | undefined;
   let lastStatsAtMs = 0;
   let reshowStatsAfterCompaction = false;
-  let lastTokensPerSecondStatusMs = 0;
   const activeToolStarts = new Map<string, number>();
   const toolIntervals: Array<[number, number]> = [];
 
   function reset() {
     totalStartMs = 0;
-    estimatedOutputTokens = 0;
-    activeStreamStartMs = 0;
-    streamMs = 0;
+    requestMs = 0;
+    timedAssistantMessages = 0;
+    requestTimingValid = true;
     providerRequestCount = 0;
     pendingProviderLatencyStartMs = 0;
     providerLatenciesMs.length = 0;
-    lastTokensPerSecondStatusMs = 0;
     activeToolStarts.clear();
     toolIntervals.length = 0;
   }
@@ -67,9 +65,20 @@ export default function (pi: ExtensionAPI) {
     return Math.max(0, total);
   }
 
-  function estimateTokens(text: string) {
-    // Cheap streaming estimate. Final stats prefer provider-reported usage.output.
-    return Math.max(1, Math.ceil(text.length / 4));
+  function estimateOutputTokens(content: unknown) {
+    if (!Array.isArray(content)) return 0;
+    let characters = 0;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "text" && typeof block.text === "string") characters += block.text.length;
+      if (block.type === "thinking" && typeof block.thinking === "string") characters += block.thinking.length;
+      if (block.type === "toolCall") {
+        if (typeof block.name === "string") characters += block.name.length;
+        characters += (JSON.stringify(block.arguments ?? {}) ?? "").length;
+      }
+    }
+    // Round once per message, not once per streamed chunk.
+    return Math.ceil(characters / 4);
   }
 
   function formatTokens(tokens: number) {
@@ -77,13 +86,16 @@ export default function (pi: ExtensionAPI) {
     return `${(tokens / 1000).toFixed(1)}k`;
   }
 
-  function tokensPerSecond(tokens: number, elapsedMs: number) {
-    return tokens / Math.max(0.001, elapsedMs / 1000);
+  function tokensPerSecond(usage: TurnTokenUsage): number | null {
+    if (!requestTimingValid || timedAssistantMessages !== usage.assistantMessages || requestMs < 100) return null;
+    if (usage.output <= 0) return null;
+    const rate = usage.output * 1000 / requestMs;
+    return Number.isFinite(rate) ? rate : null;
   }
 
-  function formatTokenRate(tokens: number, elapsedMs: number, estimated = true) {
+  function formatTokenRate(rate: number, estimated: boolean) {
     const prefix = estimated ? "~" : "";
-    return `${prefix}${tokensPerSecond(tokens, elapsedMs).toFixed(1)} tok/s`;
+    return `${prefix}${rate.toFixed(1)} tok/s`;
   }
 
   function formatClock(date = new Date()) {
@@ -113,6 +125,11 @@ export default function (pi: ExtensionAPI) {
     cacheRead: number;
     cacheWrite: number;
     exact: boolean;
+    assistantMessages: number;
+  }
+
+  function validCount(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
   }
 
   function turnTokenUsage(messages: unknown[]): TurnTokenUsage {
@@ -121,13 +138,15 @@ export default function (pi: ExtensionAPI) {
       output: 0,
       cacheRead: 0,
       cacheWrite: 0,
-      exact: false,
+      exact: true,
+      assistantMessages: 0,
     };
 
     for (const message of messages) {
       if (!message || typeof message !== "object") continue;
       const maybeMessage = message as {
         role?: unknown;
+        content?: unknown;
         usage?: {
           input?: unknown;
           output?: unknown;
@@ -136,17 +155,20 @@ export default function (pi: ExtensionAPI) {
         };
       };
       if (maybeMessage.role !== "assistant") continue;
+      usage.assistantMessages++;
 
       const messageUsage = maybeMessage.usage;
-      if (!messageUsage) continue;
-      usage.exact = true;
-      if (typeof messageUsage.input === "number") usage.input += messageUsage.input;
-      if (typeof messageUsage.output === "number") usage.output += messageUsage.output;
-      if (typeof messageUsage.cacheRead === "number") usage.cacheRead += messageUsage.cacheRead;
-      if (typeof messageUsage.cacheWrite === "number") usage.cacheWrite += messageUsage.cacheWrite;
+      if (messageUsage && validCount(messageUsage.input)) usage.input += messageUsage.input;
+      if (messageUsage && validCount(messageUsage.cacheRead)) usage.cacheRead += messageUsage.cacheRead;
+      if (messageUsage && validCount(messageUsage.cacheWrite)) usage.cacheWrite += messageUsage.cacheWrite;
+      if (messageUsage && validCount(messageUsage.output)) {
+        usage.output += messageUsage.output;
+      } else {
+        usage.output += estimateOutputTokens(maybeMessage.content);
+        usage.exact = false;
+      }
     }
 
-    if (!usage.exact) usage.output = estimatedOutputTokens;
     return usage;
   }
 
@@ -157,27 +179,22 @@ export default function (pi: ExtensionAPI) {
     return parts.join(" ");
   }
 
-  function currentStreamMs() {
-    return streamMs + (activeStreamStartMs > 0 ? Date.now() - activeStreamStartMs : 0);
-  }
-
   function formatStats(
-    usage: TurnTokenUsage = { input: 0, output: estimatedOutputTokens, cacheRead: 0, cacheWrite: 0, exact: false },
+    usage: TurnTokenUsage,
+    rate: number | null,
     finishedAt = new Date(),
   ) {
     const totalMs = totalStartMs > 0 ? Date.now() - totalStartMs : 0;
     const toolMs = currentToolMs();
     const usagePart = formatUsage(usage);
-    const rateMs = currentStreamMs() || Math.max(0, totalMs - toolMs) || totalMs;
     const avgLatencyMs = average(providerLatenciesMs);
     const maxWidth = terminalWidth();
 
     const totalPart = `${formatDuration(totalMs)} total`;
     const toolPart = `${formatDuration(toolMs)} tools`;
     const latencyPart = avgLatencyMs > 0 ? `${formatDuration(avgLatencyMs)} avg latency` : undefined;
-    const usageRatePart = usage.output > 0
-      ? `${usagePart}${usagePart ? " · " : ""}${formatTokenRate(usage.output, rateMs, !usage.exact)}`
-      : undefined;
+    const usageRatePart = [usagePart, rate === null ? undefined : formatTokenRate(rate, !usage.exact)]
+      .filter(Boolean).join(" · ") || undefined;
     const clockPart = formatClock(finishedAt);
 
     const candidates = [
@@ -212,30 +229,25 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("message_update", async (event, ctx) => {
+  pi.on("message_update", async () => {
     if (pendingProviderLatencyStartMs > 0) {
       providerLatenciesMs.push(Date.now() - pendingProviderLatencyStartMs);
       pendingProviderLatencyStartMs = 0;
     }
-
-    const streamEvent = event.assistantMessageEvent;
-    if (streamEvent.type !== "text_delta" && streamEvent.type !== "thinking_delta") return;
-
-    estimatedOutputTokens += estimateTokens(streamEvent.delta);
-    if (activeStreamStartMs === 0) activeStreamStartMs = Date.now();
-
-    // Avoid redrawing the footer on every tiny chunk.
-    const now = Date.now();
-    if (now - lastTokensPerSecondStatusMs < 250) return;
-    lastTokensPerSecondStatusMs = now;
-
-    // Keep the estimate updated internally, but do not show live footer/status text.
   });
 
   pi.on("message_end", async (event) => {
-    if (event.message.role !== "assistant" || activeStreamStartMs === 0) return;
-    streamMs += Date.now() - activeStreamStartMs;
-    activeStreamStartMs = 0;
+    if (event.message.role !== "assistant") return;
+    const startedAt = event.message.timestamp;
+    const finishedAt = Date.now();
+    // Pi sets this timestamp before the request, not at the first visible token.
+    // Include hidden reasoning and request latency. Exclude time between requests.
+    if (!Number.isFinite(startedAt) || startedAt < totalStartMs || startedAt > finishedAt) {
+      requestTimingValid = false;
+      return;
+    }
+    requestMs += finishedAt - startedAt;
+    timedAssistantMessages++;
   });
 
   pi.on("tool_execution_start", async (event) => {
@@ -252,8 +264,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, ctx) => {
     const totalMs = totalStartMs > 0 ? Date.now() - totalStartMs : 0;
     const usage = turnTokenUsage(event.messages);
+    const rate = tokensPerSecond(usage);
     const finishedAt = new Date();
-    const stats = formatStats(usage, finishedAt);
+    const stats = formatStats(usage, rate, finishedAt);
 
     lastStats = stats;
     lastStatsAtMs = Date.now();
@@ -267,10 +280,11 @@ export default function (pi: ExtensionAPI) {
       cacheReadTokens: usage.cacheRead,
       cacheWriteTokens: usage.cacheWrite,
       estimatedTokens: !usage.exact,
-      streamMs: currentStreamMs(),
+      requestMs,
+      rateBasis: "full-request",
       avgLatencyMs: average(providerLatenciesMs),
       latenciesMs: [...providerLatenciesMs],
-      tokensPerSecond: tokensPerSecond(usage.output, currentStreamMs() || Math.max(0, totalMs - currentToolMs()) || totalMs),
+      tokensPerSecond: rate,
       timestamp: Date.now(),
     });
   });
