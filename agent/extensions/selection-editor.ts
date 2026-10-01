@@ -31,6 +31,7 @@ import { randomUUID } from "node:crypto";
 
 import { copyToClipboard, CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, decodeKittyPrintable, isKeyRelease, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { keepCursorInRender } from "./_shared/cursor-render.ts";
 
 type Pos = { line: number; col: number };
 type Range = { start: Pos; end: Pos };
@@ -1386,6 +1387,7 @@ class SelectionEditor extends CustomEditor {
 		const before = rawText.slice(0, cursorPos);
 		const after = rawText.slice(cursorPos);
 		const marker = emitCursorMarker ? CURSOR_MARKER : "";
+		const drawSoftwareCursor = !this.tui.getShowHardwareCursor();
 
 		if (after.length > 0) {
 			const firstGrapheme = [...this.i.segment(after)][0]?.segment || after[0] || "";
@@ -1394,7 +1396,9 @@ class SelectionEditor extends CustomEditor {
 				text:
 					stylePiece(before, startCol) +
 					marker +
-					`${REVERSE}${firstGrapheme}${RESET}` +
+					(drawSoftwareCursor
+						? `${REVERSE}${firstGrapheme}${RESET}`
+						: stylePiece(firstGrapheme, startCol + cursorPos)) +
 					stylePiece(rest, startCol + cursorPos + firstGrapheme.length),
 				width: lineVisibleWidth,
 				cursorInPadding,
@@ -1403,7 +1407,7 @@ class SelectionEditor extends CustomEditor {
 
 		lineVisibleWidth += 1;
 		return {
-			text: stylePiece(before, startCol) + marker + `${REVERSE} ${RESET}`,
+			text: stylePiece(before, startCol) + marker + (drawSoftwareCursor ? `${REVERSE} ${RESET}` : " "),
 			width: lineVisibleWidth,
 			cursorInPadding: true,
 		};
@@ -1709,6 +1713,7 @@ class SelectionEditor extends CustomEditor {
 
 export default function (pi: ExtensionAPI) {
 	let activeEditor: SelectionEditor | null = null;
+	let restoreCursorRender: (() => void) | null = null;
 
 	pi.on("session_start", (_event, ctx) => {
 		// The TUI accepts input before extension session_start handlers finish. Capture
@@ -1716,6 +1721,8 @@ export default function (pi: ExtensionAPI) {
 		const expandedTextBeforeSwap = ctx.ui.getEditorText();
 		const inlinePromptCandidates = loadInlinePromptCandidates(pi);
 		ctx.ui.setEditorComponent((tui, theme, kb) => {
+			restoreCursorRender?.();
+			restoreCursorRender = keepCursorInRender(tui);
 			activeEditor = new SelectionEditor(inlinePromptCandidates, tui, theme, kb);
 			return activeEditor;
 		});
@@ -1724,5 +1731,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", () => {
 		activeEditor?.resetAfterSubmit();
+	});
+
+	pi.on("session_shutdown", () => {
+		restoreCursorRender?.();
+		restoreCursorRender = null;
 	});
 }
