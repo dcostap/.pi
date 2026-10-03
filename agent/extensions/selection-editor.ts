@@ -1721,6 +1721,8 @@ export default function (pi: ExtensionAPI) {
 		const expandedTextBeforeSwap = ctx.ui.getEditorText();
 		const inlinePromptCandidates = loadInlinePromptCandidates(pi);
 		ctx.ui.setEditorComponent((tui, theme, kb) => {
+			// Anvil animates the terminal cursor. It needs Pi to show the real cursor.
+			tui.setShowHardwareCursor(true);
 			restoreCursorRender?.();
 			restoreCursorRender = keepCursorInRender(tui);
 			activeEditor = new SelectionEditor(inlinePromptCandidates, tui, theme, kb);
