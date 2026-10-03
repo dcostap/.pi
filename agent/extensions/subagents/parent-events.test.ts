@@ -66,6 +66,19 @@ describe("parent subagent updates", () => {
 		expect(pending.filter((item) => item.kind === "report")).toHaveLength(5);
 	});
 
+	test("delivers mid-task reports without a completion", () => {
+		const pending: ParentUpdate[] = [
+			{ kind: "report", id: "sa-live", title: "Live", createdAt: 1, message: "Need input." },
+		];
+		const selected = takeParentUpdateBatch(pending);
+		expect(selected).toHaveLength(1);
+		expect(pending).toHaveLength(0);
+		const text = formatParentUpdates(selected);
+		expect(text).toContain("## Mid-task report — Live");
+		expect(text).toContain("Need input.");
+		expect(text).not.toContain("Final result");
+	});
+
 	test("can take terminal updates without interrupting a tool loop for reports", () => {
 		const pending: ParentUpdate[] = [
 			{ kind: "report", id: "sa-live", title: "Live", createdAt: 1, message: "Progress" },

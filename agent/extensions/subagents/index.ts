@@ -1053,7 +1053,7 @@ class SubagentManager {
 				const settled = records
 					.filter((record, index) => record.state === "cold" && record.currentRunId === targets[index]!.runId)
 					.map((record) => record.latestCompletion ?? completionSnapshot(record));
-				if (!timedOut && settled.length === 0) return;
+				if (!timedOut && settled.length === 0 && !this.hasPendingParentUpdates()) return;
 				finished = true;
 				cleanup();
 				resolve({
@@ -1069,7 +1069,7 @@ class SubagentManager {
 				reject(new SubagentWaitAbortedError("Subagent wait aborted"));
 			};
 			const unsubscribe = this.subscribe((event) => {
-				if (event.kind === "settled") finish(false);
+				if (event.kind === "settled" || event.kind === "parent_update") finish(false);
 			});
 			timeout = setTimeout(() => finish(true), Math.max(0, timeoutMs));
 			if (signal?.aborted) onAbort();
@@ -1078,10 +1078,8 @@ class SubagentManager {
 		});
 	}
 
-	hasPendingParentUpdates(terminalOnly = false): boolean {
-		return terminalOnly
-			? this.pendingParentUpdates.some((update) => update.kind !== "report")
-			: this.pendingParentUpdates.length > 0;
+	hasPendingParentUpdates(): boolean {
+		return this.pendingParentUpdates.length > 0;
 	}
 
 	pendingCompletionCount(): number {
@@ -1098,8 +1096,8 @@ class SubagentManager {
 		return true;
 	}
 
-	takePendingParentUpdates(terminalOnly = false): ParentUpdate[] {
-		const updates = takeParentUpdateBatch(this.pendingParentUpdates, terminalOnly ? 0 : undefined);
+	takePendingParentUpdates(): ParentUpdate[] {
+		const updates = takeParentUpdateBatch(this.pendingParentUpdates);
 		for (const key of this.parentUpdateCompletionKeys(updates)) this.inFlightCompletionKeys.add(key);
 		return updates;
 	}
@@ -3025,10 +3023,10 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		latestCtx.ui.notify(childRuntimeNotification(pendingWork), "info");
 	};
 
-	const flushParentUpdates = async (deliverAs: "steer" | "followUp", terminalOnly = false): Promise<boolean> => {
+	const flushParentUpdates = async (deliverAs: "steer" | "followUp"): Promise<boolean> => {
 		const activeManager = manager;
-		if (parentUpdateFlushRunning || shuttingDown || !activeManager?.hasPendingParentUpdates(terminalOnly)) return false;
-		const updates = activeManager.takePendingParentUpdates(terminalOnly);
+		if (parentUpdateFlushRunning || shuttingDown || !activeManager?.hasPendingParentUpdates()) return false;
+		const updates = activeManager.takePendingParentUpdates();
 		if (updates.length === 0) return false;
 		parentUpdateFlushRunning = true;
 		try {
@@ -3398,29 +3396,31 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: WAIT_FOR_ANY_TOOL_NAME,
 		label: "Wait for Any Subagent",
-		description: "Wait until any active direct subagent finishes or the timeout expires. A steering message ends only this wait. Subagents continue running. The tool also releases queued completion updates.",
+		description: "Wait until a direct subagent finishes, sends a mid-task report, or the timeout expires. A steering message ends only this wait. Subagents continue running. The tool also releases queued subagent updates.",
 		parameters: Type.Object({
 			timeout_seconds: Type.Integer({ minimum: 1, maximum: 86400, description: "Maximum wait time in seconds." }),
 		}, { additionalProperties: false }),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const activeManager = ensureManager(ctx);
-			if (activeManager.hasPendingParentUpdates(true)) {
-				const delivered = await flushParentUpdates("steer", true);
-				return result("Released queued subagent completion updates without waiting.", { delivered, timedOut: false, settled: [], activeIds: activeManager.list().filter(isActive).map((record) => record.id) });
+			if (activeManager.hasPendingParentUpdates()) {
+				const delivered = await flushParentUpdates("steer");
+				return result("Released queued subagent updates without waiting.", { delivered, timedOut: false, settled: [], activeIds: activeManager.list().filter(isActive).map((record) => record.id) });
 			}
 			const wait = waitInterrupts.begin(signal);
 			try {
 				const waited = await activeManager.waitForAny(params.timeout_seconds * 1000, wait.signal);
-				const delivered = await flushParentUpdates("steer", true);
+				const delivered = await flushParentUpdates("steer");
 				const text = waited.settled.length > 0
 					? `${waited.settled.length} subagent${waited.settled.length === 1 ? "" : "s"} finished. Released queued completion updates.`
-					: waited.timedOut
-						? `Timed out after ${params.timeout_seconds}s. ${waited.activeIds.length} subagent${waited.activeIds.length === 1 ? " remains" : "s remain"} active.`
-						: "No direct subagents are active.";
+					: delivered
+						? "Released queued subagent updates. Subagents continue running."
+						: waited.timedOut
+							? `Timed out after ${params.timeout_seconds}s. ${waited.activeIds.length} subagent${waited.activeIds.length === 1 ? " remains" : "s remain"} active.`
+							: "No direct subagents are active.";
 				return result(text, { ...waited, delivered });
 			} catch (error) {
 				if (error instanceof SubagentWaitAbortedError && wait.reason() === "steer") {
-					const delivered = await flushParentUpdates("steer", true);
+					const delivered = await flushParentUpdates("steer");
 					return result("Subagent wait ended because a steering message arrived. Subagents continue running.", {
 						interruptedBySteer: true,
 						delivered,
