@@ -464,11 +464,62 @@ function pickRandom(): string {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on("turn_start", async (_event, ctx) => {
-    ctx.ui.setWorkingMessage(pickRandom());
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let message = "";
+
+  function stopTimer() {
+    if (timer !== undefined) clearInterval(timer);
+    timer = undefined;
+  }
+
+  pi.on("turn_start", (_event, ctx) => {
+    stopTimer();
+    if (ctx.mode !== "tui") return;
+
+    message = pickRandom();
+    ctx.ui.setWorkingMessage(message);
+    const startedAt = Date.now();
+    let displayedSeconds = 0;
+    timer = setInterval(() => {
+      const elapsedMs = Date.now() - startedAt;
+      const seconds = Math.floor(elapsedMs / 1000);
+      if (elapsedMs > 3000 && seconds !== displayedSeconds) {
+        displayedSeconds = seconds;
+        ctx.ui.setWorkingMessage(`${message} (${seconds}s)`);
+      }
+    }, 250);
+    timer.unref();
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  pi.on("message_update", (event, ctx) => {
+    if (timer === undefined) return;
+    const update = event.assistantMessageEvent;
+    // Stream metadata can arrive before the model sends any output.
+    const hasOutput = update.type === "toolcall_start" || (
+      (update.type === "text_delta" || update.type === "thinking_delta" || update.type === "toolcall_delta") &&
+      update.delta.length > 0
+    );
+    if (!hasOutput) return;
+
+    stopTimer();
+    ctx.ui.setWorkingMessage(message);
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    if (event.message.role !== "assistant" || timer === undefined) return;
+    stopTimer();
+    ctx.ui.setWorkingMessage(message);
+  });
+
+  pi.on("turn_end", (_event, ctx) => {
+    stopTimer();
     ctx.ui.setWorkingMessage(); // Reset for next time
   });
+
+  pi.on("agent_end", (_event, ctx) => {
+    stopTimer();
+    ctx.ui.setWorkingMessage();
+  });
+
+  pi.on("session_shutdown", stopTimer);
 }
