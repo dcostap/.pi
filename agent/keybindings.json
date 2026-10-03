@@ -1,8 +1,8 @@
 {
   "tui.editor.cursorLineStart": ["home"],
   "tui.editor.cursorLineEnd": ["end"],
-  "tui.altScreen.top": [],
-  "tui.altScreen.bottom": [],
+  "tui.altScreen.top": ["ctrl+home"],
+  "tui.altScreen.bottom": ["ctrl+end"],
   "tui.editor.deleteCharForward": ["delete"],
   "tui.editor.yank": [],
   "app.exit": [],
