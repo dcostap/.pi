@@ -10,6 +10,8 @@
 
 # Hand-picked core config
 !agent/keybindings.json
+!agent/settings.json
+!agent/models.json
 !agent/model-roles.example.json
 agent/model-roles.local.json
 
@@ -35,10 +37,8 @@ agent/extensions/**/coverage/
 agent/extensions/**/.cache/
 agent/extensions/**/.turbo/
 
-# Per-machine Pi config/auth/secrets
+# Per-machine Pi auth/secrets
 agent/auth.json
-agent/settings.json
-agent/models.json
 web-smart-fetch.json
 
 # Runtime/generated/bulky Pi state

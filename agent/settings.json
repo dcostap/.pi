@@ -1,0 +1,37 @@
+{
+  "lastChangelogVersion": "1.0.0",
+  "defaultProvider": "openai-codex-secondary",
+  "defaultModel": "gpt-6-sol",
+  "packages": [],
+  "defaultThinkingLevel": "high",
+  "enabledModels": [
+    "deepseek/deepseek-flash",
+    "openai-codex/gpt-6.1-sol",
+    "openai-codex-secondary/gpt-6.1-sol",
+    "openai-codex/gpt-6-luna",
+    "openai-codex-secondary/gpt-6-luna"
+  ],
+  "steeringMode": "all",
+  "theme": "light/dark",
+  "showCacheMissNotices": true,
+  "treeFilterMode": "no-tools",
+  "defaultProjectTrust": "always",
+  "collapseChangelog": true,
+  "hideThinkingBlock": false,
+  "quietStartup": true,
+  "modelThinkingLevels": {
+    "openai-codex/gpt-6-sol": "xhigh",
+    "openai-codex/gpt-6-luna": "max",
+    "openai-codex/gpt-5.6-luna": "xhigh",
+    "openai-codex/gpt-5.6-sol": "high",
+    "openai-codex-secondary/gpt-6-sol": "xhigh",
+    "openai-codex-secondary/gpt-6-luna": "max",
+    "openai-codex-secondary/gpt-6-astra": "medium",
+    "openai-codex-secondary/gpt-5.6-sol": "high",
+    "openai-codex-secondary/gpt-5.6-luna": "xhigh",
+    "openai-codex/gpt-6-astra": "medium",
+    "deepseek/deepseek-flash": "high"
+  },
+  "fullscreenCopyOnSelect": false,
+  "fullscreenWheelScrollLines": 6
+}
