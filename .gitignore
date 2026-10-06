@@ -9,6 +9,7 @@
 !agent/
 
 # Hand-picked core config
+!agent/AGENTS.md
 !agent/keybindings.json
 !agent/settings.json
 !agent/models.json
