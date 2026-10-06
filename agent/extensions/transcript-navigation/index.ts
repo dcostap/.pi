@@ -1,13 +1,13 @@
 import { copyToClipboard, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { TranscriptReader } from "./reader.ts";
-import { readRenderedTranscript } from "./snapshot.ts";
+import { readRenderedTranscript, scrollRenderedTranscript } from "./snapshot.ts";
 
 export default function (pi: ExtensionAPI) {
 	let active = false;
 	let closeActive: (() => void) | undefined;
 
 	pi.registerShortcut("f2", {
-		description: "Select and copy transcript text; F2 returns to the prompt",
+		description: "Select transcript blocks; F2 switches between blocks and caret navigation",
 		handler: async (ctx) => {
 			if (ctx.mode !== "tui" || active) return;
 			active = true;
@@ -24,8 +24,12 @@ export default function (pi: ExtensionAPI) {
 						return { render: () => [], invalidate() {} };
 					}
 					closeActive = done;
-					return new TranscriptReader(snapshot, tui, done, copyToClipboard,
+					const reader = new TranscriptReader(snapshot, tui, () => {
+						scrollRenderedTranscript(tui, reader.viewportTop);
+						done();
+					}, copyToClipboard,
 						(text) => theme.fg("muted", text));
+					return reader;
 				}, {
 					overlay: true,
 					overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 },
