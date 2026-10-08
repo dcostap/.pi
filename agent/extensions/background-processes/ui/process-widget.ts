@@ -1,49 +1,37 @@
-import { formatSize, type Theme } from "@earendil-works/pi-coding-agent";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { renderAlignedTable, type AlignedColumn } from "../../_shared/aligned-table.ts";
 import { createSpinnerTicker, spinnerFrame } from "../../_shared/spinner.ts";
 import { cleanInline, formatDuration } from "../formatting.ts";
 import type { BackgroundProcessSnapshot } from "../manager.ts";
 
-const MAX_WIDGET_ROWS = 8;
+const MAX_WIDGET_ROWS = 5;
 
 type ProcessWidgetRow = {
-	connector: string;
 	state: string;
 	id: string;
 	title: string;
 	duration: string;
-	outputSize: string;
 	activity: string;
 };
 
-// Keep identity and current activity visible. Duration and captured size are
-// lower-priority metrics and disappear before useful text on narrow terminals.
+// Identity first; the latest output line takes whatever width is left.
 const PROCESS_COLUMNS: readonly AlignedColumn<keyof ProcessWidgetRow>[] = [
-	{ key: "connector", minWidth: 3 },
-	{ key: "state", minWidth: 10 },
-	{ key: "id", minWidth: 8 },
-	{ key: "title", minWidth: 12, maxWidth: 46, shrinkPriority: 2 },
-	{ key: "duration", minWidth: 4, maxWidth: 10, align: "right", optional: true, hidePriority: 1 },
-	{ key: "outputSize", minWidth: 5, maxWidth: 9, align: "right", optional: true, hidePriority: 2 },
-	{ key: "activity", minWidth: 12, maxWidth: 80, shrinkPriority: 4 },
+	{ key: "state", minWidth: 1 },
+	{ key: "id", minWidth: 4 },
+	{ key: "title", minWidth: 8, maxWidth: 40, shrinkPriority: 2 },
+	{ key: "duration", minWidth: 3, maxWidth: 8, align: "right", optional: true, hidePriority: 1 },
+	{ key: "activity", minWidth: 8, maxWidth: 100, shrinkPriority: 4, optional: true, hidePriority: 2 },
 ];
 
-function stateText(snapshot: BackgroundProcessSnapshot, theme: Theme, now: number): string {
-	const state = snapshot.killRequested ? "stopping" : "running";
-	const color = snapshot.killRequested ? "warning" : "accent";
-	return theme.fg(color, `${spinnerFrame(now)} ${state}`);
-}
-
 function latestActivity(snapshot: BackgroundProcessSnapshot): string {
-	const command = cleanInline(snapshot.command);
-	const outputLines = snapshot.output.text
+	if (snapshot.killRequested) return "stopping…";
+	const latest = snapshot.output.text
 		.split(/\r?\n/gu)
 		.map(cleanInline)
-		.filter(Boolean);
-	const latest = outputLines.at(-1);
-	if (!command) return latest || "waiting for output";
-	return latest ? `$ ${command} · ${latest}` : `$ ${command}`;
+		.filter(Boolean)
+		.at(-1);
+	return latest ?? `$ ${cleanInline(snapshot.command)}`;
 }
 
 export function processWidgetLines(
@@ -52,31 +40,27 @@ export function processWidgetLines(
 	now = Date.now(),
 	width = Number.POSITIVE_INFINITY,
 ): string[] {
-	const running = snapshots.filter((snapshot) => !snapshot.settled).slice(0, MAX_WIDGET_ROWS);
-	if (running.length === 0) return [];
+	const allRunning = snapshots.filter((snapshot) => !snapshot.settled);
+	if (allRunning.length === 0) return [];
+	const running = allRunning.slice(-MAX_WIDGET_ROWS);
 
-	const stopping = running.filter((snapshot) => snapshot.killRequested).length;
-	const header = theme.fg("toolTitle", theme.bold("Background terminals"))
-		+ theme.fg(
-			"muted",
-			` · ${running.length} running${stopping ? ` · ${stopping} stopping` : ""} · /ps to inspect`,
-		);
-	const rows = running.map((snapshot, index): ProcessWidgetRow => ({
-		connector: theme.fg("dim", `${index === running.length - 1 ? "└─" : "├─"} `),
-		state: stateText(snapshot, theme, now),
+	const rows = running.map((snapshot): ProcessWidgetRow => ({
+		state: theme.fg(snapshot.killRequested ? "warning" : "accent", spinnerFrame(now)),
 		id: theme.fg("accent", snapshot.id),
-		title: theme.fg("muted", cleanInline(snapshot.title)),
+		title: theme.fg("toolOutput", cleanInline(snapshot.title)),
 		duration: theme.fg("dim", formatDuration(Math.max(0, now - snapshot.createdAt))),
-		outputSize: snapshot.output.totalBytes > 0 ? theme.fg("dim", formatSize(snapshot.output.totalBytes)) : "",
-		activity: theme.fg("muted", latestActivity(snapshot)),
+		activity: theme.fg("dim", latestActivity(snapshot)),
 	}));
 	const rendered = renderAlignedTable(rows, width, PROCESS_COLUMNS, {
 		gap: "  ",
 		visibleWidth,
 		truncate: (value, cellWidth) => truncateToWidth(value, cellWidth),
 	});
-	const omitted = snapshots.filter((snapshot) => !snapshot.settled).length - running.length;
-	if (omitted > 0) rendered.push(theme.fg("dim", `… ${omitted} more running terminal${omitted === 1 ? "" : "s"}`));
+	if (allRunning.length === 1) return rendered;
+
+	const omitted = allRunning.length - running.length;
+	const header = theme.fg("muted", `${allRunning.length} background processes · /ps to inspect`)
+		+ (omitted > 0 ? theme.fg("dim", ` · ${omitted} older not shown`) : "");
 	return [header, ...rendered];
 }
 

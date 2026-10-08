@@ -1,23 +1,17 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { highlightCode, keyHint } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
-import { normalizeTitle } from "../prompt.ts";
+import { formatSize, keyHint, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
+import { Box, Container, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { highlightBashCommand } from "../../_shared/bash-command-highlight.ts";
+import { formatDuration, type KillView, type ProcessView } from "../formatting.ts";
+import { normalizeTitle, stripBackgroundNotice } from "../prompt.ts";
 import { sanitizeTerminalText } from "../sanitize.ts";
 
-export type BackgroundToolName =
-	| "bash_bg_start"
-	| "bash_bg_status"
-	| "bash_bg_list"
-	| "bash_bg_wait"
-	| "bash_bg_kill";
+export type BackgroundToolName = "bash_bg_start" | "bash_bg_status" | "bash_bg_wait" | "bash_bg_kill";
 
-export interface BackgroundStartCallArgs {
+export interface BackgroundToolCallArgs {
 	command?: unknown;
 	title?: unknown;
 	working_dir?: unknown;
-}
-
-export interface BackgroundToolCallArgs extends BackgroundStartCallArgs {
 	id?: unknown;
 	ids?: unknown;
 	timeout_seconds?: unknown;
@@ -38,49 +32,23 @@ export interface BackgroundCompletionMessage {
 	details?: unknown;
 }
 
-export interface BackgroundProcessDisplay {
-	title: string | undefined;
-	command: string | undefined;
+export type BackgroundProcessLookup = (id: string) => { title: string | undefined } | undefined;
+
+/** Details of a foreground bash call that was moved to the background. */
+export interface BashTransferView {
+	id: string;
+	reason: "timeout" | "steer";
+	timeoutSeconds: number;
 }
 
-export type BackgroundProcessLookup = (id: string) => BackgroundProcessDisplay | undefined;
+/** Collapsed output height, matching Pi's built-in bash tool. */
+const PREVIEW_LINES = 5;
+/** Per-process output height when one row shows several processes. */
+const MULTI_PREVIEW_LINES = 3;
+const LIST_COLLAPSED_ROWS = 8;
 
-/** Render automatic completion delivery with the same shell as a completed tool row. */
-export function renderBackgroundCompletionMessage(
-	message: BackgroundCompletionMessage,
-	options: Pick<BackgroundToolResultOptions, "expanded">,
-	theme: Theme,
-): Box {
-	const processes = completionProcesses(message.details);
-	const label = processes.length === 0
-		? "completion"
-		: `completion · ${processes.map((process) => (
-			formatCompletionProcess(process)
-		)).join(", ")}`;
-	const box = new Box(1, 1, (line) => theme.bg("toolSuccessBg", line));
-	box.addChild(new Text(
-		theme.fg("toolTitle", theme.bold("bash_bg_start")) + theme.fg("muted", ` ${label}`),
-		0,
-		0,
-	));
-	box.addChild(renderBackgroundToolResult(
-		"bash_bg_status",
-		{ content: [{ type: "text", text: stripCompletionSummary(message.content) }] },
-		{ expanded: options.expanded, isPartial: false },
-		theme,
-		undefined,
-		false,
-	));
-	return box;
-}
-
-export function renderBackgroundStartCall(
-	args: BackgroundStartCallArgs,
-	theme: Theme,
-	previous?: Text,
-): Text {
-	return renderBackgroundToolCall("bash_bg_start", args, theme, previous);
-}
+// ---------------------------------------------------------------------------
+// Tool call rows
 
 export function renderBackgroundToolCall(
 	toolName: BackgroundToolName,
@@ -90,248 +58,293 @@ export function renderBackgroundToolCall(
 	lookupProcess?: BackgroundProcessLookup,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
-	const prefix = theme.fg("toolTitle", theme.bold(toolName));
 
 	if (toolName === "bash_bg_start") {
-		const command = stringArg(args.command, false);
+		const command = typeof args.command === "string" ? sanitizeTerminalText(args.command) : "";
 		const title = typeof args.title === "string" ? cleanInline(normalizeTitle(args.title)) : "";
-		const workingDirectory = stringArg(args.working_dir);
-		const commandDisplay = command || "...";
-		const qualifiers = [title, workingDirectory ? `in ${workingDirectory}` : ""].filter(Boolean);
-		const suffix = qualifiers.length > 0 ? theme.fg("muted", ` (${qualifiers.join(" • ")})`) : "";
-		const highlightedCommand = command
-			? highlightCode(commandDisplay, "bash").join("\n")
-			: theme.fg("toolOutput", commandDisplay);
-		component.setText(`${prefix} ${theme.fg("toolTitle", theme.bold("$ "))}${highlightedCommand}${suffix}`);
+		const workingDirectory = typeof args.working_dir === "string" ? cleanInline(args.working_dir) : "";
+		const qualifiers = ["background", title, workingDirectory ? `in ${workingDirectory}` : ""].filter(Boolean);
+		const commandDisplay = command ? highlightBashCommand(command) : theme.fg("toolOutput", "...");
+		component.setText(
+			theme.fg("toolTitle", theme.bold("$ ")) + commandDisplay + theme.fg("muted", ` (${qualifiers.join(" · ")})`),
+		);
 		return component;
 	}
 
-	if (toolName === "bash_bg_status") {
-		component.setText(`${prefix}${formatIds([args.id], theme, lookupProcess)}`);
-		return component;
-	}
-
-	if (toolName === "bash_bg_wait") {
-		const timeout = typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined;
-		const suffix = timeout === undefined ? "" : theme.fg("muted", ` (timeout ${timeout}s)`);
-		component.setText(`${prefix}${formatIds(args.ids, theme, lookupProcess)}${suffix}`);
-		return component;
-	}
-
-	if (toolName === "bash_bg_kill") {
-		component.setText(`${prefix}${formatIds(args.ids, theme, lookupProcess)}`);
-		return component;
-	}
-
-	component.setText(prefix);
+	const label = toolName === "bash_bg_status" ? "bg status" : toolName === "bash_bg_wait" ? "bg wait" : "bg stop";
+	const ids = toolName === "bash_bg_status" ? idList(args.id) : idList(args.ids);
+	const target = toolName === "bash_bg_status" && ids.length === 0
+		? theme.fg("muted", " all processes")
+		: formatIds(ids, theme, lookupProcess);
+	const timeout = toolName === "bash_bg_wait" && typeof args.timeout_seconds === "number"
+		? theme.fg("muted", ` (timeout ${args.timeout_seconds}s)`)
+		: "";
+	component.setText(theme.fg("toolTitle", theme.bold(label)) + target + timeout);
 	return component;
 }
+
+function idList(value: unknown): string[] {
+	const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+	return values.filter((item): item is string => typeof item === "string").map(cleanInline).filter(Boolean);
+}
+
+function formatIds(ids: string[], theme: Theme, lookupProcess?: BackgroundProcessLookup): string {
+	if (ids.length === 0) return "";
+	return ` ${ids.map((id) => {
+		const title = lookupProcess?.(id)?.title;
+		return theme.fg("accent", id) + (title ? theme.fg("muted", ` ${cleanInline(title)}`) : "");
+	}).join(theme.fg("muted", ", "))}`;
+}
+
+// ---------------------------------------------------------------------------
+// Tool result rows
 
 export function renderBackgroundToolResult(
 	toolName: BackgroundToolName,
 	result: BackgroundToolResult,
 	options: BackgroundToolResultOptions,
 	theme: Theme,
-	previous?: Text,
+	previous?: Component,
 	isError = false,
-	lookupProcess?: BackgroundProcessLookup,
-): Text {
-	const component = previous ?? new Text("", 0, 0);
-	const text = sanitizeTerminalText(
-		result.content.find((item) => item.type === "text" && typeof item.text === "string")?.text ?? "",
-	).trimEnd();
-
-	if (!text) {
-		component.setText("");
-		return component;
-	}
+): Component {
+	const component = previous instanceof Container ? previous : new Container();
+	component.clear();
+	const text = stripBackgroundNotice(sanitizeTerminalText(textContent(result)).trimEnd());
+	const details = (result.details ?? {}) as Record<string, unknown>;
 
 	if (isError) {
-		component.setText(`\n${text.split("\n").map((line) => theme.fg("error", line)).join("\n")}`);
+		if (text) component.addChild(new Text(`\n${text.split("\n").map((line) => theme.fg("error", line)).join("\n")}`, 0, 0));
+		return component;
+	}
+	if (options.expanded && !options.isPartial && text) {
+		component.addChild(new Text(`\n${text.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n")}`, 0, 0));
 		return component;
 	}
 
-	if (toolName === "bash_bg_start" && isCompletedStart(result.details)) {
-		return renderBackgroundToolResult(
-			"bash_bg_status",
-			{ content: [{ type: "text", text: stripCompletionSummary(text) }] },
-			options,
-			theme,
-			component,
-		);
+	const single = asView(details.process);
+	const many = Array.isArray(details.processes) ? details.processes.map(asView).filter((view) => view !== undefined) : [];
+
+	if (toolName === "bash_bg_start" && single) {
+		if (single.settled) addProcessBlock(component, single, theme, options.expanded, PREVIEW_LINES);
+		else component.addChild(new Text(`\n${theme.fg("muted", "→ running in background as ")}${theme.fg("accent", single.id)}`, 0, 0));
+		return component;
 	}
 
-	const lines = text.split("\n");
-	const visible = options.expanded ? lines : collapseResult(toolName, lines, options.isPartial);
-	const styled = visible.map((line) => styleResultLine(toolName, line, options.isPartial, theme, lookupProcess));
-	component.setText(`\n${styled.join("\n")}`);
+	if (toolName === "bash_bg_status" && single) {
+		addProcessBlock(component, single, theme, options.expanded, PREVIEW_LINES);
+		return component;
+	}
+
+	if (toolName === "bash_bg_status" && Array.isArray(details.processes)) {
+		addProcessList(component, many, Number(details.omitted) || 0, theme, options.expanded);
+		return component;
+	}
+
+	if (toolName === "bash_bg_wait" && many.length > 0) {
+		if (many.length === 1) addProcessBlock(component, many[0]!, theme, options.expanded, PREVIEW_LINES);
+		else for (const view of many) addProcessBlock(component, view, theme, options.expanded, MULTI_PREVIEW_LINES, true);
+		const running = many.filter((view) => !view.settled).map((view) => view.id);
+		if (!options.isPartial && running.length > 0) {
+			const reason = details.interruptedBySteer
+				? "wait interrupted by your message"
+				: `wait timed out${typeof details.timeoutSeconds === "number" ? ` after ${details.timeoutSeconds}s` : ""}`;
+			component.addChild(new Text(`\n${theme.fg("warning", `${reason} · still running: ${running.join(", ")}`)}`, 0, 0));
+		}
+		return component;
+	}
+
+	if (toolName === "bash_bg_kill" && Array.isArray(details.results)) {
+		const lines = (details.results as unknown[]).flatMap((value) => {
+			const item = value as Partial<KillView> | undefined;
+			const view = asView(item?.process);
+			return view && item?.outcome ? [killLine(item.outcome, view, theme)] : [];
+		});
+		component.addChild(new Text(`\n${lines.join("\n")}`, 0, 0));
+		return component;
+	}
+
+	// Results from older sessions or unexpected shapes: show the text like bash output.
+	if (text) addOutputPreview(component, text, theme, options.expanded, PREVIEW_LINES);
 	return component;
 }
 
-function isCompletedStart(details: unknown): boolean {
-	if (!details || typeof details !== "object") return false;
-	return (details as { settledAt?: unknown }).settledAt !== undefined;
+/** Status line added below a foreground bash result that moved to the background. */
+export function renderBashTransferLine(transfer: BashTransferView, theme: Theme): Text {
+	const reason = transfer.reason === "steer" ? "you sent a message" : `still running after ${transfer.timeoutSeconds}s`;
+	return new Text(
+		`\n${theme.fg("warning", "→ moved to background as ")}${theme.fg("accent", theme.bold(transfer.id))}${theme.fg("muted", ` · ${reason}`)}`,
+		0,
+		0,
+	);
 }
 
-function formatIds(value: unknown, theme: Theme, lookupProcess?: BackgroundProcessLookup): string {
-	const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
-	const ids = values.filter((item): item is string => typeof item === "string").map(cleanInline);
-	if (ids.length === 0) return "";
-	const rendered = ids.map((id) => {
-		const process = lookupProcess?.(id);
-		const details = [
-			process?.title ? cleanInline(process.title) : "",
-			process?.command ? `$ ${cleanInline(process.command)}` : "",
-		].filter(Boolean);
-		return details.length > 0
-			? `${theme.fg("accent", id)} ${theme.fg("muted", `(${details.join(" • ")})`)}`
-			: theme.fg("accent", id);
+export function asBashTransfer(value: unknown): BashTransferView | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const transfer = value as Partial<BashTransferView>;
+	if (typeof transfer.id !== "string" || (transfer.reason !== "timeout" && transfer.reason !== "steer")) return undefined;
+	return { id: transfer.id, reason: transfer.reason, timeoutSeconds: Number(transfer.timeoutSeconds) || 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Automatic completion messages
+
+export function renderBackgroundCompletionMessage(
+	message: BackgroundCompletionMessage,
+	options: Pick<BackgroundToolResultOptions, "expanded">,
+	theme: Theme,
+): Box {
+	const details = (message.details ?? {}) as { processes?: unknown };
+	const views = Array.isArray(details.processes) ? details.processes.map(asView).filter((view) => view !== undefined) : [];
+	const failed = views.some((view) => view.status === "failed");
+	const box = new Box(1, 1, (line) => theme.bg(failed ? "toolErrorBg" : "toolSuccessBg", line));
+	const body = new Container();
+
+	if (options.expanded || views.length === 0) {
+		const text = sanitizeTerminalText(message.content).trimEnd();
+		body.addChild(new Text(theme.fg("toolTitle", theme.bold("background process finished")), 0, 0));
+		addOutputPreview(body, text, theme, options.expanded, PREVIEW_LINES);
+	} else {
+		views.forEach((view, index) => {
+			body.addChild(new Text(`${index === 0 ? "" : "\n"}${processHeadline(view, theme, true)}`, 0, 0));
+			if (view.preview) addOutputPreview(body, view.preview, theme, false, views.length === 1 ? PREVIEW_LINES : MULTI_PREVIEW_LINES);
+		});
+	}
+	box.addChild(body);
+	return box;
+}
+
+// ---------------------------------------------------------------------------
+// Building blocks
+
+function addProcessBlock(
+	container: Container,
+	view: ProcessView,
+	theme: Theme,
+	expanded: boolean,
+	previewLines: number,
+	withHeadline = false,
+): void {
+	if (withHeadline) container.addChild(new Text(`\n${processHeadline(view, theme, false)}`, 0, 0));
+	if (view.preview) addOutputPreview(container, view.preview, theme, expanded, previewLines);
+	else if (!withHeadline) container.addChild(new Text(`\n${theme.fg("muted", view.settled ? "(no output)" : "(no output yet)")}`, 0, 0));
+	if (view.errorText) container.addChild(new Text(theme.fg("error", cleanInline(view.errorText)), 0, 0));
+	if (view.fullOutputPath) container.addChild(new Text(`\n${theme.fg("warning", `[Full output: ${view.fullOutputPath}]`)}`, 0, 0));
+	if (!withHeadline) container.addChild(new Text(`\n${statusFooter(view, theme)}`, 0, 0));
+}
+
+function addProcessList(container: Container, views: ProcessView[], omitted: number, theme: Theme, expanded: boolean): void {
+	if (views.length === 0) {
+		container.addChild(new Text(`\n${theme.fg("muted", "No background processes.")}`, 0, 0));
+		return;
+	}
+	const visible = expanded ? views : views.slice(-LIST_COLLAPSED_ROWS);
+	const hidden = views.length - visible.length + omitted;
+	const lines = visible.map((view) => processHeadline(view, theme, false));
+	if (hidden > 0) lines.unshift(theme.fg("muted", `... (${hidden} older,`) + ` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`);
+	container.addChild(new Text(`\n${lines.join("\n")}`, 0, 0));
+}
+
+/** One line: icon, id, title, and status summary. */
+function processHeadline(view: ProcessView, theme: Theme, finishedWording: boolean): string {
+	const [icon, color] = statusIcon(view);
+	const verb = finishedWording && view.status === "done" ? "finished" : statusWord(view);
+	return [
+		theme.fg(color, icon),
+		theme.fg("accent", theme.bold(view.id)),
+		theme.fg("toolOutput", cleanInline(view.title)),
+		theme.fg("muted", `· ${[verb, formatDuration(view.elapsedMs)].join(" · ")}`),
+	].join(" ");
+}
+
+function statusFooter(view: ProcessView, theme: Theme): string {
+	const [icon, color] = statusIcon(view);
+	const parts = [formatDuration(view.elapsedMs)];
+	if (view.capturedBytes > 0) parts.push(formatSize(view.capturedBytes));
+	return `${theme.fg(color, `${icon} ${statusWord(view)}`)}${theme.fg("muted", ` · ${parts.join(" · ")}`)}`;
+}
+
+function statusIcon(view: ProcessView): [string, "accent" | "success" | "error" | "warning"] {
+	if (!view.settled) return ["●", view.killRequested ? "warning" : "accent"];
+	if (view.status === "done") return ["✓", "success"];
+	if (view.status === "killed") return ["■", "warning"];
+	return ["✗", "error"];
+}
+
+function statusWord(view: ProcessView): string {
+	if (!view.settled) return view.killRequested ? "stopping" : "running";
+	if (view.status === "killed") return "stopped";
+	if (view.exitCode !== undefined && view.exitCode !== null) return `exit ${view.exitCode}`;
+	return view.status;
+}
+
+function killLine(outcome: KillView["outcome"], view: ProcessView, theme: Theme): string {
+	const name = `${theme.fg("accent", theme.bold(view.id))} ${theme.fg("toolOutput", cleanInline(view.title))}`;
+	switch (outcome) {
+		case "killed":
+			return `${theme.fg("warning", "■")} ${name} ${theme.fg("muted", "stopped")}`;
+		case "already-settled":
+			return `${theme.fg("muted", "·")} ${name} ${theme.fg("muted", `had already finished (${statusWord(view)})`)}`;
+		case "settled-after-request":
+			return `${theme.fg("muted", "·")} ${name} ${theme.fg("muted", `finished on its own (${statusWord(view)})`)}`;
+		case "termination-pending":
+			return `${theme.fg("warning", "●")} ${name} ${theme.fg("warning", "stop requested; not yet confirmed")}`;
+	}
+}
+
+/** Output styled and collapsed like Pi's bash tool: the last lines by visual height, with an expand hint. */
+function addOutputPreview(container: Container, text: string, theme: Theme, expanded: boolean, maxLines: number): void {
+	const output = text.replace(/\s+$/u, "");
+	if (!output) return;
+	const styled = output.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n");
+	if (expanded) {
+		container.addChild(new Text(`\n${styled}`, 0, 0));
+		return;
+	}
+	let cachedWidth: number | undefined;
+	let cachedLines: string[] = [];
+	container.addChild({
+		render(width: number): string[] {
+			if (cachedWidth !== width) {
+				const preview = truncateToVisualLines(styled, maxLines, width, 0, "end");
+				const hint = preview.skippedCount > 0
+					? [truncateToWidth(
+						theme.fg("muted", `... (${preview.skippedCount} earlier lines,`) + ` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+						width,
+						"...",
+					)]
+					: [];
+				cachedLines = ["", ...hint, ...preview.visualLines];
+				cachedWidth = width;
+			}
+			return cachedLines;
+		},
+		invalidate() {
+			cachedWidth = undefined;
+		},
 	});
-	return ` ${rendered.join(", ")}`;
 }
 
-function stringArg(value: unknown, inline = true): string {
-	if (typeof value !== "string") return "";
-	return inline ? cleanInline(value) : sanitizeTerminalText(value);
+function asView(value: unknown): ProcessView | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const view = value as Partial<ProcessView>;
+	if (typeof view.id !== "string" || typeof view.status !== "string") return undefined;
+	return {
+		...view,
+		id: view.id,
+		title: typeof view.title === "string" ? view.title : view.id,
+		command: typeof view.command === "string" ? view.command : "",
+		status: view.status,
+		settled: view.settled ?? view.status !== "running",
+		killRequested: view.killRequested ?? false,
+		elapsedMs: typeof view.elapsedMs === "number" ? view.elapsedMs : 0,
+		capturedBytes: typeof view.capturedBytes === "number" ? view.capturedBytes : 0,
+	} as ProcessView;
+}
+
+function textContent(result: BackgroundToolResult): string {
+	return result.content.find((item) => item.type === "text" && typeof item.text === "string")?.text ?? "";
 }
 
 function cleanInline(value: string): string {
 	return sanitizeTerminalText(value).replace(/[\r\n]+/gu, " ").replace(/\s+/gu, " ").trim();
-}
-
-function styleResultLine(
-	toolName: BackgroundToolName,
-	line: string,
-	isPartial: boolean,
-	theme: Theme,
-	lookupProcess?: BackgroundProcessLookup,
-): string {
-	if (!line) return "";
-	if (line === "---") return theme.fg("borderMuted", line);
-	if (/^\.\.\. \(\d+ (?:hidden|earlier) lines,/u.test(line)) return theme.fg("muted", line);
-	if (/^\[(?:Full output|Output truncated|Response truncated|Only the newest)/u.test(line)) return theme.fg("warning", line);
-	if (/^\((?:no output|no output yet)\)$/u.test(line)) return theme.fg("muted", line);
-	if (/^(?:Elapsed|Took) \d/u.test(line)) return theme.fg("muted", line);
-	if (isPartial && /^Waiting for background process output/u.test(line)) return theme.fg("warning", line);
-	if (/^Use bash_bg_/u.test(line)) return theme.fg("dim", line);
-	if (/^(?:All requested background processes settled\.|No background processes are tracked\.)$/u.test(line)) {
-		return theme.fg("success", line);
-	}
-	if (/^Wait timed out\./u.test(line)) return theme.fg("warning", line);
-
-	const started = line.match(/^Started (bg-\d+):\s*(.*)$/u);
-	if (started) {
-		return `${theme.fg("success", "Started")} ${theme.fg("accent", theme.bold(started[1]!))}: ${theme.fg("toolOutput", started[2]!)}`;
-	}
-
-	const processTitle = line.match(/^(bg-\d+) — (.*)$/u);
-	if (processTitle) {
-		return `${theme.fg("accent", theme.bold(processTitle[1]!))} ${theme.fg("muted", "—")} ${theme.fg("toolOutput", processTitle[2]!)}`;
-	}
-
-	const listEntry = line.match(/^(bg-\d+) \[([^\]]+)\] (.*)$/u);
-	if (listEntry) {
-		return `${theme.fg("accent", theme.bold(listEntry[1]!))} ${styleStatus(`[${listEntry[2]}]`, theme)} ${theme.fg("toolOutput", listEntry[3]!)}`;
-	}
-
-	const killEntry = line.match(/^(bg-\d+)(?: \((.*)\))?:\s*(.*)$/u);
-	if (toolName === "bash_bg_kill" && killEntry) {
-		const id = killEntry[1]!;
-		const title = killEntry[2] || lookupProcess?.(id)?.title;
-		const outcome = killEntry[3]!;
-		const alias = title ? ` ${theme.fg("muted", `(${cleanInline(title)})`)}` : "";
-		const color = /pending|requested but/u.test(outcome) ? "warning" : "success";
-		return `${theme.fg("accent", theme.bold(id))}${alias}: ${theme.fg(color, outcome)}`;
-	}
-
-	const labeled = line.match(/^([A-Za-z ]+):\s*(.*)$/u);
-	if (labeled) {
-		const label = labeled[1]!;
-		const value = labeled[2]!;
-		if (label === "State") return `${theme.fg("muted", `${label}:`)} ${styleStatus(value, theme)}`;
-		if (label === "Error") return `${theme.fg("error", `${label}:`)} ${theme.fg("error", value)}`;
-		if (label === "Command") return `${theme.fg("muted", `${label}:`)} ${theme.fg("toolTitle", value)}`;
-		return `${theme.fg("muted", `${label}:`)} ${theme.fg("toolOutput", value)}`;
-	}
-
-	return theme.fg("toolOutput", line);
-}
-
-function styleStatus(value: string, theme: Theme): string {
-	const normalized = value.toLowerCase();
-	const color = normalized.includes("failed")
-		? "error"
-		: normalized.includes("killed") || normalized.includes("stopping")
-			? "warning"
-			: normalized.includes("running")
-				? "accent"
-				: "success";
-	return theme.fg(color, value);
-}
-
-function collapseResult(toolName: BackgroundToolName, lines: string[], isPartial: boolean): string[] {
-	if (toolName === "bash_bg_wait" && isPartial) return collapseWaitPreview(lines);
-
-	const limit = toolName === "bash_bg_status" ? 14 : toolName === "bash_bg_wait" ? 22 : 18;
-	if (toolName === "bash_bg_start" || lines.length <= limit) return lines;
-
-	const tailCount = toolName === "bash_bg_status" ? 5 : 8;
-	const headCount = Math.max(4, limit - tailCount - 1);
-	const hidden = lines.length - headCount - tailCount;
-	const hint = `... (${hidden} hidden lines, ${keyHint("app.tools.expand", "to expand")})`;
-	return [...lines.slice(0, headCount), hint, ...lines.slice(-tailCount)];
-}
-
-function collapseWaitPreview(lines: string[]): string[] {
-	const footerStart = lines.findIndex((line) => /^\[(?:Full output|Output truncated)/u.test(line));
-	const elapsedIndex = lines.findLastIndex((line) => /^(?:Elapsed|Took) \d/u.test(line));
-	const bodyEndCandidates = [footerStart, elapsedIndex].filter((index) => index >= 0);
-	const bodyEnd = bodyEndCandidates.length > 0 ? Math.min(...bodyEndCandidates) : lines.length;
-	const body = trimBlankLines(lines.slice(0, bodyEnd));
-	const footer = trimBlankLines(lines.slice(bodyEnd));
-	const previewLines = 5;
-	if (body.length <= previewLines) return [...body, ...(footer.length > 0 ? ["", ...footer] : [])];
-
-	const hidden = body.length - previewLines;
-	const hint = `... (${hidden} earlier lines, ${keyHint("app.tools.expand", "to expand")})`;
-	return [hint, ...body.slice(-previewLines), ...(footer.length > 0 ? ["", ...footer] : [])];
-}
-
-function trimBlankLines(lines: string[]): string[] {
-	let start = 0;
-	let end = lines.length;
-	while (start < end && !lines[start]) start++;
-	while (end > start && !lines[end - 1]) end--;
-	return lines.slice(start, end);
-}
-
-function completionProcesses(details: unknown): Array<{ id: string; title?: string; command?: string }> {
-	if (!details || typeof details !== "object") return [];
-	const processes = (details as { processes?: unknown }).processes;
-	if (!Array.isArray(processes)) return [];
-	return processes.flatMap((value) => {
-		if (!value || typeof value !== "object") return [];
-		const process = value as { id?: unknown; title?: unknown; command?: unknown };
-		if (typeof process.id !== "string") return [];
-		return [{
-			id: cleanInline(process.id),
-			title: typeof process.title === "string" ? process.title : undefined,
-			command: typeof process.command === "string" ? process.command : undefined,
-		}];
-	});
-}
-
-function formatCompletionProcess(process: { id: string; title?: string; command?: string }): string {
-	const details = [
-		process.title ? cleanInline(process.title) : "",
-		process.command ? `$ ${cleanInline(process.command)}` : "",
-	].filter(Boolean);
-	return details.length > 0 ? `${process.id} (${details.join(" • ")})` : process.id;
-}
-
-function stripCompletionSummary(content: string): string {
-	return content.replace(
-		/^(?:A background process finished\.|\d+ background processes finished\.)(?:\r?\n){2}---(?:\r?\n){2}/u,
-		"",
-	);
 }

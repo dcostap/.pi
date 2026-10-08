@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import type { ProcessView } from "../formatting.ts";
+import { BACKGROUND_NOTICE_MARKER } from "../prompt.ts";
 import {
 	renderBackgroundCompletionMessage,
-	renderBackgroundStartCall,
 	renderBackgroundToolCall,
 	renderBackgroundToolResult,
 } from "./tool-call.ts";
@@ -12,159 +13,133 @@ const theme = {
 	bold: (text: string) => text,
 } as any;
 
-describe("background start tool-call rendering", () => {
-	test("shows the actual command and background title in chat history", () => {
-		const component = renderBackgroundStartCall(
-			{ command: "bun test ./src", title: "Unit tests" },
-			theme,
-		);
+function view(overrides: Partial<ProcessView> = {}): ProcessView {
+	return {
+		id: "bg-1",
+		title: "Build",
+		command: "bun run build",
+		cwd: "C:/work",
+		origin: "bash_bg_start",
+		status: "done",
+		settled: true,
+		killRequested: false,
+		exitCode: 0,
+		createdAt: 0,
+		settledAt: 2000,
+		elapsedMs: 2000,
+		capturedBytes: 300,
+		droppedBytes: 0,
+		totalLines: 30,
+		preview: Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n"),
+		...overrides,
+	};
+}
 
-		expect(component.render(200).join("\n")).toBe("bash_bg_start $ <bash>bun test ./src</bash> (Unit tests)");
+const render = (component: { render(width: number): string[] }) => component.render(200).join("\n");
+const collapsed = { expanded: false, isPartial: false };
+
+describe("background tool calls", () => {
+	test("bash_bg_start looks like a bash call with a background tag", () => {
+		const text = render(renderBackgroundToolCall("bash_bg_start", { command: "bun test ./src", title: "Unit tests" }, theme));
+		expect(text).toBe("$ <bash>bun test ./src</bash> (background · Unit tests)");
 	});
 
-	test("updates the existing component and strips terminal control sequences", () => {
-		const component = renderBackgroundStartCall({ command: "old", title: "Old" }, theme);
-		const updated = renderBackgroundStartCall(
-			{ command: "safe\x1b]0;hidden\x07 command", title: "New\x1b[31m title" },
-			theme,
-			component,
-		);
-
-		expect(updated).toBe(component);
-		expect(updated.render(200).join("\n")).toBe("bash_bg_start $ <bash>safe command</bash> (New title)");
+	test("strips terminal control sequences and reuses the component", () => {
+		const first = renderBackgroundToolCall("bash_bg_start", { command: "old", title: "Old" }, theme);
+		const updated = renderBackgroundToolCall("bash_bg_start", { command: "safe\x1b]0;hidden\x07 command", title: "New\x1b[31m title" }, theme, first);
+		expect(updated).toBe(first);
+		expect(render(updated)).toBe("$ <bash>safe command</bash> (background · New title)");
 	});
 
-	test("prefixes every background tool and summarizes its arguments", () => {
-		expect(renderBackgroundToolCall("bash_bg_status", { id: "bg-2" }, theme).render(200).join("\n"))
-			.toBe("bash_bg_status bg-2");
-		expect(renderBackgroundToolCall("bash_bg_wait", { ids: ["bg-2", "bg-3"], timeout_seconds: 30 }, theme).render(200).join("\n"))
-			.toBe("bash_bg_wait bg-2, bg-3 (timeout 30s)");
-		expect(renderBackgroundToolCall("bash_bg_list", {}, theme).render(200).join("\n"))
-			.toBe("bash_bg_list");
-		expect(renderBackgroundToolCall("bash_bg_kill", { ids: ["bg-4"] }, theme).render(200).join("\n"))
-			.toBe("bash_bg_kill bg-4");
-	});
-
-	test("shows process titles and commands beside ids", () => {
-		const process = (id: string) => id === "bg-2"
-			? { title: "Dev server", command: "bun run dev" }
-			: id === "bg-3"
-				? { title: "Unit tests", command: "bun test" }
-				: undefined;
-		expect(renderBackgroundToolCall("bash_bg_status", { id: "bg-2" }, theme, undefined, process).render(200).join("\n"))
-			.toBe("bash_bg_status bg-2 (Dev server • $ bun run dev)");
-		expect(renderBackgroundToolCall("bash_bg_wait", { ids: ["bg-2", "bg-3"] }, theme, undefined, process).render(200).join("\n"))
-			.toBe("bash_bg_wait bg-2 (Dev server • $ bun run dev), bg-3 (Unit tests • $ bun test)");
+	test("other tools show a short label, ids, and live titles", () => {
+		const lookup = (id: string) => (id === "bg-2" ? { title: "Dev server" } : undefined);
+		expect(render(renderBackgroundToolCall("bash_bg_status", { id: "bg-2" }, theme, undefined, lookup))).toBe("bg status bg-2 Dev server");
+		expect(render(renderBackgroundToolCall("bash_bg_status", {}, theme))).toBe("bg status all processes");
+		expect(render(renderBackgroundToolCall("bash_bg_wait", { ids: ["bg-2", "bg-3"], timeout_seconds: 30 }, theme, undefined, lookup)))
+			.toBe("bg wait bg-2 Dev server, bg-3 (timeout 30s)");
+		expect(render(renderBackgroundToolCall("bash_bg_kill", { ids: ["bg-4"] }, theme))).toBe("bg stop bg-4");
 	});
 });
 
-describe("background tool-result rendering", () => {
-	test("renders automatic completion as a completed tool row and keeps the output ending visible", () => {
-		const output = Array.from({ length: 30 }, (_, index) => `Completed groups: ${index + 1}/30`).join("\n");
-		const message = {
-			content: `A background process finished.\n\n---\n\nbg-1 — Build\nState: done\nElapsed: 2s\nCommand: bun run build\n\n${output}`,
-			details: { processes: [{ id: "bg-1", title: "Build", command: "bun run build" }] },
+describe("background tool results", () => {
+	test("a start that keeps running shows one line", () => {
+		const result = { content: [{ type: "text", text: "Started bg-3 (Dev) in C:/work. It is still running.\nlong hint" }], details: { process: view({ id: "bg-3", settled: false, status: "running", preview: "" }) } };
+		expect(render(renderBackgroundToolResult("bash_bg_start", result, collapsed, theme))).toBe("\n→ running in background as bg-3");
+	});
+
+	test("status shows the newest output lines and a one-line footer", () => {
+		const result = { content: [{ type: "text", text: "bg-1 — Build\nState: done\n..." }], details: { process: view() } };
+		const text = render(renderBackgroundToolResult("bash_bg_status", result, collapsed, theme));
+
+		expect(text).toContain("line 30");
+		expect(text).toContain("... (25 earlier lines, ctrl+e to expand)");
+		expect(text).not.toContain("line 25\n");
+		expect(text).toContain("✓ exit 0 · 2s · 300B");
+		expect(text).not.toContain("State:");
+	});
+
+	test("expanded results show the full model text without the guidance notice", () => {
+		const result = { content: [{ type: "text", text: `full text\n\n${BACKGROUND_NOTICE_MARKER}\nguidance` }], details: { process: view() } };
+		const text = render(renderBackgroundToolResult("bash_bg_status", result, { expanded: true, isPartial: false }, theme));
+		expect(text).toBe("\nfull text");
+	});
+
+	test("a timed-out wait names the processes that still run", () => {
+		const result = {
+			content: [{ type: "text", text: "Wait timed out." }],
+			details: { processes: [view({ settled: false, status: "running", exitCode: undefined })], timedOut: true, timeoutSeconds: 60 },
 		};
-		const collapsed = renderBackgroundCompletionMessage(message, { expanded: false }, theme).render(200).join("\n");
-		const expanded = renderBackgroundCompletionMessage(message, { expanded: true }, theme).render(200).join("\n");
-
-		expect(collapsed).toContain("bash_bg_start completion · bg-1 (Build • $ bun run build)");
-		expect(collapsed).toContain("Completed groups: 30/30");
-		expect(collapsed).not.toContain("Completed groups: 15/30");
-		expect(expanded).toContain("Completed groups: 1/30");
-		expect(collapsed).not.toContain("A background process finished.");
+		const text = render(renderBackgroundToolResult("bash_bg_wait", result, collapsed, theme));
+		expect(text).toContain("● running · 2s");
+		expect(text).toContain("wait timed out after 60s · still running: bg-1");
 	});
 
-	test("renders quick start completion like an automatic completion message", () => {
-		const content = "A background process finished.\n\n---\n\nbg-1 — Quick\nState: failed\nExit code: 2\n\nerror text";
-		const result = { content: [{ type: "text", text: content }], details: { settledAt: 100 } };
-		const rendered = renderBackgroundToolResult("bash_bg_start", result, { expanded: false, isPartial: false }, theme).render(200).join("\n");
-		const automatic = renderBackgroundCompletionMessage({ content }, { expanded: false }, theme).render(200).join("\n");
-		expect(rendered).toContain("bg-1 — Quick\nState: failed\nExit code: 2\n\nerror text");
-		expect(rendered).not.toContain("A background process finished.");
-		expect(automatic.split("\n").map((line) => line.trim()).join("\n")).toContain(rendered.trim());
+	test("waits for several processes show one headline each", () => {
+		const result = {
+			content: [{ type: "text", text: "..." }],
+			details: { processes: [view(), view({ id: "bg-2", title: "Lint", status: "failed", exitCode: 1, preview: "error" })] },
+		};
+		const text = render(renderBackgroundToolResult("bash_bg_wait", result, collapsed, theme));
+		expect(text).toContain("✓ bg-1 Build · exit 0 · 2s");
+		expect(text).toContain("✗ bg-2 Lint · exit 1 · 2s");
 	});
 
-	test("separates and styles structured status from command output", () => {
-		const styledTheme = {
-			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
-			bold: (text: string) => `<b>${text}</b>`,
-		} as any;
-		const component = renderBackgroundToolResult(
-			"bash_bg_status",
-			{ content: [{ type: "text", text: "bg-2 — Dev server\nState: running\nElapsed: 2s\n\nready" }] },
-			{ expanded: false, isPartial: false },
-			styledTheme,
-		);
-
-		const rendered = component.render(200).join("\n");
-		expect(rendered).toContain("<accent><b>bg-2</b></accent>");
-		expect(rendered).toContain("<muted>State:</muted> <accent>running</accent>");
-		expect(rendered).toContain("<toolOutput>ready</toolOutput>");
+	test("the list shows one line per process", () => {
+		const result = { content: [{ type: "text", text: "..." }], details: { processes: [view({ preview: undefined }), view({ id: "bg-2", title: "Server", settled: false, status: "running" })], omitted: 0 } };
+		const text = render(renderBackgroundToolResult("bash_bg_status", result, collapsed, theme));
+		expect(text).toBe("\n✓ bg-1 Build · exit 0 · 2s\n● bg-2 Server · running · 2s");
 	});
 
-	test("collapses long status output until expanded", () => {
-		const output = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");
-		const result = { content: [{ type: "text", text: `bg-1 — Logs\nState: running\nElapsed: 1s\n\n${output}` }] };
-		const collapsed = renderBackgroundToolResult("bash_bg_status", result, { expanded: false, isPartial: false }, theme);
-		const expanded = renderBackgroundToolResult("bash_bg_status", result, { expanded: true, isPartial: false }, theme);
-
-		expect(collapsed.render(200).join("\n")).toContain("hidden lines, ctrl+e to expand");
-		expect(collapsed.render(200).join("\n")).not.toContain("line 10\n");
-		expect(expanded.render(200).join("\n")).toContain("line 10\n");
+	test("stop results show one line per process", () => {
+		const result = { content: [{ type: "text", text: "..." }], details: { results: [{ outcome: "killed", process: view({ status: "killed", exitCode: null }) }] } };
+		expect(render(renderBackgroundToolResult("bash_bg_kill", result, collapsed, theme))).toBe("\n■ bg-1 Build stopped");
 	});
 
-	test("renders live wait output like the built-in bash preview", () => {
-		const output = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
-		const text = `${output}\n\n[Full output: C:/temp/pi-bash-bg.log. Truncated: showing the latest 10 of 3000 lines]\n\nElapsed 12.3s`;
-		const result = { content: [{ type: "text", text }] };
-		const collapsed = renderBackgroundToolResult("bash_bg_wait", result, { expanded: false, isPartial: true }, theme);
-		const expanded = renderBackgroundToolResult("bash_bg_wait", result, { expanded: true, isPartial: true }, theme);
-		const collapsedText = collapsed.render(200).join("\n");
-
-		expect(collapsedText).toContain("5 earlier lines, ctrl+e to expand");
-		expect(collapsedText).not.toContain("line 5\n");
-		expect(collapsedText).toContain("line 6\nline 7\nline 8\nline 9\nline 10");
-		expect(collapsedText).toContain("Full output: C:/temp/pi-bash-bg.log");
-		expect(collapsedText).toContain("Elapsed 12.3s");
-		expect(expanded.render(200).join("\n")).toContain("line 1\n");
+	test("results without structured details fall back to an output preview", () => {
+		const result = { content: [{ type: "text", text: "old\nresult" }], details: { id: "bg-1" } };
+		expect(render(renderBackgroundToolResult("bash_bg_status", result, collapsed, theme))).toBe("\nold\nresult");
 	});
 
-	test("highlights inventory and stop outcomes", () => {
-		const styledTheme = {
-			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
-			bold: (text: string) => `<b>${text}</b>`,
-		} as any;
-		const list = renderBackgroundToolResult(
-			"bash_bg_list",
-			{ content: [{ type: "text", text: "bg-1 [done] Build • 3s • 1.0KB • C:/work\nbg-2 [running] Server • 1s • 20B • C:/work" }] },
-			{ expanded: false, isPartial: false },
-			styledTheme,
-		).render(200).join("\n");
-		const kill = renderBackgroundToolResult(
-			"bash_bg_kill",
-			{ content: [{ type: "text", text: "bg-2 (Dev server): termination observed (killed)" }] },
-			{ expanded: false, isPartial: false },
-			styledTheme,
-		).render(200).join("\n");
+	test("errors render in full", () => {
+		const result = { content: [{ type: "text", text: "Unknown background process ID: bg-9" }] };
+		expect(render(renderBackgroundToolResult("bash_bg_status", result, collapsed, theme, undefined, true))).toBe("\nUnknown background process ID: bg-9");
+	});
+});
 
-		expect(list).toContain("<success>[done]</success>");
-		expect(list).toContain("<accent>[running]</accent>");
-		expect(kill).toContain("<success>termination observed (killed)</success>");
-		expect(kill).toContain("<muted>(Dev server)</muted>");
+describe("automatic completion messages", () => {
+	test("show a headline and the end of the output", () => {
+		const message = { content: "A background process finished.\n\n---\n\nbg-1 — Build\nState: done", details: { processes: [view()] } };
+		const text = render(renderBackgroundCompletionMessage(message, { expanded: false }, theme));
+
+		expect(text).toContain("✓ bg-1 Build · finished · 2s");
+		expect(text).toContain("line 30");
+		expect(text).not.toContain("line 20\n");
+		expect(text).not.toContain("State: done");
 	});
 
-	test("can restore an alias from result details for older result text", () => {
-		const rendered = renderBackgroundToolResult(
-			"bash_bg_kill",
-			{ content: [{ type: "text", text: "bg-2: termination observed (killed)" }] },
-			{ expanded: false, isPartial: false },
-			theme,
-			undefined,
-			false,
-			(id) => id === "bg-2" ? { title: "Dev server", command: "bun run dev" } : undefined,
-		).render(200).join("\n");
-
-		expect(rendered).toContain("bg-2 (Dev server): termination observed (killed)");
+	test("expanded messages show the text the agent received", () => {
+		const message = { content: "A background process finished.\n\nbg-1 — Build\nState: done", details: { processes: [view()] } };
+		const text = render(renderBackgroundCompletionMessage(message, { expanded: true }, theme));
+		expect(text).toContain("State: done");
 	});
 });

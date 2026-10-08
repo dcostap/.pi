@@ -3,6 +3,8 @@ import { BackgroundOutputCapture, type BackgroundOutputSnapshot } from "./output
 
 export type BackgroundProcessStatus = "running" | "done" | "failed" | "killed";
 export type AutomaticDeliveryState = "none" | "deferred" | "sending" | "injected" | "consumed";
+/** How a process entered the registry: started as background work, or moved from a foreground bash call. */
+export type BackgroundProcessOrigin = "bash_bg_start" | "bash-timeout" | "bash-steer";
 
 export interface BackgroundProcessSnapshot {
 	readonly id: string;
@@ -11,6 +13,7 @@ export interface BackgroundProcessSnapshot {
 	readonly cwd: string;
 	readonly createdAt: number;
 	readonly settledAt?: number;
+	readonly origin: BackgroundProcessOrigin;
 	readonly status: BackgroundProcessStatus;
 	readonly exitCode?: number | null;
 	readonly errorText?: string;
@@ -26,7 +29,8 @@ interface BackgroundProcessEntry {
 	readonly title: string;
 	readonly cwd: string;
 	readonly createdAt: number;
-	readonly controller: AbortController;
+	readonly origin: BackgroundProcessOrigin;
+	readonly launched: LaunchedProcess;
 	readonly output: BackgroundOutputCapture;
 	completion: Promise<void>;
 	status: BackgroundProcessStatus;
@@ -77,6 +81,31 @@ export interface DisposeResult {
 	readonly stillRunningIds: string[];
 }
 
+export interface LaunchOptions {
+	env?: NodeJS.ProcessEnv;
+	/** Receives raw output chunks until `LaunchedProcess.forward` is cleared. */
+	onData?: (chunk: Buffer) => void;
+}
+
+/**
+ * A running command that is not yet tracked by the registry. Foreground bash calls run as launched
+ * processes so they can be adopted as background processes without restarting them.
+ */
+export interface LaunchedProcess {
+	readonly command: string;
+	readonly cwd: string;
+	readonly createdAt: number;
+	readonly output: BackgroundOutputCapture;
+	/** Resolves or rejects after output capture has finished. Rejections are always handled. */
+	readonly execution: Promise<{ exitCode: number | null }>;
+	forward: ((chunk: Buffer) => void) | undefined;
+	abort(): void;
+}
+
+interface LaunchedProcessInternals extends LaunchedProcess {
+	onOutput: (() => void) | undefined;
+}
+
 export class WaitAbortedError extends Error {
 	constructor(message = "Background wait aborted") {
 		super(message);
@@ -115,17 +144,70 @@ export class BackgroundProcessManager {
 		if (this.entries.size >= this.maxEntries) {
 			throw new Error(`The ${this.maxEntries}-entry background process registry is full with no safe entry to prune`);
 		}
+		return this.adopt(this.launch(command, cwd), title, "bash_bg_start");
+	}
 
-		const id = `bg-${this.nextId++}`;
+	/** Run a command without registering it. Use `adopt()` to move it into the registry later. */
+	launch(command: string, cwd: string, options: LaunchOptions = {}): LaunchedProcess {
+		this.assertActive();
 		const controller = new AbortController();
-		const entry: BackgroundProcessEntry = {
-			id,
+		const output = new BackgroundOutputCapture(this.maxOutputBytes, this.persistFullOutput);
+		const hooks: Pick<LaunchedProcessInternals, "forward" | "onOutput"> = { forward: options.onData, onOutput: undefined };
+		let execution: Promise<{ exitCode: number | null }>;
+		try {
+			execution = this.operations.exec(command, cwd, {
+				signal: controller.signal,
+				env: options.env,
+				onData: (chunk) => {
+					if (this.disposed) return;
+					output.append(chunk);
+					hooks.forward?.(chunk);
+					hooks.onOutput?.();
+				},
+			});
+		} catch (error) {
+			execution = Promise.reject(error);
+		}
+		const finished = execution.then(
+			(result) => {
+				output.finish();
+				return result;
+			},
+			(error: unknown) => {
+				output.finish();
+				throw error;
+			},
+		);
+		// Callers attach their own handlers; this only prevents an unhandled rejection in between.
+		finished.catch(() => {});
+		return Object.assign(hooks, {
 			command,
-			title,
 			cwd,
 			createdAt: this.now(),
-			controller,
-			output: new BackgroundOutputCapture(this.maxOutputBytes, this.persistFullOutput),
+			output,
+			execution: finished,
+			abort: () => controller.abort(),
+		});
+	}
+
+	/**
+	 * Register a launched process under a new background ID. Adoption never refuses a running
+	 * process: refusing would leave it untracked, so registry limits only prune settled history.
+	 */
+	adopt(launched: LaunchedProcess, title: string, origin: BackgroundProcessOrigin): BackgroundProcessSnapshot {
+		this.assertActive();
+		this.pruneForStart();
+		const internals = launched as LaunchedProcessInternals;
+		const id = `bg-${this.nextId++}`;
+		const entry: BackgroundProcessEntry = {
+			id,
+			command: launched.command,
+			title,
+			cwd: launched.cwd,
+			createdAt: launched.createdAt,
+			origin,
+			launched,
+			output: launched.output,
 			completion: Promise.resolve(),
 			status: "running",
 			killRequested: false,
@@ -134,33 +216,17 @@ export class BackgroundProcessManager {
 			automaticDelivery: "none",
 		};
 		this.entries.set(id, entry);
+		internals.onOutput = () => {
+			if (!entry.settled) this.emit({ kind: "output", id });
+		};
 		this.emit({ kind: "started", id });
 
-		let execution: Promise<{ exitCode: number | null }>;
-		try {
-			execution = this.operations.exec(command, cwd, {
-				signal: controller.signal,
-				onData: (chunk) => {
-					if (this.disposed || entry.settled) return;
-					entry.output.append(chunk);
-					this.emit({ kind: "output", id });
-				},
-			});
-		} catch (error) {
-			entry.output.finish();
-			this.settleFailure(entry, error);
-			entry.completion = Promise.resolve();
-			return this.snapshotEntry(entry);
-		}
-
-		entry.completion = execution
+		entry.completion = launched.execution
 			.then(({ exitCode }) => {
-				entry.output.finish();
 				if (exitCode === 0) this.settle(entry, "done", exitCode);
 				else this.settle(entry, "failed", exitCode);
 			})
 			.catch((error) => {
-				entry.output.finish();
 				if (entry.killRequested && error instanceof Error && error.message === "aborted") {
 					this.settle(entry, "killed", null);
 					return;
@@ -320,7 +386,7 @@ export class BackgroundProcessManager {
 			if (!entry.settled) {
 				requested.add(entry.id);
 				entry.killRequested = true;
-				entry.controller.abort();
+				entry.launched.abort();
 			}
 		}
 
@@ -381,7 +447,7 @@ export class BackgroundProcessManager {
 		const running = [...this.entries.values()].filter((entry) => !entry.settled);
 		for (const entry of running) {
 			entry.killRequested = true;
-			entry.controller.abort();
+			entry.launched.abort();
 		}
 		const completed = await waitWithDeadline(Promise.all(running.map((entry) => entry.completion)), timeoutMs);
 		const stillRunningIds = running.filter((entry) => !entry.settled).map((entry) => entry.id);
@@ -463,6 +529,7 @@ export class BackgroundProcessManager {
 			cwd: entry.cwd,
 			createdAt: entry.createdAt,
 			settledAt: entry.settledAt,
+			origin: entry.origin,
 			status: entry.status,
 			exitCode: entry.exitCode,
 			errorText: entry.errorText,

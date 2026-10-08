@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AUTO_BUDGET, formatAutomaticResults, formatKillResults, formatList, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, LIST_MAX_ENTRIES, WAIT_TOTAL_BYTES } from "./formatting.ts";
+import { AUTO_BUDGET, formatAutomaticResults, formatKillResults, formatList, formatProcess, formatStartResult, formatWaitResult, formatWaitUpdate, LIST_MAX_ENTRIES, PREVIEW_BUDGET, processView, WAIT_TOTAL_BYTES } from "./formatting.ts";
 import type { BackgroundProcessSnapshot } from "./manager.ts";
 
 function snapshot(id: string, output: string): BackgroundProcessSnapshot {
@@ -10,6 +10,7 @@ function snapshot(id: string, output: string): BackgroundProcessSnapshot {
 		cwd: "C:/work",
 		createdAt: 0,
 		settledAt: 1000,
+		origin: "bash_bg_start",
 		status: "done",
 		exitCode: 0,
 		killRequested: false,
@@ -20,10 +21,19 @@ function snapshot(id: string, output: string): BackgroundProcessSnapshot {
 }
 
 describe("bounded formatting", () => {
-	test("start results include the command", () => {
+	test("start results name the process and say that completion is reported", () => {
 		const text = formatStartResult(snapshot("bg-1", ""));
-		expect(text).toContain("Started bg-1: Job bg-1");
-		expect(text).toContain("Command: node test.js");
+		expect(text).toContain("Started bg-1 (Job bg-1) in C:/work. It is still running.");
+		expect(text).toContain("reported automatically");
+	});
+
+	test("process views keep a bounded, sanitized output preview", () => {
+		const output = Array.from({ length: 50 }, (_, index) => `line ${index + 1}\x1b]0;x\x07`).join("\n");
+		const view = processView(snapshot("bg-1", output));
+		expect(view.preview?.split("\n")).toHaveLength(PREVIEW_BUDGET.maxLines);
+		expect(view.preview).toEndWith("line 50");
+		expect(view).toMatchObject({ id: "bg-1", status: "done", elapsedMs: 1000, origin: "bash_bg_start" });
+		expect(processView(snapshot("bg-1", output), { preview: false }).preview).toBeUndefined();
 	});
 
 	test("process output is terminal-sanitized", () => {

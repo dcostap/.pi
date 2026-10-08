@@ -73,6 +73,20 @@ export class BackgroundOutputCapture {
 		}
 	}
 
+	/** Stop capturing and delete the full-output file, for output that another owner already reported. */
+	discard(): void {
+		this.finished = true;
+		this.rawChunks.length = 0;
+		this.closeFile();
+		if (!this.path) return;
+		try {
+			rmSync(this.path, { force: true });
+		} catch {
+			// Best-effort cleanup of a duplicate copy.
+		}
+		this.path = undefined;
+	}
+
 	snapshot(): BackgroundOutputSnapshot {
 		const tail = this.tail.snapshot();
 		return {

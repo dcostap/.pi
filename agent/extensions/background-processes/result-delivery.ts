@@ -1,5 +1,5 @@
 import type { BackgroundProcessManager } from "./manager.ts";
-import { formatAutomaticResults } from "./formatting.ts";
+import { formatAutomaticResults, processView } from "./formatting.ts";
 
 export interface DeliveryPort {
 	isIdle(): boolean;
@@ -56,16 +56,7 @@ export class ResultDeliveryCoordinator {
 				customType: "background-process-result",
 				content: formatAutomaticResults(claimed),
 				display: true,
-				details: {
-					processes: claimed.map((entry) => ({
-						id: entry.id,
-						title: entry.title,
-						command: entry.command,
-						status: entry.status,
-						exitCode: entry.exitCode,
-						capturedBytes: entry.output.totalBytes,
-					})),
-				},
+				details: { processes: claimed.map((entry) => processView(entry)) },
 			});
 			this.manager.finishDelivery(ids, true);
 		} catch {

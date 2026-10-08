@@ -1,16 +1,11 @@
 /**
- * Live syntax highlighting for Python embedded in bash heredocs.
+ * Syntax highlighting for bash commands, including Python embedded in heredocs.
  *
- * The bash call renderer is updated as tool arguments stream. As soon as a
- * complete Python heredoc opener is present, the unfinished body is rendered
- * as Python; it does not wait for the closing delimiter.
+ * Tool call renderers update as arguments stream. As soon as a complete Python
+ * heredoc opener is present, the unfinished body is rendered as Python; it does
+ * not wait for the closing delimiter.
  */
-import {
-	createBashToolDefinition,
-	highlightCode,
-	type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { highlightCode } from "@earendil-works/pi-coding-agent";
 
 type HighlightLanguage = "bash" | "python" | undefined;
 
@@ -261,7 +256,7 @@ function classifyLines(command: string): HighlightLine[] {
 	return result;
 }
 
-function highlightMixedCommand(command: string): string {
+export function highlightBashCommand(command: string): string {
 	const lines = classifyLines(command);
 	const output: string[] = [];
 
@@ -275,29 +270,4 @@ function highlightMixedCommand(command: string): string {
 	}
 
 	return output.join("\n");
-}
-
-export default function inlinePythonHeredocHighlight(pi: ExtensionAPI) {
-	const bash = createBashToolDefinition(process.cwd());
-
-	pi.registerTool({
-		...bash,
-		renderCall(args, theme, context) {
-			// Preserve the timing state used by the inherited bash result renderer.
-			const state = context.state as { startedAt?: number; endedAt?: number };
-			if (context.executionStarted && state.startedAt === undefined) {
-				state.startedAt = Date.now();
-				state.endedAt = undefined;
-			}
-
-			const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			const command = typeof args?.command === "string" ? args.command : "";
-			const commandDisplay = command
-				? highlightMixedCommand(command)
-				: theme.fg("toolOutput", "...");
-			const timeout = args?.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
-			component.setText(theme.fg("toolTitle", theme.bold("$ ")) + commandDisplay + timeout);
-			return component;
-		},
-	});
 }

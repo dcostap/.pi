@@ -4,7 +4,14 @@ import {
 	formatSize,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
-import type { BackgroundProcessSnapshot, KillResultItem, WaitResult } from "./manager.ts";
+import type {
+	BackgroundProcessOrigin,
+	BackgroundProcessSnapshot,
+	BackgroundProcessStatus,
+	KillOutcome,
+	KillResultItem,
+	WaitResult,
+} from "./manager.ts";
 import { sanitizeTerminalText } from "./sanitize.ts";
 
 export interface OutputBudget {
@@ -18,6 +25,65 @@ export const WAIT_ENTRY_BUDGET: OutputBudget = { maxBytes: 16 * 1024, maxLines: 
 export const WAIT_TOTAL_BYTES = 48 * 1024;
 export const WAIT_LIVE_BUDGET: OutputBudget = { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES };
 export const LIST_MAX_ENTRIES = 30;
+/** Output kept in tool details for the collapsed transcript preview. */
+export const PREVIEW_BUDGET: OutputBudget = { maxBytes: 4 * 1024, maxLines: 20 };
+
+/** Structured process state stored in tool details. Renderers use it instead of parsing model text. */
+export interface ProcessView {
+	id: string;
+	title: string;
+	command: string;
+	cwd: string;
+	origin: BackgroundProcessOrigin;
+	status: BackgroundProcessStatus;
+	settled: boolean;
+	killRequested: boolean;
+	exitCode?: number | null;
+	errorText?: string;
+	createdAt: number;
+	settledAt?: number;
+	elapsedMs: number;
+	capturedBytes: number;
+	droppedBytes: number;
+	totalLines: number;
+	fullOutputPath?: string;
+	/** Newest output lines, sanitized and bounded. Omitted from list views. */
+	preview?: string;
+}
+
+export function processView(
+	snapshot: BackgroundProcessSnapshot,
+	options: { preview?: boolean; now?: number } = {},
+): ProcessView {
+	const view: ProcessView = {
+		id: snapshot.id,
+		title: snapshot.title,
+		command: snapshot.command,
+		cwd: snapshot.cwd,
+		origin: snapshot.origin,
+		status: snapshot.status,
+		settled: snapshot.settled,
+		killRequested: snapshot.killRequested,
+		exitCode: snapshot.exitCode,
+		errorText: snapshot.errorText,
+		createdAt: snapshot.createdAt,
+		settledAt: snapshot.settledAt,
+		elapsedMs: Math.max(0, (snapshot.settledAt ?? options.now ?? Date.now()) - snapshot.createdAt),
+		capturedBytes: snapshot.output.totalBytes,
+		droppedBytes: snapshot.output.droppedBytes,
+		totalLines: snapshot.output.totalLines,
+		fullOutputPath: snapshot.output.fullOutputPath,
+	};
+	if (options.preview !== false) {
+		view.preview = truncateTail(sanitizeTerminalText(snapshot.output.text).replace(/\s+$/u, ""), PREVIEW_BUDGET).content;
+	}
+	return view;
+}
+
+export interface KillView {
+	outcome: KillOutcome;
+	process: ProcessView;
+}
 
 export function formatDuration(milliseconds: number): string {
 	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -30,10 +96,8 @@ export function formatDuration(milliseconds: number): string {
 
 export function formatStartResult(snapshot: BackgroundProcessSnapshot): string {
 	return [
-		`Started ${snapshot.id}: ${cleanInline(snapshot.title)}`,
-		`Working directory: ${cleanInline(snapshot.cwd)}`,
-		`Command: ${sanitizeTerminalText(snapshot.command)}`,
-		"Use bash_bg_wait only when further work depends on completion; otherwise continue useful work.",
+		`Started ${snapshot.id} (${cleanInline(snapshot.title)}) in ${cleanInline(snapshot.cwd)}. It is still running.`,
+		"Its completion will be reported automatically. Continue useful work; use bash_bg_wait only when further work depends on it.",
 	].join("\n");
 }
 

@@ -1,9 +1,10 @@
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import type { Component, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { createForegroundBashTool } from "./foreground-bash.ts";
 import {
 	formatAutomaticResults,
 	formatKillResults,
@@ -12,10 +13,11 @@ import {
 	formatStartResult,
 	formatWaitUpdate,
 	formatWaitResult,
+	processView,
 	recentListSnapshots,
 } from "./formatting.ts";
 import { BackgroundProcessManager, WaitAbortedError } from "./manager.ts";
-import { BACKGROUND_PROCESS_PROMPT, normalizeTitle } from "./prompt.ts";
+import { BACKGROUND_PROCESS_PROMPT, MAX_BLOCKING_SECONDS, normalizeTitle, withBackgroundNotice } from "./prompt.ts";
 import { ResultDeliveryCoordinator } from "./result-delivery.ts";
 import { ProcessDashboard } from "./ui/process-dashboard.ts";
 import { processWidgetComponent } from "./ui/process-widget.ts";
@@ -24,6 +26,7 @@ import {
 	renderBackgroundToolCall,
 	renderBackgroundToolResult,
 	type BackgroundProcessLookup,
+	type BackgroundToolName,
 } from "./ui/tool-call.ts";
 import { MANAGED_WORK_STATE_EVENT } from "../_shared/managed-work.ts";
 import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
@@ -34,8 +37,8 @@ const StartParameters = Type.Object({
 	working_dir: Type.Optional(Type.String({ description: "Working directory, relative to the session directory by default" })),
 });
 
-const IdParameters = Type.Object({
-	id: Type.String({ minLength: 1, description: "Background bash process ID returned by bash_bg_start" }),
+const StatusParameters = Type.Object({
+	id: Type.Optional(Type.String({ minLength: 1, description: "Background bash process ID. Omit to list recent processes." })),
 });
 
 const IdsParameters = Type.Object({
@@ -44,7 +47,11 @@ const IdsParameters = Type.Object({
 
 const WaitParameters = Type.Object({
 	ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 32, description: "Background bash process IDs" }),
-	timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400, description: "Maximum wait in seconds" })),
+	timeout_seconds: Type.Optional(Type.Integer({
+		minimum: 1,
+		maximum: 86_400,
+		description: `Maximum wait in seconds. Defaults to and is capped at ${MAX_BLOCKING_SECONDS}.`,
+	})),
 });
 
 const START_GRACE_MS = 2_000;
@@ -58,7 +65,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	let widgetRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	let widgetLastRefreshAt = 0;
 	let shuttingDown = false;
-	const waitInterrupts = new WaitInterruptRegistry();
+	const interrupts = new WaitInterruptRegistry();
 
 	const publishManagedWork = () => {
 		const pending = manager?.list().some((snapshot) => !snapshot.settled) ?? false;
@@ -119,18 +126,29 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		return manager;
 	};
 
+	const renderers = (toolName: BackgroundToolName) => ({
+		renderCall(args: Record<string, unknown>, theme: Theme, context: { lastComponent?: unknown }) {
+			return renderBackgroundToolCall(toolName, args, theme, context.lastComponent as Text | undefined, processLookup(manager));
+		},
+		renderResult(
+			result: { content: Array<{ type: string; text?: string }>; details?: unknown },
+			options: { expanded: boolean; isPartial: boolean },
+			theme: Theme,
+			context: { lastComponent?: unknown; isError?: boolean },
+		) {
+			return renderBackgroundToolResult(toolName, result, options, theme, context.lastComponent as Component | undefined, context.isError);
+		},
+	});
+
+	pi.registerTool(createForegroundBashTool({ manager: ensureManager, interrupts }));
+
 	pi.registerTool({
 		name: "bash_bg_start",
 		label: "bash background start",
 		description: `Start a long-running non-interactive bash command using the same local backend as Pi's built-in bash tool. Wait up to two seconds for completion. Return the completion result if it finishes, or its background ID if it remains active. Recent merged output is retained in bounded memory. Output beyond Pi's standard 50KB/2000-line inline limit is saved to a temporary full-output file.\n\n${BACKGROUND_PROCESS_PROMPT}`,
 		promptSnippet: "Start a long non-interactive bash command; wait two seconds for a quick result, then deliver later completion automatically",
 		parameters: StartParameters,
-		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_start", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
-		},
-		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_start", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
-		},
+		...renderers("bash_bg_start"),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
 			const command = params.command.trim();
@@ -149,15 +167,9 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 			if (signal?.aborted) throw new Error("Background start aborted before launch");
 
 			const started = await ensureManager(ctx).startWithGracePeriod(command, title, cwd, START_GRACE_MS, signal);
-			if (started.settled) {
-				return {
-					content: [{ type: "text", text: formatAutomaticResults([started]) }],
-					details: compactDetails(started),
-				};
-			}
 			return {
-				content: [{ type: "text", text: formatStartResult(started) }],
-				details: { id: started.id, title, cwd, status: started.status },
+				content: [{ type: "text", text: started.settled ? formatAutomaticResults([started]) : formatStartResult(started) }],
+				details: { process: processView(started) },
 			};
 		},
 	});
@@ -165,41 +177,26 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_status",
 		label: "bash background status",
-		description: "Return a nonblocking status and bounded recent-output snapshot for one background bash process.",
-		parameters: IdParameters,
-		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_status", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
-		},
-		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_status", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
-		},
+		description: "Without waiting, return the status and recent output of one background bash process. Omit id to list the 30 most recent processes without their output.",
+		parameters: StatusParameters,
+		...renderers("bash_bg_status"),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestContext = ctx;
+			if (params.id === undefined) {
+				const snapshots = manager?.list() ?? [];
+				const visible = recentListSnapshots(snapshots);
+				return {
+					content: [{ type: "text", text: formatList(snapshots) }],
+					details: {
+						processes: visible.map((snapshot) => processView(snapshot, { preview: false })),
+						omitted: snapshots.length - visible.length,
+					},
+				};
+			}
 			const snapshot = requireManager(ctx).get(params.id, true);
 			return {
 				content: [{ type: "text", text: formatProcess(snapshot) }],
-				details: compactDetails(snapshot),
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "bash_bg_list",
-		label: "bash background list",
-		description: "List the 30 most recent tracked background bash processes without waiting or including bash command output. Older entries are summarized.",
-		parameters: Type.Object({}),
-		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_list", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
-		},
-		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_list", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
-		},
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			latestContext = ctx;
-			const snapshots = manager?.list() ?? [];
-			const visible = recentListSnapshots(snapshots);
-			return {
-				content: [{ type: "text", text: formatList(snapshots) }],
-				details: { processes: visible.map(compactDetails), omitted: snapshots.length - visible.length },
+				details: { process: processView(snapshot) },
 			};
 		},
 	});
@@ -207,50 +204,54 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_wait",
 		label: "bash background wait",
-		description: "Wait for selected background bash processes. The tool streams a bounded live output preview. A steering message interrupts only the wait. Timeout, steering, or cancellation leaves unfinished processes running.",
+		description: `Wait for selected background bash processes, at most ${MAX_BLOCKING_SECONDS} seconds per call. The tool streams a bounded live output preview. A steering message interrupts only the wait. Timeout, steering, or cancellation leaves unfinished processes running.`,
 		parameters: WaitParameters,
-		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_wait", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
-		},
-		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_wait", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
-		},
+		...renderers("bash_bg_wait"),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const activeManager = requireManager(ctx);
-			const wait = waitInterrupts.begin(signal);
+			const timeoutSeconds = Math.min(params.timeout_seconds ?? MAX_BLOCKING_SECONDS, MAX_BLOCKING_SECONDS);
+			const wait = interrupts.begin(signal);
 			try {
 				const result = await activeManager.wait(params.ids, {
-					timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
+					timeoutMs: timeoutSeconds * 1000,
 					signal: wait.signal,
 					updateIntervalMs: 100,
-					onUpdate: (runningIds, snapshots) => {
+					onUpdate: (_runningIds, snapshots) => {
 						onUpdate?.({
 							content: [{ type: "text", text: formatWaitUpdate(snapshots) }],
-							details: {
-								runningIds,
-								processes: snapshots.map(compactDetails),
-							},
+							details: { processes: snapshots.map((snapshot) => processView(snapshot)) },
 						});
 					},
 				});
+				const text = formatWaitResult(result);
 				return {
-					content: [{ type: "text", text: formatWaitResult(result) }],
+					content: [{
+						type: "text",
+						text: result.timedOut
+							? withBackgroundNotice(text, { kind: "wait-timeout", ids: result.runningIds, seconds: timeoutSeconds })
+							: text,
+					}],
 					details: {
+						processes: activeManager.validateIds(params.ids).map((id) => processView(activeManager.get(id))),
 						timedOut: result.timedOut,
-						settled: result.settled.map(compactDetails),
+						timeoutSeconds,
 						runningIds: result.runningIds,
 					},
 				};
 			} catch (error) {
 				if (error instanceof WaitAbortedError) {
 					if (wait.reason() === "steer") {
-						const snapshots = params.ids.map((id) => activeManager.get(id));
+						const snapshots = activeManager.validateIds(params.ids).map((id) => activeManager.get(id));
+						const runningIds = snapshots.filter((snapshot) => !snapshot.settled).map((snapshot) => snapshot.id);
 						return {
-							content: [{ type: "text", text: "Background wait interrupted by a steering message. Unfinished processes remain active." }],
+							content: [{
+								type: "text",
+								text: withBackgroundNotice("Background wait interrupted by a steering message.", { kind: "wait-steer", ids: runningIds }),
+							}],
 							details: {
 								interruptedBySteer: true,
-								processes: snapshots.map(compactDetails),
-								runningIds: snapshots.filter((snapshot) => !snapshot.settled).map((snapshot) => snapshot.id),
+								processes: snapshots.map((snapshot) => processView(snapshot)),
+								runningIds,
 							},
 						};
 					}
@@ -265,7 +266,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 
 	pi.on("input", (event) => {
 		if (event.streamingBehavior !== "steer") return;
-		waitInterrupts.interruptForSteer();
+		interrupts.interruptForSteer();
 	});
 
 	pi.registerTool({
@@ -273,18 +274,15 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		label: "bash background stop",
 		description: "Request termination of selected background bash processes through the same local backend as Pi's built-in bash tool.",
 		parameters: IdsParameters,
-		renderCall(args, theme, context) {
-			return renderBackgroundToolCall("bash_bg_kill", args, theme, context.lastComponent as Text | undefined, processLookup(manager));
-		},
-		renderResult(result, options, theme, context) {
-			return renderBackgroundToolResult("bash_bg_kill", result, options, theme, context.lastComponent as Text | undefined, context.isError, processLookup(manager, result.details));
-		},
+		...renderers("bash_bg_kill"),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Background stop aborted before termination began");
 			const results = await requireManager(ctx).kill(params.ids, 5000);
 			return {
 				content: [{ type: "text", text: formatKillResults(results) }],
-				details: { results: results.map(({ id, outcome, snapshot }) => ({ id, outcome, ...compactDetails(snapshot) })) },
+				details: {
+					results: results.map(({ outcome, snapshot }) => ({ outcome, process: processView(snapshot, { preview: false }) })),
+				},
 			};
 		},
 	});
@@ -340,7 +338,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		latestContext = ctx;
 		shuttingDown = true;
-		waitInterrupts.abortAll();
+		interrupts.abortAll();
 		delivery?.dispose();
 		delivery = undefined;
 		managerWidgetSubscription?.();
@@ -358,50 +356,9 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	});
 }
 
-function compactDetails(snapshot: ReturnType<BackgroundProcessManager["get"]>) {
-	return {
-		id: snapshot.id,
-		title: snapshot.title,
-		status: snapshot.status,
-		cwd: snapshot.cwd,
-		createdAt: snapshot.createdAt,
-		settledAt: snapshot.settledAt,
-		exitCode: snapshot.exitCode,
-		killRequested: snapshot.killRequested,
-		capturedBytes: snapshot.output.totalBytes,
-		droppedBytes: snapshot.output.droppedBytes,
-		totalLines: snapshot.output.totalLines,
-		fullOutputPath: snapshot.output.fullOutputPath,
-	};
-}
-
-function processLookup(manager: BackgroundProcessManager | undefined, details?: unknown): BackgroundProcessLookup {
+function processLookup(manager: BackgroundProcessManager | undefined): BackgroundProcessLookup {
 	return (id) => {
 		const live = manager?.list().find((snapshot) => snapshot.id === id);
-		if (live) return { title: live.title, command: live.command };
-		return findProcessInDetails(details, id);
+		return live ? { title: live.title } : undefined;
 	};
-}
-
-function findProcessInDetails(
-	value: unknown,
-	id: string,
-): { title: string | undefined; command: string | undefined } | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			const found = findProcessInDetails(item, id);
-			if (found) return found;
-		}
-		return undefined;
-	}
-	const record = value as Record<string, unknown>;
-	if (record.id === id && typeof record.title === "string") {
-		return { title: record.title, command: undefined };
-	}
-	for (const key of ["processes", "settled", "results"]) {
-		const found = findProcessInDetails(record[key], id);
-		if (found) return found;
-	}
-	return undefined;
 }
