@@ -95,6 +95,7 @@ import { terminateProcessTree } from "./process-tree.ts";
 import { isLiveMessageTarget, parseSubagentSendSelector } from "./send-policy.ts";
 import { BRIDGE_DIR_ENV, BRIDGE_RESULTS_FILE, startBridgeServer, type RunningBridge } from "./bridge-server.ts";
 import { customCwdDisplay } from "./cwd-display.ts";
+import { segmentTheme, widgetSegments } from "./widget-segments.ts";
 import { subagentWidgetSummary } from "./widget-summary.ts";
 import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
 
@@ -3708,13 +3709,19 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				if (bridgeOutbox.length === 0) return undefined;
 				return bridgeOutbox.splice(0).join("\n\n---\n\n");
 			},
-			state: async () => {
+			state: async ({ width }) => {
 				const now = Date.now();
 				const records = mergedById(manager?.list() ?? [], hierarchyRecords);
 				const visible = records.filter((record) => isActive(record) || isRecentlyFinished(record, now));
 				const batches = mergedById(manager?.listBatches() ?? [], hierarchyBatches);
+				// The same lines as the pinned widget, which Pi pads with one column.
+				const lines = records.length > 0
+					? widgetLines(records, batches, segmentTheme as unknown as Theme, now, Math.max(20, (width ?? 120) - 1), false, undefined, latestCtx?.cwd, sessionCreatedAt, manager?.pendingCompletionCount() ?? 0)
+						.map(widgetSegments)
+					: undefined;
 				return {
 					text: visible.length > 0 ? formatTreeList(visible, batches) : undefined,
+					lines,
 					active: records.filter(isActive).length,
 					pending: (manager?.pendingCompletionCount() ?? 0) + bridgeOutbox.length,
 				};

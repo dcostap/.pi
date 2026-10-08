@@ -29,7 +29,7 @@ The tools and their rules come from the Pi subagents extension.
 1. The first tool call starts a hub: `pi --mode rpc` with `PI_SUBAGENT_BRIDGE_DIR` set.
 2. The subagents extension in the hub serves its tools on `127.0.0.1`.
 3. When the session is idle, the mod gets the batched updates and sends them as a prompt.
-4. A band above the prompt shows the agent tree.
+4. A band above the prompt shows the Pi subagent widget, in Claude Code theme colors, with turning spinners.
 5. The hub stops when the session ends, or after 15 minutes without requests.
 6. A new hub restores the agents of the session from `results.jsonl`.
 

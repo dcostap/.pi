@@ -8,6 +8,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { WidgetSegment } from "./widget-segments.ts";
 
 export const BRIDGE_DIR_ENV = "PI_SUBAGENT_BRIDGE_DIR";
 export const BRIDGE_INFO_FILE = "hub.json";
@@ -27,8 +28,11 @@ export type BridgeHandlers = {
 	callTool(name: string, params: unknown): Promise<BridgeToolResult>;
 	/** Formatted parent updates for one delivery, or undefined when none wait. */
 	drain(): Promise<string | undefined>;
-	/** Plain-text tree of active and recently finished agents, or undefined. */
-	state(): Promise<{ text?: string; active: number; pending: number }>;
+	/**
+	 * Plain-text tree of active and recently finished agents, and the pinned
+	 * widget as styled lines laid out for `width` columns; undefined when none.
+	 */
+	state(options: { width?: number }): Promise<{ text?: string; lines?: WidgetSegment[][]; active: number; pending: number }>;
 	/** Ends a running subagent_wait_for_any, as a Pi steering message does. */
 	interrupt(): Promise<void>;
 	shutdown(): Promise<void>;
@@ -115,7 +119,7 @@ export async function startBridgeServer(dir: string, handlers: BridgeHandlers, i
 					send(200, { text: await handlers.drain() ?? null });
 					return;
 				case "/state":
-					send(200, await handlers.state());
+					send(200, await handlers.state({ width: typeof body.width === "number" ? body.width : undefined }));
 					return;
 				case "/interrupt":
 					await handlers.interrupt();

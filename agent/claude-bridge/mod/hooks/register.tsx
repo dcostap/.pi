@@ -11,7 +11,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Tree } from '../types'
 
 const PREFIX = 'mcp__pi-bridge__'
-const TICK_MS = 2000
+const TICK_MS = 1000
 const WAIT_TOOL = 'subagent_wait_for_any'
 const tree = atom({ plugin: 'pi-bridge', key: 'tree' } as const, null)
 
@@ -26,7 +26,9 @@ type State = {
   hasTimer: boolean
   isMirrorDirty: boolean
   mirror?: Promise<void>
-  lastTree: Tree
+  lastTree: string
+  // The band's width in cells, as last drawn; the hub lays the table out to it.
+  width?: number
 }
 
 function message(error: unknown): string {
@@ -108,10 +110,11 @@ async function syncMirror($: EngineInterface, s: State): Promise<void> {
   })
 }
 
-async function showTree($: EngineInterface, s: State, text: Tree): Promise<void> {
-  if (text === s.lastTree) return
-  s.lastTree = text
-  await update($, tree, () => text)
+async function showTree($: EngineInterface, s: State, lines: Tree): Promise<void> {
+  const key = JSON.stringify(lines)
+  if (key === s.lastTree) return
+  s.lastTree = key
+  await update($, tree, () => lines)
 }
 
 // Runs every TICK_MS: mirror sync, the band, and idle delivery.
@@ -121,8 +124,8 @@ async function tick($: EngineInterface, s: State): Promise<void> {
   try {
     if (s.isMirrorDirty) await syncMirror($, s)
     if (!s.hub) return void (await showTree($, s, null))
-    const state = await post($, s, '/state', {}, false)
-    await showTree($, s, state?.text ?? null)
+    const state = await post($, s, '/state', { width: s.width }, false)
+    await showTree($, s, state?.lines ?? null)
     if (s.isBusy) return
     const drained = await post($, s, '/drain', {}, false)
     if (!drained?.text) return
@@ -178,7 +181,7 @@ async function endSession($: EngineInterface, s: State, sessionId: string): Prom
 }
 
 export const register: Register = on => {
-  const s: State = { instructions: '', isBusy: false, isTicking: false, hasTimer: false, isMirrorDirty: false, lastTree: null }
+  const s: State = { instructions: '', isBusy: false, isTicking: false, hasTimer: false, isMirrorDirty: false, lastTree: 'null' }
 
   on('session.start', async ($, e, next) => {
     await registerTools($, s)
@@ -239,17 +242,17 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const text = await read($, tree)
-    if (!text || e.props.hasSurvey) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
-    const lines = text.split('\n')
-    const room = Math.max(3, Math.min(12, e.props.maxRows - 1))
-    const shown = lines.length > room ? [...lines.slice(0, room - 1), `… ${lines.length - room + 1} more lines`] : lines
-    return (
-      <Box flexDirection="column">
-        <Text dimColor>Pi subagents</Text>
-        {shown.map((line, index) => <Text key={String(index)} wrap="truncate-end">{line}</Text>)}
-      </Box>
-    )
+    s.width = e.props.bodyColumns
+    const lines = await read($, tree)
+    if (!lines?.length || e.props.hasSurvey) return next(e)
+    const room = Math.max(3, Math.min(16, e.props.maxRows))
+    const shown = lines.length > room
+      ? [...lines.slice(0, room - 1), [{ text: `… ${lines.length - room + 1} more lines`, color: 'dim' }]]
+      : lines
+    // The band is raised on the terminal and desktop, which run surface modules.
+    const elements = $.ui.resolve(e)
+    if (!('Client' in elements)) return next(e)
+    const { Client } = elements
+    return <Client key="tree" module="./tree.tsx" props={{ lines: shown }} />
   })
 }

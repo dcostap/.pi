@@ -44,15 +44,18 @@ describe("bridge server", () => {
 
 	test("calls tools, drains, and reports state", async () => {
 		let pending: string | undefined = "update";
+		const widths: Array<number | undefined> = [];
 		const { post, info } = await start(handlers({
 			drain: async () => { const text = pending; pending = undefined; return text; },
-			state: async () => ({ text: "tree", active: 1, pending: 0 }),
+			state: async ({ width }) => { widths.push(width); return { text: "tree", active: 1, pending: 0 }; },
 		}));
 		expect(info.pid).toBe(process.pid);
 		expect(await (await post("/call", { tool: "subagent_list", params: { a: 1 } })).json()).toEqual({ text: "subagent_list:{\"a\":1}", isError: false });
 		expect(await (await post("/drain")).json()).toEqual({ text: "update" });
 		expect(await (await post("/drain")).json()).toEqual({ text: null });
 		expect(await (await post("/state")).json()).toEqual({ text: "tree", active: 1, pending: 0 });
+		await post("/state", { width: 90 });
+		expect(widths).toEqual([undefined, 90]);
 		expect((await (await post("/tools")).json()).tools[0].name).toBe("subagent_list");
 		expect((await post("/call", {})).status).toBe(500);
 	});

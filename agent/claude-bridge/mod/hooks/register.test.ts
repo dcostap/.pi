@@ -20,11 +20,12 @@ type Fake = {
   // Polls answered { pending } before the result.
   jobs: number
   isCallFailing: boolean
+  lines: unknown[][] | null
 }
 
 // Answers what the mod asks of the engine: processes, HTTP, tools, prompts.
 function fakeWorld(on: On): Fake {
-  const fake: Fake = { clock: mock.clock(on), registered: [], runs: [], posts: [], submitted: [], pending: null, callResult: { text: 'ok', isError: false }, jobs: 0, isCallFailing: false }
+  const fake: Fake = { clock: mock.clock(on), registered: [], runs: [], posts: [], submitted: [], pending: null, callResult: { text: 'ok', isError: false }, jobs: 0, isCallFailing: false, lines: null }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.cwd', () => ({ value: 'C:/work' }))
@@ -47,7 +48,7 @@ function fakeWorld(on: On): Fake {
     let answer: unknown = { ok: true }
     if (endpoint === '/call' && fake.isCallFailing) return { deny: 'connection reset' }
     if (endpoint === '/call' || endpoint === '/job') answer = fake.jobs-- > 0 ? { pending: 'job-1' } : fake.callResult
-    if (endpoint === '/state') answer = { text: 'tree', active: 1, pending: 0 }
+    if (endpoint === '/state') answer = { text: 'tree', lines: fake.lines, active: 1, pending: 0 }
     if (endpoint === '/drain') {
       answer = { text: fake.pending }
       fake.pending = null
@@ -60,6 +61,16 @@ function fakeWorld(on: On): Fake {
   })
   return fake
 }
+
+const BAND = {
+  component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 100, scroll: { offset: 0, bodyRows: 20 }, view: {} },
+} as const
+
+const LINES = [
+  [{ text: 'Subagents', color: 'toolTitle', bold: true }, { text: ' · 1 active', color: 'muted' }],
+  [{ text: '└─ ', color: 'dim' }, { text: '·', color: 'accent', spinner: true }, { text: ' running', color: 'accent' }],
+]
 
 describe('pi-bridge', () => {
   test('registers the hub tools at session start', async ($, on) => {
@@ -133,5 +144,38 @@ describe('pi-bridge', () => {
     await $.prompt.submit({ text: 'stop waiting', turnId: 'turn-1', wait: false, origin: { kind: 'composer' } })
     await $.prompt.submit({ text: 'next task', wait: false, origin: { kind: 'composer' } })
     expect(fake.posts.filter(post => post.endpoint === '/interrupt')).toHaveLength(1)
+  })
+
+  test('the band draws the widget lines in theme colors and turns the spinners', async ($, on) => {
+    const fake = fakeWorld(on)
+    fake.lines = LINES
+    await $.session.start({ cwd: 'C:/work', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__pi-bridge__subagent_list' })
+    await fake.clock.advance(1000)
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ plugin: 'pi-bridge', surface, ...BAND })
+      const title = await ui.find({ type: 'Text', text: /^Subagents$/, in: 'tree' })
+      expect(title?.props).toMatchObject({ color: 'claude', bold: true })
+      expect((await ui.find({ type: 'Text', text: /^ running$/, in: 'tree' }))?.props.color).toBe('claude')
+      expect(await ui.find({ type: 'Text', text: /^·$/, in: 'tree' })).toBeDefined()
+      await ui.advance(240)
+      expect(await ui.find({ type: 'Text', text: /^·$/, in: 'tree' })).toBeUndefined()
+      expect(await ui.find({ type: 'Text', text: /^\*$/, in: 'tree' })).toBeDefined()
+      await ui.unmount()
+    }
+    // The hub lays the table out to the band's width.
+    await fake.clock.advance(1000)
+    expect(fake.posts.filter(post => post.endpoint === '/state').at(-1)!.body).toEqual({ width: 100 })
+  })
+
+  test('the band stays empty without agents', async ($, on) => {
+    const fake = fakeWorld(on)
+    // The engine's own band.
+    on('ui.render', ($, e) => $.ui.resolve(e).Box({}))
+    await $.session.start({ cwd: 'C:/work', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__pi-bridge__subagent_list' })
+    await fake.clock.advance(1000)
+    const ui = await $.ui.mount({ plugin: 'pi-bridge', surface: 'terminal', ...BAND })
+    expect(await ui.find({ type: 'Client' })).toBeUndefined()
   })
 })
