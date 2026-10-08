@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { appendFile, mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,6 +93,7 @@ import {
 import { stopManagedProcessTree } from "./stop-policy.ts";
 import { terminateProcessTree } from "./process-tree.ts";
 import { isLiveMessageTarget, parseSubagentSendSelector } from "./send-policy.ts";
+import { BRIDGE_DIR_ENV, BRIDGE_RESULTS_FILE, startBridgeServer, type RunningBridge } from "./bridge-server.ts";
 import { customCwdDisplay } from "./cwd-display.ts";
 import { subagentWidgetSummary } from "./widget-summary.ts";
 import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
@@ -1578,9 +1579,9 @@ async function cleanupPreparedAgents(prepared: PreparedAgent[]): Promise<void> {
 	]));
 }
 
-function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
+function scanSerializedAgents(entries: any[]): SerializedAgent[] {
 	const byId = new Map<string, SerializedAgent>();
-	for (const entry of ctx.sessionManager.getBranch() as any[]) {
+	for (const entry of entries) {
 		if (entry?.type !== "message" || entry.message?.role !== "toolResult") continue;
 		const toolName = entry.message.toolName;
 		const agents = entry.message.details?.agents;
@@ -1615,9 +1616,9 @@ function scanSerializedAgents(ctx: ExtensionContext): SerializedAgent[] {
 	return [...byId.values()];
 }
 
-function scanSerializedBatches(ctx: ExtensionContext): SerializedBatch[] {
+function scanSerializedBatches(entries: any[]): SerializedBatch[] {
 	const byId = new Map<string, SerializedBatch>();
-	for (const entry of ctx.sessionManager.getBranch() as any[]) {
+	for (const entry of entries) {
 		if (entry?.type !== "message" || entry.message?.role !== "toolResult") continue;
 		if (entry.message.toolName !== START_TOOL_NAME) continue;
 		const batches = entry.message.details?.batches;
@@ -2849,6 +2850,30 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	let widgetRefreshTimer: ReturnType<typeof setInterval> | undefined;
 	let widgetRefreshTimerDelay: number | undefined;
 	let shuttingDown = false;
+	// Bridge hub mode: an external client calls the tools over local HTTP and
+	// pulls parent updates when it is idle. Managed children never run as hubs.
+	const bridgeDir = process.env[MANAGED_CHILD_ENV] === "1" ? undefined : process.env[BRIDGE_DIR_ENV] || undefined;
+	const bridgeOutbox: string[] = [];
+	const bridgeTools = new Map<string, any>();
+	let bridge: RunningBridge | undefined;
+	const registerTool: ExtensionAPI["registerTool"] = (tool) => {
+		bridgeTools.set(tool.name, tool);
+		pi.registerTool(tool);
+	};
+	// Pi saves a session only after a user or assistant message, and a hub has
+	// none. The hub keeps start and stop results in its own log, in the same
+	// entry shape as session tool results, so a restarted hub restores its agents.
+	const bridgeResultsFile = bridgeDir ? path.join(bridgeDir, BRIDGE_RESULTS_FILE) : undefined;
+	const readBridgeResults = (): any[] => {
+		if (!bridgeResultsFile || !existsSync(bridgeResultsFile)) return [];
+		return readFileSync(bridgeResultsFile, "utf8").split("\n").flatMap((line) => {
+			try {
+				return line.trim() ? [JSON.parse(line)] : [];
+			} catch {
+				return [];
+			}
+		});
+	};
 
 	const mergedById = <T extends { id: string }>(local: T[], remote: T[]): T[] => {
 		const values = new Map<string, T>();
@@ -3052,7 +3077,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 				: update.kind === "completion"
 					? { kind: update.kind, id: update.completion.id, title: update.completion.title, runId: update.completion.runId, outcome: update.completion.outcome }
 					: { kind: update.kind, label: update.label, count: update.completions.length });
-			pi.sendMessage({
+			if (bridgeDir) bridgeOutbox.push(content);
+			else pi.sendMessage({
 				customType: "subagent-updates",
 				content,
 				display: true,
@@ -3076,6 +3102,8 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	const scheduleParentUpdateFlush = () => {
+		// A hub is always idle. Its client pulls updates when the client is idle.
+		if (bridgeDir) return;
 		if (parentUpdateFlushScheduled || shuttingDown || !manager?.hasPendingParentUpdates() || !latestCtx?.isIdle()) return;
 		parentUpdateFlushScheduled = true;
 		queueMicrotask(() => {
@@ -3101,9 +3129,10 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		if (shuttingDown) throw new Error("Subagent extension is shutting down");
 		if (manager) return manager;
 		manager = new SubagentManager(ctx.cwd, compactionPolicy, hierarchyRegistryDir);
-		manager.restore(scanSerializedAgents(ctx).map((item) => item.contextWindow
+		const entries = [...ctx.sessionManager.getBranch(), ...readBridgeResults()];
+		manager.restore(scanSerializedAgents(entries).map((item) => item.contextWindow
 			? item
-			: { ...item, contextWindow: modelContextWindow(ctx, item.modelRef) }), scanSerializedBatches(ctx));
+			: { ...item, contextWindow: modelContextWindow(ctx, item.modelRef) }), scanSerializedBatches(entries));
 		unsubscribe = manager.subscribe((event) => {
 			scheduleWidgetRefresh();
 			scheduleHierarchyPublish();
@@ -3158,7 +3187,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		agents: Type.Array(AgentSpecSchema, { minItems: 1, description: "Agents with individual tasks. An agent role overrides the batch role." }),
 	}, { additionalProperties: false });
 
-	pi.registerTool({
+	registerTool({
 		name: START_TOOL_NAME,
 		label: "Start Subagent",
 		description: `Start one managed Pi subagent or one formal batch and return immediately. Each agent can use an optional working directory, such as an existing Git worktree. Exact provider/model-id and thinking are required for every agent. Roles are optional (${[...roles.keys()].join(", ") || "none available"}). Todo support and mid-task reports default to off. Supply single-agent fields, batch by itself, or input_file by itself containing the same request shape.`,
@@ -3256,7 +3285,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: LIST_TOOL_NAME,
 		label: "List Subagents",
 		description: "List every active direct subagent. Then list the 10 most recent completed direct subagents. Active rows include assignment, current activity, and a compact descendant summary. The result counts older omitted entries. It omits transcripts, final answers, usage, cost, cache, and context metrics.",
@@ -3285,7 +3314,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: STATUS_TOOL_NAME,
 		label: "Subagent Status",
 		description: "Return focused status for selected direct subagents. Status includes state, assignment, current tools, recent activity, errors, and descendant summary. It omits transcripts, final answers, session paths, usage, cost, cache, and context metrics.",
@@ -3319,7 +3348,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: SEND_TOOL_NAME,
 		label: "Message Subagent",
 		description: "Send one immediate instruction to selected direct subagents. Select one ID, explicit IDs, one batch, or all active and parked agents. Multi-target sends never continue completed sessions. The all-active selector requires an explicit true value.",
@@ -3393,7 +3422,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: WAIT_FOR_ANY_TOOL_NAME,
 		label: "Wait for Any Subagent",
 		description: "Wait until a direct subagent finishes, sends a mid-task report, or the timeout expires. A steering message ends only this wait. Subagents continue running. The tool also releases queued subagent updates.",
@@ -3453,7 +3482,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	/* Disabled: grouped completion notifications hide useful per-agent results.
-	pi.registerTool({
+	registerTool({
 		name: NOTIFY_ONLY_ONCE_TOOL_NAME,
 		label: "Notify Only Once When All Subagents Complete",
 		description: "Arm one nonblocking notification that fires only once after all selected direct subagents complete. Use it only when further work needs the complete set. The tool returns immediately. Selected current runs stop sending separate completion updates. Pi sends one combined update after all selected runs finish. Do not use it for normal launches. Each subagent notifies separately by default. Only one notify-only-once request can be active.",
@@ -3503,7 +3532,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	});
 	*/
 
-	pi.registerTool({
+	registerTool({
 		name: RESULT_TOOL_NAME,
 		label: "Read Subagent Result",
 		description: "Read the final answer from one completed managed subagent run. A parked coordinator is not complete. Status and list intentionally omit final answers.",
@@ -3546,7 +3575,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: STOP_TOOL_NAME,
 		label: "Stop Subagents",
 		description: "Stop selected queued, running, or parked subagent trees. Stopping a coordinator also stops its descendants. Pi preserves session files for later continuation.",
@@ -3631,7 +3660,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	if (currentAgentId && midTaskReportsEnabled) pi.registerTool({
+	if (currentAgentId && midTaskReportsEnabled) registerTool({
 		name: REPORT_TOOL_NAME,
 		label: "Report to Parent",
 		description: "Send important mid-task information to this subagent's parent. Use it for blockers, major issues, and decisions the parent needs now. Do not use it for completion or final reports. Pi sends the final answer after the complete managed task finishes.",
@@ -3653,6 +3682,48 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	const startBridge = async (dir: string) => {
+		bridge = await startBridgeServer(dir, {
+			tools: async () => ({
+				tools: [...bridgeTools.values()].map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
+				instructions: buildMainInstructions(roles, false),
+			}),
+			callTool: async (name, params) => {
+				const tool = bridgeTools.get(name);
+				if (!tool) return { text: `Unknown tool ${name}. Known tools: ${[...bridgeTools.keys()].join(", ")}`, isError: true };
+				if (!latestCtx) return { text: "The hub session is not ready.", isError: true };
+				try {
+					const args = tool.prepareArguments ? tool.prepareArguments(params) : params;
+					const value = await tool.execute(`bridge-${randomUUID().slice(0, 8)}`, args, undefined, undefined, latestCtx);
+					if (bridgeResultsFile && (name === START_TOOL_NAME || name === STOP_TOOL_NAME)) {
+						await appendFile(bridgeResultsFile, `${JSON.stringify({ type: "message", message: { role: "toolResult", toolName: name, details: value?.details } })}\n`, "utf8");
+					}
+					return { text: resultText(value), isError: false };
+				} catch (error) {
+					return { text: error instanceof Error ? error.message : String(error), isError: true };
+				}
+			},
+			drain: async () => {
+				if (bridgeOutbox.length === 0) await flushParentUpdates("followUp");
+				if (bridgeOutbox.length === 0) return undefined;
+				return bridgeOutbox.splice(0).join("\n\n---\n\n");
+			},
+			state: async () => {
+				const now = Date.now();
+				const records = mergedById(manager?.list() ?? [], hierarchyRecords);
+				const visible = records.filter((record) => isActive(record) || isRecentlyFinished(record, now));
+				const batches = mergedById(manager?.listBatches() ?? [], hierarchyBatches);
+				return {
+					text: visible.length > 0 ? formatTreeList(visible, batches) : undefined,
+					active: records.filter(isActive).length,
+					pending: (manager?.pendingCompletionCount() ?? 0) + bridgeOutbox.length,
+				};
+			},
+			interrupt: async () => waitInterrupts.interruptForSteer(),
+			shutdown: async () => latestCtx?.shutdown(),
+		});
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		const headerTimestamp = Date.parse(String(ctx.sessionManager.getHeader().timestamp));
@@ -3661,6 +3732,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		hierarchyRegistryDir ??= path.join(tmpdir(), "pi-subagent-hierarchy", ctx.sessionManager.getSessionId());
 		await mkdir(hierarchyRegistryDir, { recursive: true });
 		ensureManager(ctx);
+		if (bridgeDir && !bridge) await startBridge(bridgeDir);
 		publishPendingWork();
 		if (currentAgentId && ownTodoStatus) ctx.ui.notify(childTodoNotification(ownTodoStatus), "info");
 		if (currentAgentId) {
@@ -3681,6 +3753,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
 		waitInterrupts.abortAll();
+		const runningBridge = bridge;
+		bridge = undefined;
+		await runningBridge?.close();
 		parentUpdateFlushScheduled = false;
 		if (hierarchyTimer) clearInterval(hierarchyTimer);
 		if (hierarchyPublishTimer) clearTimeout(hierarchyPublishTimer);

@@ -1,0 +1,7 @@
+{
+  "name": "pi-bridge",
+  "version": "0.1.0",
+  "description": "Runs Pi subagents from Claude Code and mirrors Claude Code sessions into Pi session files.",
+  "author": { "name": "dcostap" },
+  "types": "./types/index.d.ts"
+}
