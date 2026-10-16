@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { execSync, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
@@ -7,7 +7,7 @@ import * as readline from "readline";
 
 /**
  * Processes Pi agent JSONL session logs into readable text format
- * Output directory: ~/.pi/agent/pi-sessions-extracted/
+ * Output directory: pi-sessions-extracted/ in the configured agent directory.
  */
 
 interface SessionMeta {
@@ -626,7 +626,7 @@ function describeToolFilter(toolFilter: ToolFilter | null): string | null {
   return "tool calls";
 }
 
-const OUTPUT_DIR = path.join(os.homedir(), ".pi", "agent", "pi-sessions-extracted");
+const OUTPUT_DIR = path.join(getAgentDir(), "pi-sessions-extracted");
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("md", {

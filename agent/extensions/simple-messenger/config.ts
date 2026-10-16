@@ -1,3 +1,4 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -47,7 +48,7 @@ export function matchesPathPattern(cwd: string, patterns: string[]): boolean {
 }
 
 export function loadConfig(cwd: string): SimpleMessengerConfig {
-  const userPath = join(homedir(), ".pi", "agent", "messenger.json");
+  const userPath = join(getAgentDir(), "messenger.json");
   const projectPath = join(cwd, ".pi", "messenger.json");
 
   const merged = {

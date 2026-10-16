@@ -54,6 +54,10 @@ Or create:
 
 `%USERPROFILE%\.pi\web-smart-fetch.json`
 
+With `PI_CODING_AGENT_DIR`, put this file beside the configured agent directory.
+For example, `profile/agent` uses `profile/web-smart-fetch.json`.
+Fetch artifacts and caches remain in local application data.
+
 ```json
 {
   "firecrawlApiKey": "fc-...",

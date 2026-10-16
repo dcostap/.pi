@@ -1,6 +1,7 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export type ExtensionConfig = {
 	firecrawlApiKey?: string;
@@ -19,8 +20,8 @@ export type ExtensionConfig = {
 
 const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
 const baseDir = join(localAppData, "pi-web-smart-fetch");
-const configPath = join(homedir(), ".pi", "web-smart-fetch.json");
-const legacyConfigPath = join(homedir(), ".pi", "firecrawl-smart-fetch.json");
+const configPath = join(dirname(getAgentDir()), "web-smart-fetch.json");
+const legacyConfigPath = join(dirname(getAgentDir()), "firecrawl-smart-fetch.json");
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
 	const parsed = Number.parseInt(String(value ?? ""), 10);

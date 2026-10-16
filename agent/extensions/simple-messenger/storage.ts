@@ -1,3 +1,4 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   appendFileSync,
   existsSync,
@@ -10,7 +11,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
@@ -375,7 +375,7 @@ function sanitizeFileStem(value: string): string {
 }
 
 function watchRulesPath(watcherName: string): string {
-  return join(homedir(), ".pi", "agent", "simple-messenger", "idle-watch", `${sanitizeFileStem(watcherName)}.json`);
+  return join(getAgentDir(), "simple-messenger", "idle-watch", `${sanitizeFileStem(watcherName)}.json`);
 }
 
 export function readIdleWatchStore(watcherName: string): IdleWatchStore {

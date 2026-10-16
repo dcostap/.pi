@@ -331,9 +331,9 @@ export default async function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		}, 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
+			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or add web-smart-fetch.json beside the agent directory.");
 			const client = await getFirecrawlClient(config);
-			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
+			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or add web-smart-fetch.json beside the agent directory.");
 			onUpdate?.({ content: [{ type: "text", text: "Searching with Firecrawl..." }] });
 			const result: any = await searchWithFirecrawl(client, params.query, 10, signal);
 			const dir = makeArtifactDir(config.fetchesDir, "search", params.query);
@@ -388,9 +388,9 @@ export default async function (pi: ExtensionAPI) {
 			return renderLine(text, theme, context);
 		},
 		async execute(_toolCallId, params, signal, onUpdate) {
-			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
+			if (!config.firecrawlApiKey) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or add web-smart-fetch.json beside the agent directory.");
 			const client = await getFirecrawlClient(config);
-			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or ~/.pi/web-smart-fetch.json");
+			if (!client) throw new Error("Firecrawl is not configured. Set FIRECRAWL_API_KEY or add web-smart-fetch.json beside the agent directory.");
 			onUpdate?.({ content: [{ type: "text", text: "Crawling with Firecrawl..." }] });
 			const result: any = await crawlWithFirecrawl(client, params.url, 20, signal);
 			const dir = makeArtifactDir(config.crawlDir, "crawl", params.url);

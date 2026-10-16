@@ -1,7 +1,7 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
 import type { ProjectInfo } from "./types.js";
 
 function tryRealpath(path: string): string {
@@ -95,7 +95,7 @@ export function detectProjectInfo(cwd: string): ProjectInfo {
 
   const label = basename(rootDir) || basename(cwd) || "project";
   const key = `${slugify(label)}-${hashPath(scopePath.toLowerCase())}`;
-  const projectDir = join(homedir(), ".pi", "agent", "messenger", "projects", key);
+  const projectDir = join(getAgentDir(), "messenger", "projects", key);
 
   return {
     key,

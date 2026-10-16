@@ -1,9 +1,9 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { promises as fs } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 export const FAST_CHEAP_ROLE = "fastCheap";
-export const MODEL_ROLES_FILE = join(homedir(), ".pi", "agent", "model-roles.local.json");
+export const MODEL_ROLES_FILE = join(getAgentDir(), "model-roles.local.json");
 
 export type ModelRoleName = typeof FAST_CHEAP_ROLE | string;
 
@@ -87,7 +87,7 @@ export async function writeModelRole(role: ModelRoleName, config: ModelRoleConfi
 	const roles = { ...(file.roles ?? {}) };
 	if (config) roles[role] = config;
 	else delete roles[role];
-	await fs.mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
+	await fs.mkdir(dirname(MODEL_ROLES_FILE), { recursive: true });
 	await fs.writeFile(MODEL_ROLES_FILE, JSON.stringify({ ...file, roles }, null, 2) + "\n", "utf8");
 }
 
