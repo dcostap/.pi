@@ -41,7 +41,7 @@ Edit `profile/agent/settings.json` on that branch:
 
 - Set `defaultTools` to `["read", "powershell", "edit", "write"]`.
 - Set `defaultProjectTrust` to `"ask"`.
-- Add `"-extensions/background-processes"` to `extensions`. That extension requires Bash.
+- Add `"-extensions/background-processes/index.ts"` to `extensions`. That extension requires Bash.
 
 Keep the other settings unchanged. Commit these changes on `intranet`.
 This branch can remain local. Do not push it unless you want to publish it.
@@ -100,6 +100,8 @@ Your account must have administrator rights on that PC.
 Run `/login openai-codex` in Pi.
 Pi saves and refreshes credentials in `profile/agent/auth.json`.
 Provider revocation or expired credentials can require another login.
+Use `/model` to select your Codex model after signing in.
+Codex model discovery may require this first sign-in.
 
 Configure `/fast-model` once if you need the extensions that use that model role.
 Add other provider credentials only when those features need them.
