@@ -19,7 +19,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { basename } from "node:path";
 import {
     statSync,
     openSync,
@@ -248,6 +248,16 @@ export default function (pi: ExtensionAPI) {
                     );
                 }
 
+                const piCommand = process.platform === "win32" ? process.execPath : "pi";
+                const needsScript = process.platform === "win32" && /^(node|bun)(\.exe)?$/i.test(basename(process.execPath));
+                const currentScript = process.argv[1];
+                if (needsScript && !currentScript) throw new Error("Cannot find the current Pi CLI entry point");
+                const piArgs = [
+                    ...(needsScript ? [currentScript!] : []),
+                    "--session",
+                    destSessionFile,
+                ];
+
                 // --- Tear down the parent's terminal usage ---
                 // We do this BEFORE spawning, to avoid nesting Kitty protocol flags.
                 process.stdout.write("\x1b[<u");      // Pop kitty keyboard protocol
@@ -262,23 +272,7 @@ export default function (pi: ExtensionAPI) {
                 // Spawn new pi in the target directory.
                 // On Windows, avoid both `spawn("pi")` (may not resolve npm shims)
                 // and `shell: true` (can split paths containing spaces). Launch the
-                // installed Pi CLI JS with the current Node executable instead.
-                const piCommand = process.platform === "win32" ? process.execPath : "pi";
-                const piArgs = process.platform === "win32"
-                    ? [
-                        join(
-                            process.env.APPDATA || join(process.env.USERPROFILE || "", "AppData", "Roaming"),
-                            "npm",
-                            "node_modules",
-                            "@earendil-works",
-                            "pi-coding-agent",
-                            "dist",
-                            "cli.js",
-                        ),
-                        "--session",
-                        destSessionFile,
-                    ]
-                    : ["--session", destSessionFile];
+                // current CLI script with Node/Bun, or the compiled executable directly.
                 const child = spawn(piCommand, piArgs, {
                     cwd: targetCwd,
                     stdio: "inherit",

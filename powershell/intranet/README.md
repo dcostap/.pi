@@ -27,8 +27,15 @@ Folder permissions do not protect credentials from administrators or malware on 
 
 Commit the portable configuration changes before cloning the repo.
 Use a network Pi version that supports your current extensions.
-Copy the complete installation, not only `pi.exe`.
+Use portable Node.js 22 and Pi's npm package, not the standalone Bun executable.
+This runtime supports 64-bit Windows 10 and Windows Server 2016 or later.
+Bun requires Windows 10 version 1809 or later, which excludes Server 2016 version 1607.
+This setup does not support Windows 7 or Windows 8.
+No Node.js installation is needed on client PCs.
 Do not update files while network Pi processes are running.
+
+References: [Node.js 22 platforms](https://github.com/nodejs/node/blob/v22.x/BUILDING.md#platform-list)
+and [Bun installation requirements](https://bun.com/docs/installation).
 
 ## Create the network clone
 
@@ -56,6 +63,42 @@ Edit `profile/agent/settings.json` on that branch:
 
 Keep the other settings unchanged. Commit these changes on `intranet`.
 This branch can remain local. Do not push it unless you want to publish it.
+
+## Install the portable runtime
+
+Run this from your management PC. Stage the package locally because npm can fail on UNC paths.
+Keep the Node.js version and checksum together when updating this recipe.
+
+```powershell
+$runtimeStage = Join-Path $env:TEMP ("pi-runtime-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $runtimeStage | Out-Null
+try {
+    $node = Join-Path $runtimeStage 'node.exe'
+    Invoke-WebRequest -UseBasicParsing 'https://nodejs.org/dist/v22.23.3/win-x64/node.exe' -OutFile $node
+    $expected = '9c9245166b4a8e182e0b797da9c20136117ff24368eaff1fec8343a123c8db0e'
+    if ((Get-FileHash $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+        throw 'The Node.js download failed checksum verification.'
+    }
+    Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/nodejs/node/v22.23.3/LICENSE' `
+        -OutFile (Join-Path $runtimeStage 'Node-LICENSE.txt')
+    npm --prefix $runtimeStage install --save-exact --omit=dev --ignore-scripts --no-audit --no-fund `
+        '@earendil-works/pi-coding-agent@1.3.0'
+    if ($LASTEXITCODE -ne 0) { throw 'Pi runtime installation failed.' }
+    $cli = Join-Path $runtimeStage 'node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js'
+    & $node $cli --version
+    if ($LASTEXITCODE -ne 0) { throw 'Pi runtime verification failed.' }
+    robocopy $runtimeStage "$target\runtime" /E /PURGE /COPY:DAT /R:2 /W:1
+    if ($LASTEXITCODE -ge 8) { throw 'Pi runtime copy failed.' }
+} finally {
+    Remove-Item $runtimeStage -Recurse -Force
+}
+```
+
+Only copy generated runtime files into `pi/runtime`.
+Do not copy the private profile into that directory.
+Keep client sessions stopped while replacing runtime files.
+
+## Install extension dependencies
 
 Install extension dependencies from your PC:
 
@@ -94,8 +137,13 @@ pi-launcher/                    # public read-only entry point
   Start-Pi.cmd
   Start-Pi.ps1
 pi/                             # private installation and profile
-  pi.exe
-  ...other Pi installation files...
+  runtime/
+    node.exe
+    Node-LICENSE.txt
+    package.json
+    package-lock.json
+    node_modules/
+      @earendil-works/pi-coding-agent/
   profile/
     .git/
     powershell/intranet/Start-Pi.ps1
@@ -132,6 +180,7 @@ For Firecrawl, put `web-smart-fetch.json` beside `profile/agent`, not inside it.
 Run `Start-Pi.cmd`. Pi and its commands run elevated.
 Use the copy in the public `pi-launcher` folder, not the private installation.
 The launcher shows the Windows identity before starting Pi.
+It runs Pi through portable Node.js, including on Server 2016.
 It uses the network profile and keeps sessions in local application data.
 It starts in the local system drive root, not the shared configuration repo.
 
@@ -161,4 +210,5 @@ Resolve conflicts without discarding the `intranet` settings.
 Do not use `git clean -x`; it can delete ignored credentials.
 Install dependencies again when their lockfiles change.
 Copy both launcher files to `pi-launcher` again when their source changes.
-Update the complete Pi installation separately when needed.
+Update the portable Node.js and Pi runtime separately when needed.
+Verify new versions before deploying them to the shared runtime directory.

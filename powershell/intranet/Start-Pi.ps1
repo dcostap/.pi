@@ -31,7 +31,9 @@ try {
 
     $PiDirectory = [IO.Path]::GetFullPath($PiDirectory)
     $agentDirectory = Join-Path $PiDirectory "profile\agent"
-    $pi = Join-Path $PiDirectory "pi.exe"
+    $runtimeDirectory = Join-Path $PiDirectory "runtime"
+    $node = Join-Path $runtimeDirectory "node.exe"
+    $pi = Join-Path $runtimeDirectory "node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js"
 
     Write-Host "Running elevated as $($identity.Name)"
 
@@ -51,22 +53,24 @@ try {
         }
     }
 
-    if (-not [IO.File]::Exists($pi)) {
-        throw "Cannot read $pi. Check the installation and network permissions."
+    if (-not [IO.File]::Exists($node) -or -not [IO.File]::Exists($pi)) {
+        throw "Cannot read the portable Node.js runtime or Pi CLI in $runtimeDirectory. Check the installation and permissions."
     }
     if (-not [IO.File]::Exists((Join-Path $agentDirectory "settings.json"))) {
         throw "Cannot read settings.json in $agentDirectory. Complete the profile setup first."
     }
 
     $env:PI_CODING_AGENT_DIR = $agentDirectory
+    $env:PATH = "$runtimeDirectory;$env:PATH"
     $localData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
     $env:PI_CODING_AGENT_SESSION_DIR = Join-Path $localData "Pi-Intranet\sessions"
     [IO.Directory]::CreateDirectory($env:PI_CODING_AGENT_SESSION_DIR) | Out-Null
 
     Set-Location -LiteralPath $WorkingDirectory
+    Write-Host "Runtime: portable Node.js"
     Write-Host "Profile: $agentDirectory"
     Write-Host "Sessions: $env:PI_CODING_AGENT_SESSION_DIR"
-    & $pi
+    & $node $pi
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         Read-Host "Pi exited with code $exitCode. Press Enter to close" | Out-Null
