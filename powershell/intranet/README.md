@@ -3,6 +3,7 @@
 Use a network installation with a separate clone of this configuration repo.
 Keep the clone on its local `intranet` branch.
 Keep credentials outside Git.
+Put the public launcher in `pi-launcher`, beside the private `pi` directory.
 
 ## Before deployment
 
@@ -10,6 +11,16 @@ Check share permissions and restrict this folder's NTFS permissions before using
 Do not change permissions for the entire software share.
 Allow your domain account and the required system and administrator accounts.
 Other users must not have write access to the executable, scripts, or profile.
+
+Create the separate `pi-launcher` folder before copying the launcher files.
+Disable permission inheritance on that folder.
+Give Everyone Read and Execute access only.
+Preserve system, administrator, and your maintenance account's write access.
+Do not put credentials, the executable, or the profile in that public folder.
+
+Explorer normally uses the logged-in user's domain credentials for network access.
+Denying access to the private folder does not request another identity.
+The public launcher requests elevation before accessing private files.
 
 The launcher runs code from that folder with local administrator permissions.
 Folder permissions do not protect credentials from administrators or malware on the client PC.
@@ -67,7 +78,10 @@ try {
 } finally {
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 }
-Copy-Item (Join-Path $profile 'powershell\intranet\Start-Pi.cmd') (Join-Path $target 'Start-Pi.cmd')
+$public = Join-Path (Split-Path $target -Parent) 'pi-launcher'
+foreach ($file in 'Start-Pi.cmd', 'Start-Pi.ps1') {
+    Copy-Item (Join-Path $profile "powershell\intranet\$file") $public
+}
 ```
 
 Install locally because npm can fail on UNC paths.
@@ -76,9 +90,11 @@ Only mirror the generated `node_modules` folders. Do not mirror the entire profi
 The target layout is:
 
 ```text
-pi/
-  pi.exe
+pi-launcher/                    # public read-only entry point
   Start-Pi.cmd
+  Start-Pi.ps1
+pi/                             # private installation and profile
+  pi.exe
   ...other Pi installation files...
   profile/
     .git/
@@ -93,9 +109,13 @@ pi/
 
 ## Sign in once
 
-Open the protected folder in Explorer and run `Start-Pi.cmd`.
-Choose your domain administrator account in the UAC prompt.
+Open `pi-launcher` in Explorer and run `Start-Pi.cmd`.
+Windows requests administrator approval or credentials before Pi accesses the private folder.
+Choose your domain administrator account when Windows requests credentials.
 Your account must have administrator rights on that PC.
+If Windows requests approval only, it keeps the current Windows identity.
+Use `runas /user:"DOMAIN\YourUser" cmd.exe` first when you need a different identity in that case.
+Run the public launcher from that command window.
 
 Run `/login openai-codex` in Pi.
 Pi saves and refreshes credentials in `profile/agent/auth.json`.
@@ -110,6 +130,7 @@ For Firecrawl, put `web-smart-fetch.json` beside `profile/agent`, not inside it.
 ## Daily use
 
 Run `Start-Pi.cmd`. Pi and its commands run elevated.
+Use the copy in the public `pi-launcher` folder, not the private installation.
 The launcher shows the Windows identity before starting Pi.
 It uses the network profile and keeps sessions in local application data.
 It starts in the local system drive root, not the shared configuration repo.
@@ -139,5 +160,5 @@ git -c $gitTrust -C $profile merge origin/main
 Resolve conflicts without discarding the `intranet` settings.
 Do not use `git clean -x`; it can delete ignored credentials.
 Install dependencies again when their lockfiles change.
-Copy `Start-Pi.cmd` again when its source changes.
+Copy both launcher files to `pi-launcher` again when their source changes.
 Update the complete Pi installation separately when needed.
