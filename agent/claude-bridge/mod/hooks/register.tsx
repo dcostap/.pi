@@ -18,6 +18,9 @@ const tree = atom({ plugin: 'pi-bridge', key: 'tree' } as const, null)
 type Hub = { port: number; token: string; session: string }
 type ToolSpecs = { tools: { name: string; description: string; parameters: Record<string, unknown> }[]; instructions: string }
 type State = {
+  // Claude Code runs under Pi (pi-claude-bridge): Pi owns the subagents and
+  // the session, so the mod stays out of the way.
+  isUnderPi: boolean
   hub?: Hub
   starting?: Promise<Hub>
   instructions: string
@@ -181,9 +184,12 @@ async function endSession($: EngineInterface, s: State, sessionId: string): Prom
 }
 
 export const register: Register = on => {
-  const s: State = { instructions: '', isBusy: false, isTicking: false, hasTimer: false, isMirrorDirty: false, lastTree: 'null' }
+  const s: State = { isUnderPi: false, instructions: '', isBusy: false, isTicking: false, hasTimer: false, isMirrorDirty: false, lastTree: 'null' }
 
   on('session.start', async ($, e, next) => {
+    // Pi sets PI_CODING_AGENT in its own process, so its children inherit it.
+    s.isUnderPi = (await $.env.get('PI_CODING_AGENT')) === 'true'
+    if (s.isUnderPi) return next(e)
     await registerTools($, s)
     // /clear starts a new session in the same load. Keep one timer.
     if (!s.hasTimer) $.clock.every(TICK_MS, () => void tick($, s))
@@ -237,7 +243,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
-    await endSession($, s, e.sessionId)
+    if (!s.isUnderPi) await endSession($, s, e.sessionId)
     return next(e)
   })
 

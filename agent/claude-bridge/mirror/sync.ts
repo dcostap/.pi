@@ -2,7 +2,8 @@
 //
 //   bun sync.ts session <claude-session-id>   mirror one session
 //   bun sync.ts file <transcript.jsonl>       mirror one transcript file
-//   bun sync.ts backfill                      mirror every Claude Code session
+//   bun sync.ts backfill                      mirror every Claude Code session,
+//                                             except those an Agent SDK host ran
 //
 // Options: --claude-dir <dir> (default ~/.claude/projects)
 //          --sessions-dir <dir> (default ~/.pi/agent/sessions)
@@ -19,8 +20,8 @@ import { convertTranscript, entryId, parseJsonl, type PiEntry } from "./convert.
 
 export const MARKER_TYPE = "claude-code-mirror";
 
-export type SyncOptions = { sessionsDir: string };
-export type SyncResult = { status: "written" | "unchanged" | "empty"; file?: string };
+export type SyncResult = { status: "written" | "unchanged" | "empty" | "skipped"; file?: string };
+export type SyncOptions = { sessionsDir: string; skipSdk?: boolean };
 
 /** Pi's session folder name for a working directory. */
 export function sessionFolderName(cwd: string): string {
@@ -93,7 +94,11 @@ async function writeAtomic(file: string, content: string): Promise<void> {
 
 export async function syncTranscript(transcriptFile: string, options: SyncOptions): Promise<SyncResult> {
 	const claudeSessionId = path.basename(transcriptFile, ".jsonl");
-	const converted = convertTranscript(parseJsonl(await readFile(transcriptFile, "utf8")), claudeSessionId);
+	const rows = parseJsonl(await readFile(transcriptFile, "utf8"));
+	// pi-claude-bridge and other Agent SDK hosts write "sdk-*" entrypoints. Their
+	// sessions are copies of conversations that already live in that host.
+	if (options.skipSdk && rows.some((r) => String(r.entrypoint ?? "").startsWith("sdk"))) return { status: "skipped" };
+	const converted = convertTranscript(rows, claudeSessionId);
 	if (!converted || !converted.header.cwd) return { status: "empty" };
 	const folder = path.join(options.sessionsDir, sessionFolderName(converted.header.cwd));
 	const markerId = entryId(`${claudeSessionId}:marker`);
@@ -163,7 +168,7 @@ async function main(argv: string[]): Promise<number> {
 		let failed = 0;
 		for (const file of await listTranscripts(claudeDir)) {
 			try {
-				const result = await syncTranscript(file, options);
+				const result = await syncTranscript(file, { ...options, skipSdk: true });
 				console.log(`${result.status.padEnd(9)} ${path.basename(file)}${result.file ? ` -> ${result.file}` : ""}`);
 			} catch (error) {
 				failed++;

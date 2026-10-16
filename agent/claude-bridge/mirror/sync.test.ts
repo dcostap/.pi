@@ -37,6 +37,12 @@ afterEach(async () => {
 });
 
 describe("syncTranscript", () => {
+	test("skips an Agent SDK transcript only when asked", async () => {
+		await appendFile(transcript, row({ type: "queue-operation", entrypoint: "sdk-ts", sessionId: SESSION }));
+		expect(await syncTranscript(transcript, { sessionsDir, skipSdk: true })).toEqual({ status: "skipped" });
+		expect((await syncTranscript(transcript, { sessionsDir })).status).toBe("written");
+	});
+
 	test("uses Pi's folder name rule", () => {
 		expect(sessionFolderName("C:\\Users\\Dario Costa\\.pi")).toBe("--C--Users-Dario Costa-.pi--");
 		expect(sessionFolderName("/home/me/x")).toBe("--home-me-x--");

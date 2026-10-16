@@ -21,14 +21,17 @@ type Fake = {
   jobs: number
   isCallFailing: boolean
   lines: unknown[][] | null
+  env: Record<string, string>
 }
 
 // Answers what the mod asks of the engine: processes, HTTP, tools, prompts.
 function fakeWorld(on: On): Fake {
-  const fake: Fake = { clock: mock.clock(on), registered: [], runs: [], posts: [], submitted: [], pending: null, callResult: { text: 'ok', isError: false }, jobs: 0, isCallFailing: false, lines: null }
+  const fake: Fake = { clock: mock.clock(on), registered: [], runs: [], posts: [], submitted: [], pending: null, callResult: { text: 'ok', isError: false }, jobs: 0, isCallFailing: false, lines: null, env: {} }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.end', ($, e) => e)
   on('session.id', () => ({ value: 'session-1' }))
   on('session.cwd', () => ({ value: 'C:/work' }))
+  on('env.get', ($, e) => ({ value: fake.env[e.name] }))
   on('ui.log', () => ({ value: undefined }))
   on('tool.register', ($, e) => {
     fake.registered.push(e.name)
@@ -78,6 +81,17 @@ describe('pi-bridge', () => {
     await $.session.start({ cwd: 'C:/work', surface: null, isInteractive: false })
     expect(fake.registered).toEqual(['subagent_list', 'subagent_wait_for_any'])
     expect(fake.runs[0]!.at(-1)).toBe('tools')
+  })
+
+  test('stays out of the way when Claude Code runs under Pi', async ($, on) => {
+    const fake = fakeWorld(on)
+    fake.env.PI_CODING_AGENT = 'true'
+    await $.session.start({ cwd: 'C:/work', surface: null, isInteractive: false })
+    await fake.clock.advance(2500)
+    await $.session.end({ sessionId: 'session-1' })
+    expect(fake.registered).toEqual([])
+    expect(fake.runs).toEqual([])
+    expect(fake.posts).toEqual([])
   })
 
   test('a tool call starts the hub once and returns its text', async ($, on) => {
