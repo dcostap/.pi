@@ -4,7 +4,7 @@
  * Codex-only usage indicator.
  */
 
-import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   Container,
   Input,
@@ -15,7 +15,6 @@ import {
   type Focusable,
 } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
@@ -23,7 +22,7 @@ const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STATUS_KEY = "better-codex-support-usage";
 const SHOW_THRESHOLD = 80;
 const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
-const AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
+const AGENT_DIR = getAgentDir();
 const AUTH_FILE = path.join(AGENT_DIR, "auth.json");
 const OBSERVATIONS_FILE = path.join(AGENT_DIR, "codex-usage-observations.jsonl");
 
