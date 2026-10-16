@@ -53,8 +53,6 @@ agent/sessions/
 agent/bin/
 agent/npm/
 agent/git/
-agent/messenger/
-agent/simple-messenger/
 agent/codex-usage-observations.jsonl
 agent/pi-crash.log
 agent/*.log
