@@ -3163,7 +3163,11 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${buildMainInstructions(roles, Boolean(currentAgentId) && midTaskReportsEnabled)}` }));
+	// A section, not a returned systemPrompt: providers that rebuild the prompt
+	// from Pi's parts, such as pi-claude-bridge, drop a replaced prompt.
+	pi.on("before_agent_start", (event) => {
+		event.systemPromptOptions.sections.subagents = buildMainInstructions(roles, Boolean(currentAgentId) && midTaskReportsEnabled);
+	});
 	const AgentSpecSchema = Type.Object({
 		title: Type.String({ minLength: 1, description: "Short human-readable subagent title." }),
 		task: Type.String({ minLength: 1, description: "Complete individual task for this subagent." }),
