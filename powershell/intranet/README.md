@@ -15,7 +15,7 @@ The launcher runs code from that folder with local administrator permissions.
 Folder permissions do not protect credentials from administrators or malware on the client PC.
 
 Commit the portable configuration changes before cloning the repo.
-Update the network Pi installation to the same version as your working installation.
+Use a network Pi version that supports your current extensions.
 Copy the complete installation, not only `pi.exe`.
 Do not update files while network Pi processes are running.
 
@@ -29,9 +29,13 @@ $source = Join-Path $HOME '.pi'
 $profile = Join-Path $target 'profile'
 $origin = git -C $source remote get-url origin
 git clone --no-hardlinks $source $profile
-git -C $profile remote set-url origin $origin
-git -C $profile switch -c intranet
+$gitTrust = "safe.directory=$($profile.Replace('\', '/'))"
+git -c $gitTrust -C $profile remote set-url origin $origin
+git -c $gitTrust -C $profile switch -c intranet
 ```
+
+The command-scoped trust allows Git to use a share whose owner is the server's administrator group.
+It does not change global Git settings or trust other folders.
 
 Edit `profile/agent/settings.json` on that branch:
 
@@ -108,8 +112,9 @@ Run these commands from your own PC:
 ```powershell
 $target = '\\server\share\pi'
 $profile = Join-Path $target 'profile'
-git -C $profile fetch origin
-git -C $profile merge origin/main
+$gitTrust = "safe.directory=$($profile.Replace('\', '/'))"
+git -c $gitTrust -C $profile fetch origin
+git -c $gitTrust -C $profile merge origin/main
 ```
 
 Resolve conflicts without discarding the `intranet` settings.
