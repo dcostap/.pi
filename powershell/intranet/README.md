@@ -49,12 +49,29 @@ This branch can remain local. Do not push it unless you want to publish it.
 Install extension dependencies from your PC:
 
 ```powershell
-Push-Location (Join-Path $profile 'agent\extensions\ssh-session')
-try { npm ci --omit=dev --ignore-scripts --no-audit --no-fund } finally { Pop-Location }
-Push-Location (Join-Path $profile 'agent\extensions\web-smart-fetch')
-try { npm ci --omit=dev --ignore-scripts --no-audit --no-fund } finally { Pop-Location }
+$stage = Join-Path $env:TEMP ("pi-deps-" + [guid]::NewGuid())
+try {
+    foreach ($extension in 'ssh-session', 'web-smart-fetch') {
+        $destination = Join-Path $profile "agent\extensions\$extension"
+        $local = Join-Path $stage $extension
+        New-Item -ItemType Directory -Path $local -Force | Out-Null
+        Copy-Item (Join-Path $destination 'package*.json') $local
+        if (Test-Path (Join-Path $destination '.npmrc')) {
+            Copy-Item (Join-Path $destination '.npmrc') $local
+        }
+        npm --prefix $local ci --omit=dev --ignore-scripts --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed: $extension" }
+        robocopy "$local\node_modules" "$destination\node_modules" /MIR /COPY:DAT /R:2 /W:1
+        if ($LASTEXITCODE -ge 8) { throw "Dependency copy failed: $extension" }
+    }
+} finally {
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+}
 Copy-Item (Join-Path $profile 'powershell\intranet\Start-Pi.cmd') (Join-Path $target 'Start-Pi.cmd')
 ```
+
+Install locally because npm can fail on UNC paths.
+Only mirror the generated `node_modules` folders. Do not mirror the entire profile.
 
 The target layout is:
 
