@@ -13,6 +13,7 @@
 !agent/keybindings.json
 !agent/settings.json
 !agent/models.json
+!agent/claude-bridge.json
 !agent/model-roles.example.json
 agent/model-roles.local.json
 

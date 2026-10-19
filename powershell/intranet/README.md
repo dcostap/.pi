@@ -60,6 +60,7 @@ Edit `profile/agent/settings.json` on that branch:
 - Set `defaultTools` to `["read", "powershell", "edit", "write"]`.
 - Set `defaultProjectTrust` to `"ask"`.
 - Add `"-extensions/background-processes/index.ts"` to `extensions`. That extension requires Bash.
+- Remove `"git:github.com/dcostap/pi-claude-bridge"` from `packages`. Pi stops at startup when it cannot clone a package.
 
 Keep the other settings unchanged. Commit these changes on `intranet`.
 This branch can remain local. Do not push it unless you want to publish it.

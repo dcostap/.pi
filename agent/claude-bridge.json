@@ -1,0 +1,6 @@
+{
+  "provider": {
+    "plan": "max",
+    "contextWindow": 300000
+  }
+}
