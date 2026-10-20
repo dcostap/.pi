@@ -111,13 +111,6 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			"Unrestricted root until disconnect",
 		]);
 		if (!privilege) return;
-		if (privilege === "Unrestricted root until disconnect") {
-			const rootApproved = await ctx.ui.confirm(
-				"Grant unrestricted root access?",
-				`The agent may run any command as root on ${target.user}@${target.hostName} without further confirmation until this SSH session closes.`,
-			);
-			if (!rootApproved) return;
-		}
 
 		const client = await connectClient(ctx, target, knownFingerprints);
 		try {
