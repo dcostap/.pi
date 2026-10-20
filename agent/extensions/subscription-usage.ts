@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
+const CLAUDE_POLL_INTERVAL_MS = 30 * 60 * 1000;
 const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STATUS_KEY = "subscription-usage";
 const SHOW_THRESHOLD = 80;
@@ -945,6 +946,7 @@ export default function (pi: ExtensionAPI) {
       // Never display one account's quota while the other account is active.
       state.usage = null;
       updateStatus();
+      if (pollTimer) restartPollTimer();
       return true;
     }
 
@@ -1110,16 +1112,20 @@ export default function (pi: ExtensionAPI) {
     } while (pollQueued);
   }
 
+  function restartPollTimer() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+      void poll("periodic");
+    }, state.activeProvider === CLAUDE_BRIDGE_PROVIDER_ID ? CLAUDE_POLL_INTERVAL_MS : POLL_INTERVAL_MS);
+  }
+
   pi.on("session_start", async (_event, _ctx) => {
     ctx = _ctx;
     updateProviderFrom(_ctx.model);
 
     await poll("session_start", true);
 
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => {
-      void poll("periodic");
-    }, POLL_INTERVAL_MS);
+    restartPollTimer();
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
