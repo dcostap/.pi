@@ -92,10 +92,14 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 		const target = resolveTarget(requested);
 		const knownFingerprints = getKnownFingerprints(target);
 
-		const privilege = await ctx.ui.select("Agent privilege for this SSH session", [
-			"Normal commands only",
-			"Unrestricted root until disconnect",
-		]);
+		// A root login already runs every exec as root, so sudo adds nothing.
+		const loginIsRoot = target.user === "root";
+		const privilege = loginIsRoot
+			? "Normal commands only"
+			: await ctx.ui.select("Agent privilege for this SSH session", [
+					"Normal commands only",
+					"Unrestricted root until disconnect",
+				]);
 		if (!privilege) return;
 
 		const client = await connectClient(ctx, target, knownFingerprints);
@@ -142,9 +146,11 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			setStatus(ctx);
 			announce(
 				`The user authorized SSH access to ${target.user}@${target.hostName} (${remoteCwd}). ` +
-				(session.rootShell
-					? "The ssh_session tool may run normal and unrestricted root commands until disconnect."
-					: "The ssh_session tool may run normal commands; root access was not authorized."),
+				(loginIsRoot
+					? "The session is logged in as root, so exec runs commands as root; sudo_exec is not needed."
+					: session.rootShell
+						? "The ssh_session tool may run normal and unrestricted root commands until disconnect."
+						: "The ssh_session tool may run normal commands; root access was not authorized."),
 			);
 			ctx.ui.notify(`Connected to ${target.user}@${target.hostName}:${target.port}${session.rootShell ? " with session root access" : ""}`, "info");
 		} catch (error) {
@@ -235,6 +241,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 				case "sudo_exec": {
 					const command = requireCommand(params.command);
 					if (!active.rootShell) {
+						if (active.target.user === "root") throw new Error("This SSH session is logged in as root; use exec");
 						throw new Error("The user did not grant root access for this SSH session; reconnect and select unrestricted root access");
 					}
 					const capture = new CommandOutputCapture("sudo-exec");
@@ -819,7 +826,7 @@ function formatSession(session: ActiveSession, includeJobs: boolean): string {
 	const lines = [
 		`Target: ${session.target.user}@${session.target.hostName}:${session.target.port}`,
 		`CWD: ${session.remoteCwd}`,
-		`Root access: ${session.rootShell ? "authorized until disconnect" : "not authorized"}`,
+		`Root access: ${session.target.user === "root" ? "logged in as root" : session.rootShell ? "authorized until disconnect" : "not authorized"}`,
 	];
 	if (includeJobs) {
 		const jobs = session.manager.list();

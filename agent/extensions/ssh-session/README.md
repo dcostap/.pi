@@ -9,7 +9,7 @@ User-authorized OpenSSH connection sharing for Pi, with one cache-stable `ssh_se
 /ssh-connect dario@nelec-5
 ```
 
-Choose either normal access or unrestricted root access until disconnect. Password entry is masked and authentication data never enters model context.
+Choose either normal access or unrestricted root access until disconnect. Root logins skip this choice, because each command already runs as root. Password entry is masked and authentication data never enters model context.
 
 Then prompt normally, for example:
 
