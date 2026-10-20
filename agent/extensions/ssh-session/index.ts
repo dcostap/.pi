@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { lookup } from "node:dns/promises";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -91,20 +90,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 
 		const requested = validateTarget(rawTarget);
 		const target = resolveTarget(requested);
-		const addresses = await resolveAddresses(target.hostName);
 		const knownFingerprints = getKnownFingerprints(target);
-		const approved = await ctx.ui.confirm(
-			"Authorize persistent SSH connection?",
-			[
-				`Requested: ${requested}`,
-				`User: ${target.user}`,
-				`Host: ${target.hostName}`,
-				`Port: ${target.port}`,
-				`Resolved address: ${addresses.join(", ") || "unavailable"}`,
-				`Known host fingerprint: ${knownFingerprints.join(", ") || "unknown — the negotiated fingerprint will require confirmation"}`,
-			].join("\n"),
-		);
-		if (!approved) return;
 
 		const privilege = await ctx.ui.select("Agent privilege for this SSH session", [
 			"Normal commands only",
@@ -160,7 +146,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 					? "The ssh_session tool may run normal and unrestricted root commands until disconnect."
 					: "The ssh_session tool may run normal commands; root access was not authorized."),
 			);
-			ctx.ui.notify(`Connected to ${target.user}@${target.hostName}${session.rootShell ? " with session root access" : ""}`, "info");
+			ctx.ui.notify(`Connected to ${target.user}@${target.hostName}:${target.port}${session.rootShell ? " with session root access" : ""}`, "info");
 		} catch (error) {
 			if (session) await closeSession(session);
 			else client.end();
@@ -562,14 +548,6 @@ function resolveTarget(requested: string): ResolvedSshTarget {
 	const result = spawnSync(SSH_PATH, ["-G", requested], { encoding: "utf8", windowsHide: true });
 	if (result.status !== 0) throw new Error((result.stderr || "Could not resolve OpenSSH configuration").trim());
 	return parseSshConfig(requested, result.stdout);
-}
-
-async function resolveAddresses(hostName: string): Promise<string[]> {
-	try {
-		return [...new Set((await lookup(hostName, { all: true })).map((item) => item.address))];
-	} catch {
-		return [];
-	}
 }
 
 function getKnownFingerprints(target: ResolvedSshTarget): string[] {
