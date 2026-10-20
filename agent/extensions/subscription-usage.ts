@@ -1,5 +1,5 @@
 /**
- * Better Codex Support for pi.
+ * Subscription usage for pi.
  *
  * Usage indicator for Codex, and for Claude models served by pi-claude-bridge.
  */
@@ -20,7 +20,7 @@ import * as path from "node:path";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
 const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
-const STATUS_KEY = "better-codex-support-usage";
+const STATUS_KEY = "subscription-usage";
 const SHOW_THRESHOLD = 80;
 const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
 const AGENT_DIR = getAgentDir();
