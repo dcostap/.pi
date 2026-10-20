@@ -1,7 +1,7 @@
 /**
  * Better Codex Support for pi.
  *
- * Codex-only usage indicator.
+ * Usage indicator for Codex, and for Claude models served by pi-claude-bridge.
  */
 
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -15,6 +15,7 @@ import {
   type Focusable,
 } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
@@ -28,8 +29,9 @@ const OBSERVATIONS_FILE = path.join(AGENT_DIR, "codex-usage-observations.jsonl")
 
 const PRIMARY_CODEX_PROVIDER_ID = "openai-codex" as const;
 const SECONDARY_CODEX_PROVIDER_ID = "openai-codex-secondary" as const;
+const CLAUDE_BRIDGE_PROVIDER_ID = "claude-bridge" as const;
 type OAuthProviderId = typeof PRIMARY_CODEX_PROVIDER_ID | typeof SECONDARY_CODEX_PROVIDER_ID;
-type ProviderKey = OAuthProviderId;
+type ProviderKey = OAuthProviderId | typeof CLAUDE_BRIDGE_PROVIDER_ID;
 
 interface StoredOAuthCredentials {
   access?: string;
@@ -462,6 +464,62 @@ async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promi
   };
 }
 
+// pi-claude-bridge runs Claude Code, so Claude Code's login is the account that
+// pays for bridge turns. Read its token only: Claude Code refreshes it during
+// bridge turns, and a refresh here would rotate the refresh token under it.
+function claudeCredentialsFile(): string {
+  return path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), ".credentials.json");
+}
+
+function readClaudeAccess(): { access?: string; error?: string } {
+  let oauth: Record<string, any> | null | undefined;
+  try {
+    oauth = asObject(asObject(JSON.parse(fs.readFileSync(claudeCredentialsFile(), "utf-8")))?.claudeAiOauth);
+  } catch {
+    return { error: "no Claude Code login found (run claude, then /login)" };
+  }
+  if (typeof oauth?.accessToken !== "string") return { error: "no Claude Code login found (run claude, then /login)" };
+  if (typeof oauth.expiresAt === "number" && oauth.expiresAt <= Date.now()) {
+    return { error: "Claude Code login expired; send a message to a Claude model to refresh it" };
+  }
+  return { access: oauth.accessToken };
+}
+
+// utilization is a percent (0-100); resets_at is an ISO date.
+function readClaudeWindow(window: any): { percent: number; resetAfterSeconds?: number; resetAt?: number } | undefined {
+  const percent = window?.utilization;
+  if (typeof percent !== "number" || !Number.isFinite(percent)) return undefined;
+  const resetAt = typeof window.resets_at === "string" ? Date.parse(window.resets_at) : Number.NaN;
+  if (!Number.isFinite(resetAt)) return { percent };
+  return { percent, resetAt, resetAfterSeconds: Math.max(0, Math.round((resetAt - Date.now()) / 1000)) };
+}
+
+// The endpoint Claude Code's own /usage reads.
+async function fetchClaudeUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
+  const result = await requestJson(
+    "https://api.anthropic.com/api/oauth/usage",
+    { headers: { Authorization: `Bearer ${token}`, accept: "application/json", "anthropic-beta": "oauth-2025-04-20" } },
+    config,
+  );
+
+  if (!result.ok) return { session: 0, weekly: 0, error: result.error };
+
+  const session = readClaudeWindow(result.data?.five_hour);
+  const weekly = readClaudeWindow(result.data?.seven_day);
+  return {
+    session: session?.percent,
+    weekly: weekly?.percent,
+    sessionResetsIn: session?.resetAfterSeconds === undefined ? undefined : formatDuration(session.resetAfterSeconds),
+    weeklyResetsIn: weekly?.resetAfterSeconds === undefined ? undefined : formatResetAt(weekly.resetAfterSeconds),
+    sessionResetAfterSeconds: session?.resetAfterSeconds,
+    weeklyResetAfterSeconds: weekly?.resetAfterSeconds,
+    sessionResetAt: session?.resetAt,
+    weeklyResetAt: weekly?.resetAt,
+    sessionWindowMinutes: 5 * 60,
+    weeklyWindowMinutes: 7 * 24 * 60,
+  };
+}
+
 async function consumeCodexResetCredit(token: string, redeemRequestId: string, config: RequestConfig = {}): Promise<ResetConsumeResult> {
   const result = await requestJson(
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
@@ -483,15 +541,18 @@ async function consumeCodexResetCredit(token: string, redeemRequestId: string, c
 function detectProvider(model: { provider?: string; id?: string; name?: string; api?: string } | undefined | null): ProviderKey {
   const provider = (model?.provider || "").toLowerCase();
   if (provider === SECONDARY_CODEX_PROVIDER_ID) return SECONDARY_CODEX_PROVIDER_ID;
+  if (provider === CLAUDE_BRIDGE_PROVIDER_ID) return CLAUDE_BRIDGE_PROVIDER_ID;
   return PRIMARY_CODEX_PROVIDER_ID;
 }
 
-function canShowForProvider(active: ProviderKey, auth: AuthData | null): boolean {
-  if (!auth) return false;
-  return !!(auth[active]?.access || auth[active]?.refresh);
+function hasCredentials(providerId: ProviderKey): boolean {
+  if (providerId === CLAUDE_BRIDGE_PROVIDER_ID) return fs.existsSync(claudeCredentialsFile());
+  const auth = readAuth();
+  return !!(auth?.[providerId]?.access || auth?.[providerId]?.refresh);
 }
 
-function providerDisplayName(providerId: OAuthProviderId): string {
+function providerDisplayName(providerId: ProviderKey): string {
+  if (providerId === CLAUDE_BRIDGE_PROVIDER_ID) return "Claude";
   return providerId === SECONDARY_CODEX_PROVIDER_ID ? "Codex Secondary" : "Codex";
 }
 
@@ -730,7 +791,7 @@ class UsageSelectorComponent extends Container implements Focusable {
 
 export default function (pi: ExtensionAPI) {
   const state = {
-    codex: null as UsageData | null,
+    usage: null as UsageData | null,
     lastPoll: 0,
     activeProvider: PRIMARY_CODEX_PROVIDER_ID as ProviderKey,
   };
@@ -761,9 +822,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function getFreshCodexAccess(
-    providerId: OAuthProviderId = state.activeProvider,
+    providerId: OAuthProviderId,
   ): Promise<{ access?: string; error?: string }> {
-    if (!hasCodexCredentials(readAuth(), providerId)) {
+    if (!hasCredentials(providerId)) {
       return { error: `missing Codex credentials (try /login ${providerId})` };
     }
 
@@ -838,12 +899,11 @@ export default function (pi: ExtensionAPI) {
 
   function updateStatus() {
     const active = state.activeProvider;
-    const data = state.codex;
+    const data = state.usage;
 
     if (!ctx?.hasUI) return;
 
-    const auth = readAuth();
-    if (!canShowForProvider(active, auth)) {
+    if (!hasCredentials(active)) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       return;
     }
@@ -883,7 +943,7 @@ export default function (pi: ExtensionAPI) {
 
     if (previous !== state.activeProvider) {
       // Never display one account's quota while the other account is active.
-      state.codex = null;
+      state.usage = null;
       updateStatus();
       return true;
     }
@@ -906,8 +966,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function maybeLogQuotaSnapshot(reason: string, force = false): boolean {
-    const data = state.codex;
-    if (!data || data.error) return false;
+    const data = state.usage;
+    if (!data || data.error || state.activeProvider === CLAUDE_BRIDGE_PROVIDER_ID) return false;
 
     const now = Date.now();
     const key = snapshotKey(data);
@@ -1003,32 +1063,26 @@ export default function (pi: ExtensionAPI) {
     lastRollupFlushAt = now;
   }
 
-  function hasCodexCredentials(auth: AuthData | null, providerId: OAuthProviderId): boolean {
-    return !!(auth?.[providerId]?.access || auth?.[providerId]?.refresh);
+  async function fetchUsage(providerId: ProviderKey): Promise<UsageData> {
+    const auth = providerId === CLAUDE_BRIDGE_PROVIDER_ID ? readClaudeAccess() : await getFreshCodexAccess(providerId);
+    if (!auth.access) return { session: 0, weekly: 0, error: auth.error ?? "missing access token (try /login again)" };
+    return providerId === CLAUDE_BRIDGE_PROVIDER_ID ? fetchClaudeUsage(auth.access) : fetchCodexUsage(auth.access);
   }
 
   async function runPoll(reason: string, forceLog = false) {
     const providerId = state.activeProvider;
-    if (!hasCodexCredentials(readAuth(), providerId)) {
-      state.codex = null;
+    if (!hasCredentials(providerId)) {
+      state.usage = null;
       state.lastPoll = Date.now();
       updateStatus();
       return;
     }
 
-    const auth = await getFreshCodexAccess(providerId);
-
-    const usage = auth.access
-      ? await fetchCodexUsage(auth.access)
-      : {
-          session: 0,
-          weekly: 0,
-          error: auth.error ?? "missing access token (try /login again)",
-        };
+    const usage = await fetchUsage(providerId);
 
     // A model switch may have happened while the request was in flight.
     if (state.activeProvider !== providerId) return;
-    state.codex = usage;
+    state.usage = usage;
 
     state.lastPoll = Date.now();
     updateStatus();
@@ -1107,6 +1161,10 @@ export default function (pi: ExtensionAPI) {
       updateProviderFrom(_ctx.model);
 
       if (!_ctx.hasUI) return;
+      if (state.activeProvider === CLAUDE_BRIDGE_PROVIDER_ID) {
+        _ctx.ui.notify("Codex resets apply to Codex models only. Select a Codex model first.", "info");
+        return;
+      }
       if (resetInFlight) {
         _ctx.ui.notify("A Codex reset check is already in progress.", "warning");
         return;
@@ -1114,7 +1172,7 @@ export default function (pi: ExtensionAPI) {
 
       resetInFlight = true;
       try {
-        const providerId = state.activeProvider;
+        const providerId = state.activeProvider as OAuthProviderId;
         const auth = await getFreshCodexAccess(providerId);
         if (!auth.access) {
           _ctx.ui.notify(auth.error ?? "missing Codex access token", "error");
@@ -1122,7 +1180,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         const data = await fetchCodexUsage(auth.access);
-        state.codex = data;
+        state.usage = data;
         state.lastPoll = Date.now();
         updateStatus();
 
@@ -1166,7 +1224,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("usage", {
-    description: "Show Codex usage bars",
+    description: "Show Codex or Claude usage bars",
     handler: async (_args, _ctx) => {
       ctx = _ctx;
       updateProviderFrom(_ctx.model);
@@ -1175,7 +1233,7 @@ export default function (pi: ExtensionAPI) {
 
       try {
         await _ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-          let data: UsageData | null = state.codex;
+          let data: UsageData | null = state.usage;
           let loading = true;
 
           const renderSimpleBar = (
@@ -1217,19 +1275,9 @@ export default function (pi: ExtensionAPI) {
             truncateToWidth(line, Math.max(0, width), "");
 
           const providerId = state.activeProvider;
-          getFreshCodexAccess(providerId)
-            .then((auth) => {
-              if (!auth.access) {
-                data = {
-                  session: 0,
-                  weekly: 0,
-                  error: auth.error ?? "missing access token (try /login again)",
-                };
-                return;
-              }
-              return fetchCodexUsage(auth.access).then((usage) => {
-                data = usage;
-              });
+          fetchUsage(providerId)
+            .then((usage) => {
+              data = usage;
             })
             .catch((error) => {
               data = { session: 0, weekly: 0, error: toErrorMessage(error) };
@@ -1256,10 +1304,11 @@ export default function (pi: ExtensionAPI) {
               lines.push(data.weekly === undefined
                 ? fitLine(`${theme.fg("muted", "Weekly".padEnd(8))} ${theme.fg("dim", "unavailable")}`, width)
                 : fitLine(renderSimpleBar("Weekly", data.weekly, data.weeklyResetsIn, data.weeklyResetAfterSeconds, data.weeklyWindowMinutes, 7 * 24 * 60), width));
-              lines.push(
-                fitLine(`${theme.fg("muted", "RESETS".padEnd(8))} ${data.resetCreditsAvailable === undefined ? theme.fg("dim", "unknown") : theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable))}${data.resetCreditsExpireText ? theme.fg("dim", `  expires ${data.resetCreditsExpireText}`) : ""}`, width),
-                separator,
-              );
+              // Banked resets exist only for Codex.
+              if (providerId !== CLAUDE_BRIDGE_PROVIDER_ID) {
+                lines.push(fitLine(`${theme.fg("muted", "RESETS".padEnd(8))} ${data.resetCreditsAvailable === undefined ? theme.fg("dim", "unknown") : theme.fg(data.resetCreditsAvailable > 0 ? "success" : "dim", String(data.resetCreditsAvailable))}${data.resetCreditsExpireText ? theme.fg("dim", `  expires ${data.resetCreditsExpireText}`) : ""}`, width));
+              }
+              lines.push(separator);
               return lines;
             },
             invalidate() {},
