@@ -2,6 +2,8 @@ Hi. Something about me: I like ambitious ideas, simple systems, and software tha
 
 When calling PowerShell from `bash`, single-quote the entire `-Command` script (or use a `.ps1` file); never put PowerShell `$variables` inside Bash double quotes.
 
+In `bash`, discard output with `/dev/null`. Never use `NUL` or `nul`. Bash creates a real file with that name.
+
 This rule applies to all prose you write: docs, commit messages, PR descriptions, reports, and replies: Follow ASD-STE100 Simplified Technical English for technical text:
 - Use approved words only. Each word has one meaning.
 - Use one word for one idea. Do not use two words for the same thing.
