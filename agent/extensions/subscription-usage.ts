@@ -17,9 +17,9 @@ import {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { sharedClaudeUsage } from "./_shared/claude-usage-cache.js";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
-const CLAUDE_POLL_INTERVAL_MS = 30 * 60 * 1000;
 const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STATUS_KEY = "subscription-usage";
 const SHOW_THRESHOLD = 80;
@@ -27,6 +27,7 @@ const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
 const AGENT_DIR = getAgentDir();
 const AUTH_FILE = path.join(AGENT_DIR, "auth.json");
 const OBSERVATIONS_FILE = path.join(AGENT_DIR, "codex-usage-observations.jsonl");
+const CLAUDE_USAGE_CACHE = path.join(AGENT_DIR, "claude-usage-cache.json");
 
 const PRIMARY_CODEX_PROVIDER_ID = "openai-codex" as const;
 const SECONDARY_CODEX_PROVIDER_ID = "openai-codex-secondary" as const;
@@ -946,7 +947,6 @@ export default function (pi: ExtensionAPI) {
       // Never display one account's quota while the other account is active.
       state.usage = null;
       updateStatus();
-      if (pollTimer) restartPollTimer();
       return true;
     }
 
@@ -1065,14 +1065,32 @@ export default function (pi: ExtensionAPI) {
     lastRollupFlushAt = now;
   }
 
-  async function fetchUsage(providerId: ProviderKey): Promise<UsageData> {
-    const auth = providerId === CLAUDE_BRIDGE_PROVIDER_ID ? readClaudeAccess() : await getFreshCodexAccess(providerId);
+  async function fetchUsage(providerId: ProviderKey, manual = false): Promise<UsageData> {
+    if (providerId === CLAUDE_BRIDGE_PROVIDER_ID) {
+      const data = await sharedClaudeUsage<UsageData>(CLAUDE_USAGE_CACHE, async () => {
+        const auth = readClaudeAccess();
+        return auth.access ? fetchClaudeUsage(auth.access) : { error: auth.error ?? "missing Claude access token" };
+      }, manual) ?? { error: "Claude usage refresh is in progress in another Pi session." };
+      // Cached percentages stay unchanged, but reset countdowns must use the current time.
+      if (data.sessionResetAt !== undefined) {
+        data.sessionResetAfterSeconds = Math.max(0, Math.round((data.sessionResetAt - Date.now()) / 1000));
+        data.sessionResetsIn = formatDuration(data.sessionResetAfterSeconds);
+      }
+      if (data.weeklyResetAt !== undefined) {
+        data.weeklyResetAfterSeconds = Math.max(0, Math.round((data.weeklyResetAt - Date.now()) / 1000));
+        data.weeklyResetsIn = formatResetAt(data.weeklyResetAfterSeconds);
+      }
+      return data;
+    }
+    const auth = await getFreshCodexAccess(providerId);
     if (!auth.access) return { session: 0, weekly: 0, error: auth.error ?? "missing access token (try /login again)" };
-    return providerId === CLAUDE_BRIDGE_PROVIDER_ID ? fetchClaudeUsage(auth.access) : fetchCodexUsage(auth.access);
+    return fetchCodexUsage(auth.access);
   }
 
   async function runPoll(reason: string, forceLog = false) {
     const providerId = state.activeProvider;
+    // A queued Codex timer must not poll Claude after a model switch.
+    if (providerId === CLAUDE_BRIDGE_PROVIDER_ID && reason !== "claude_inference") return;
     if (!hasCredentials(providerId)) {
       state.usage = null;
       state.lastPoll = Date.now();
@@ -1112,20 +1130,16 @@ export default function (pi: ExtensionAPI) {
     } while (pollQueued);
   }
 
-  function restartPollTimer() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => {
-      void poll("periodic");
-    }, state.activeProvider === CLAUDE_BRIDGE_PROVIDER_ID ? CLAUDE_POLL_INTERVAL_MS : POLL_INTERVAL_MS);
-  }
-
   pi.on("session_start", async (_event, _ctx) => {
     ctx = _ctx;
     updateProviderFrom(_ctx.model);
 
-    await poll("session_start", true);
+    if (state.activeProvider !== CLAUDE_BRIDGE_PROVIDER_ID) await poll("session_start", true);
 
-    restartPollTimer();
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+      if (state.activeProvider !== CLAUDE_BRIDGE_PROVIDER_ID) void poll("periodic");
+    }, POLL_INTERVAL_MS);
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
@@ -1145,13 +1159,27 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (_event, _ctx) => {
     ctx = _ctx;
     const changed = updateProviderFrom(_ctx.model);
-    if (changed) await poll("turn_start_model_changed", true);
+    if (state.activeProvider === CLAUDE_BRIDGE_PROVIDER_ID) checkClaudeUsage(_ctx);
+    if (changed && state.activeProvider !== CLAUDE_BRIDGE_PROVIDER_ID) await poll("turn_start_model_changed", true);
   });
 
   pi.on("model_select", async (event, _ctx) => {
     ctx = _ctx;
     const changed = updateProviderFrom(event.model ?? _ctx.model);
-    if (changed) await poll("model_select", true);
+    if (changed && state.activeProvider !== CLAUDE_BRIDGE_PROVIDER_ID) await poll("model_select", true);
+  });
+
+  // Check when inference starts and while a long response streams.
+  // Check at most once a minute locally; the shared cache enforces the one-hour limit.
+  let lastClaudeStreamCheck = 0;
+  function checkClaudeUsage(_ctx: ExtensionContext) {
+    if (Date.now() - lastClaudeStreamCheck < 60_000) return;
+    lastClaudeStreamCheck = Date.now();
+    ctx = _ctx;
+    if (state.activeProvider === CLAUDE_BRIDGE_PROVIDER_ID) void poll("claude_inference");
+  }
+  pi.on("message_update", (event, _ctx) => {
+    if (event.message.role === "assistant" && event.message.provider === CLAUDE_BRIDGE_PROVIDER_ID) checkClaudeUsage(_ctx);
   });
 
   pi.on("agent_end", async (event, _ctx) => {
@@ -1237,8 +1265,7 @@ export default function (pi: ExtensionAPI) {
 
       if (!_ctx.hasUI) return;
 
-      try {
-        await _ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+      await _ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
           let data: UsageData | null = state.usage;
           let loading = true;
 
@@ -1281,9 +1308,14 @@ export default function (pi: ExtensionAPI) {
             truncateToWidth(line, Math.max(0, width), "");
 
           const providerId = state.activeProvider;
-          fetchUsage(providerId)
+          fetchUsage(providerId, true)
             .then((usage) => {
               data = usage;
+              if (state.activeProvider === providerId) {
+                state.usage = usage;
+                state.lastPoll = Date.now();
+                updateStatus();
+              }
             })
             .catch((error) => {
               data = { session: 0, weekly: 0, error: toErrorMessage(error) };
@@ -1322,10 +1354,7 @@ export default function (pi: ExtensionAPI) {
               if (keyData.includes("\x1b") || keyData === "escape" || keyData === "q" || keyData === "\x03") done();
             },
           };
-        });
-      } finally {
-        await poll("manual", true);
-      }
+      });
     },
   });
 }
