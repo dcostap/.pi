@@ -1,26 +1,52 @@
 import assert from "node:assert/strict";
 import { mock, test } from "bun:test";
 
-// These tests use plain text. Keep terminal rendering outside the timing tests.
-mock.module("@earendil-works/pi-tui", () => ({ visibleWidth: (text: string) => text.length }));
+// These tests use plain text. Pi supplies ANSI-aware width helpers at runtime.
+mock.module("@earendil-works/pi-tui", () => ({
+  visibleWidth: (text: string) => text.length,
+  truncateToWidth: (text: string, width: number) => text.slice(0, width),
+}));
 const { default: registerStats } = await import("../agent-turn-end-stats.ts");
 
 function setup() {
   const handlers = new Map<string, (event: any, ctx: any) => Promise<void>>();
   const entries: Array<{ type: string; data: any }> = [];
   const notifications: string[] = [];
+  const renderers = new Map<string, any>();
+  const settings: { outputPad?: 0 | 1 } = {};
+  let runtimeActive = true;
   registerStats({
+    getSettings() {
+      if (!runtimeActive) throw new Error("Extension runtime is stale after reload");
+      return settings;
+    },
     on(name: string, handler: any) {
       handlers.set(name, handler);
     },
     appendEntry(type: string, data: any) {
       entries.push({ type, data });
     },
+    registerEntryRenderer(type: string, renderer: any) {
+      renderers.set(type, renderer);
+    },
   } as any);
   const state = {
     now: 1_000,
     entries,
     notifications,
+    settings,
+    invalidateRuntime() {
+      runtimeActive = false;
+    },
+    component(data = entries.at(-1)?.data, theme = {
+      fg: (_color: string, text: string) => text,
+      italic: (text: string) => text,
+    }) {
+      return renderers.get("turn-stats")({ data }, { expanded: false }, theme);
+    },
+    render(data = entries.at(-1)?.data, width = 200): string {
+      return state.component(data).render(width).join("\n");
+    },
     async emit(name: string, event: any = {}) {
       await handlers.get(name)?.(event, { ui: { notify: (text: string) => notifications.push(text) } });
     },
@@ -39,6 +65,7 @@ function scenario(name: string, run: (state: ReturnType<typeof setup>) => Promis
     const state = setup();
     Date.now = () => state.now;
     try {
+      await state.emit("session_start");
       await state.emit("agent_start");
       await run(state);
     } finally {
@@ -69,7 +96,7 @@ scenario("includes hidden reasoning and the wait before a buffered first chunk",
   assert.equal(stats.tokensPerSecond, 10_000 / 65);
   assert.equal(stats.rateBasis, "full-request");
   assert.equal(stats.estimatedTokens, false);
-  assert.match(state.notifications.at(-1)!, /153\.8 tok\/s/);
+  assert.match(state.render(), /154 tok\/s/);
 });
 
 scenario("includes tool-call-only requests and excludes parallel tool execution", async (state) => {
@@ -117,7 +144,7 @@ scenario("does not show a rate for a request shorter than 100 ms", async (state)
   const stats = await state.finish([message]);
   assert.equal(stats.tokensPerSecond, null);
   assert.equal(stats.outputTokens, 10_000);
-  assert.doesNotMatch(state.notifications.at(-1)!, /tok\/s/);
+  assert.doesNotMatch(state.render(), /tok\/s/);
 });
 
 scenario("shows a rate at the 100 ms boundary", async (state) => {
@@ -172,7 +199,7 @@ scenario("estimates final content once, independent of streamed chunk sizes", as
     assert.equal(stats.outputTokens, 2);
     assert.equal(stats.estimatedTokens, true);
     assert.equal(stats.tokensPerSecond, 2);
-    assert.match(state.notifications.at(-1)!, /~2\.0 tok\/s/);
+    assert.match(state.render(), /~2 tok\/s/);
   }
 });
 
@@ -242,4 +269,148 @@ scenario("does not show a rate for an empty run", async (state) => {
   assert.equal(stats.requestMs, 0);
   assert.equal(stats.outputTokens, 0);
   assert.equal(stats.tokensPerSecond, null);
+});
+
+scenario("rounds displayed durations to whole seconds with correct minute rollover", async (state) => {
+  state.now += 1_000;
+  const stats = await state.finish([]);
+  for (const [ms, expected] of [
+    [0, "0s"],
+    [499, "0s"],
+    [500, "1s"],
+    [1_499, "1s"],
+    [1_500, "2s"],
+    [59_499, "59s"],
+    [59_500, "1m 0s"],
+    [119_500, "2m 0s"],
+  ] as const) {
+    const line = state.render({ ...stats, totalMs: ms, toolMs: ms, avgLatencyMs: ms });
+    assert.ok(line.includes(`${expected} total · ${expected} tools`));
+    if (ms > 0) assert.ok(line.includes(`${expected} avg latency`));
+  }
+});
+
+scenario("stores one transcript entry without a replaceable notification", async (state) => {
+  const message = assistant(state.now, 100);
+  state.now += 1_000;
+  await state.emit("message_end", { message });
+  const stats = await state.finish([message]);
+  const line = state.render();
+  assert.equal(state.entries.length, 1);
+  assert.deepEqual(state.notifications, []);
+  assert.match(line, /1s total · 0s tools · ↑100 ↓100 · 100 tok\/s/);
+
+  // Later runs and compaction notices must not change the saved line.
+  state.now += 60_000;
+  await state.emit("agent_start");
+  await state.emit("session_before_compact");
+  await state.emit("session_compact");
+  await state.emit("session_shutdown");
+  assert.equal(state.render(stats), line);
+  assert.equal(state.entries.length, 1);
+  assert.deepEqual(state.notifications, []);
+});
+
+scenario("renders saved entries in a fresh extension without adding entries", async (state) => {
+  const message = assistant(state.now, 100);
+  state.now += 1_000;
+  await state.emit("message_end", { message });
+  const stats = await state.finish([message]);
+  const saved = JSON.parse(JSON.stringify(stats));
+  const restored = setup();
+  await restored.emit("session_start");
+  assert.equal(restored.render(saved), state.render(stats));
+  assert.deepEqual(restored.entries, []);
+  assert.deepEqual(restored.notifications, []);
+
+  // Older entries do not have request timing fields.
+  delete saved.requestMs;
+  delete saved.rateBasis;
+  assert.equal(restored.render(saved), state.render(stats));
+});
+
+scenario("adapts saved statistics to the component width on each render", async (state) => {
+  const message = assistant(state.now, 100);
+  state.now += 1_000;
+  await state.emit("message_end", { message });
+  const stats = await state.finish([message]);
+  const component = state.component(stats);
+  const wide = component.render(200);
+  assert.match(wide[0], /tools/);
+  for (const width of [0, 1, 5, 10, 20, 40, 80]) {
+    const lines = component.render(width);
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0].length <= width);
+  }
+  assert.deepEqual(component.render(200), wide);
+});
+
+scenario("reads Pi's outputPad setting at session and agent startup", async (state) => {
+  state.now += 1_000;
+  const stats = await state.finish([]);
+  const component = state.component(stats);
+  const defaultLine = component.render(200)[0];
+  assert.match(defaultLine, /^ 1s total/);
+
+  state.settings.outputPad = 0;
+  await state.emit("session_start");
+  assert.match(component.render(200)[0], /^1s total/);
+  state.settings.outputPad = 1;
+  await state.emit("agent_start");
+  assert.equal(component.render(200)[0], defaultLine);
+
+  for (const padding of [0, 1] as const) {
+    state.settings.outputPad = padding;
+    await state.emit("agent_start");
+    for (const width of [0, 1, 2, 5, 10, 20, 40]) {
+      assert.ok(component.render(width)[0].length <= width);
+    }
+  }
+});
+
+scenario("uses the saved finish time and the active theme", async (state) => {
+  state.now += 1_000;
+  const stats = await state.finish([]);
+  // Use a distinct historical time, not the current clock.
+  stats.timestamp = new Date(2020, 0, 1, 13, 15).getTime();
+  const colors: string[] = [];
+  const italicText: string[] = [];
+  const component = state.component(stats, {
+    fg(color: string, text: string) {
+      colors.push(color);
+      return text;
+    },
+    italic(text: string) {
+      italicText.push(text);
+      return text;
+    },
+  });
+  assert.match(component.render(200)[0], /13:15/);
+  component.invalidate();
+  component.render(200);
+  assert.deepEqual(colors, ["dim", "dim"]);
+  assert.equal(italicText.length, 2);
+  assert.match(italicText[0], /1s total.*13:15/);
+  assert.equal(italicText[1], italicText[0]);
+});
+
+test("does not render entries without data", () => {
+  assert.equal(setup().component(), undefined);
+});
+
+scenario("renders old transcript components after reload retires their extension API", async (state) => {
+  state.settings.outputPad = 0;
+  await state.emit("session_start");
+  state.now += 1_000;
+  const stats = await state.finish([]);
+  const component = state.component(stats);
+  const lines = component.render(200);
+  await state.emit("session_shutdown");
+  state.invalidateRuntime();
+
+  assert.deepEqual(component.render(200), lines);
+  component.invalidate();
+  assert.deepEqual(component.render(200), lines);
+  assert.deepEqual(state.component(stats).render(200), lines);
+  assert.ok(component.render(10)[0].length <= 10);
 });
