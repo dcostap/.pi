@@ -9,9 +9,9 @@
   "enabledModels": [
     "deepseek/deepseek-flash",
     "openai-codex/gpt-6.1-sol",
-    "openai-codex-secondary/gpt-6.1-sol",
     "openai-codex/gpt-6-luna",
-    "openai-codex-secondary/gpt-6-luna"
+    "claude-bridge/claude-opus-5-5",
+    "claude-bridge/claude-haiku-5-5"
   ],
   "steeringMode": "all",
   "theme": "light/dark",
