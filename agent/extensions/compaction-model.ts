@@ -532,6 +532,8 @@ export default function compactionModelExtension(pi: ExtensionAPI) {
 			}
 
 			const thinkingLevel = request?.thinkingLevel ?? "off";
+			// compaction-ui.ts shows this model in the "Compacting..." spinner.
+			pi.events.emit("compaction:model", { model, thinkingLevel });
 			const result = await compact(
 				event.preparation,
 				model,
