@@ -1,7 +1,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+interface TurnStats {
+  totalMs: number;
+  toolMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estimatedTokens: boolean;
+  requestMs?: number;
+  rateBasis?: string;
+  avgLatencyMs: number;
+  latenciesMs: number[];
+  tokensPerSecond: number | null;
+  timestamp: number;
+}
 
 export default function (pi: ExtensionAPI) {
+  let outputPad = 1;
   let totalStartMs = 0;
   let requestMs = 0;
   let timedAssistantMessages = 0;
@@ -9,9 +26,6 @@ export default function (pi: ExtensionAPI) {
   let providerRequestCount = 0;
   let pendingProviderLatencyStartMs = 0;
   const providerLatenciesMs: number[] = [];
-  let lastStats: string | undefined;
-  let lastStatsAtMs = 0;
-  let reshowStatsAfterCompaction = false;
   const activeToolStarts = new Map<string, number>();
   const toolIntervals: Array<[number, number]> = [];
 
@@ -28,10 +42,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function formatDuration(ms: number) {
-    const seconds = ms / 1000;
-    if (seconds < 60) return `${seconds.toFixed(1)}s`;
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
     const minutes = Math.floor(seconds / 60);
-    return `${minutes}m ${(seconds % 60).toFixed(0)}s`;
+    return `${minutes}m ${seconds % 60}s`;
   }
 
   function currentToolMs() {
@@ -95,7 +109,7 @@ export default function (pi: ExtensionAPI) {
 
   function formatTokenRate(rate: number, estimated: boolean) {
     const prefix = estimated ? "~" : "";
-    return `${prefix}${rate.toFixed(1)} tok/s`;
+    return `${prefix}${Math.round(rate)} tok/s`;
   }
 
   function formatClock(date = new Date()) {
@@ -106,12 +120,6 @@ export default function (pi: ExtensionAPI) {
 
   function fitsLine(text: string, maxWidth: number | undefined) {
     return maxWidth === undefined || visibleWidth(text) <= maxWidth;
-  }
-
-  function terminalWidth() {
-    return typeof process.stdout.columns === "number" && process.stdout.columns > 0
-      ? process.stdout.columns
-      : undefined;
   }
 
   function average(values: number[]) {
@@ -172,30 +180,23 @@ export default function (pi: ExtensionAPI) {
     return usage;
   }
 
-  function formatUsage(usage: TurnTokenUsage) {
+  function formatUsage(usage: Pick<TurnTokenUsage, "input" | "output">) {
     const parts: string[] = [];
     if (usage.input > 0) parts.push(`↑${formatTokens(usage.input)}`);
     if (usage.output > 0) parts.push(`↓${formatTokens(usage.output)}`);
     return parts.join(" ");
   }
 
-  function formatStats(
-    usage: TurnTokenUsage,
-    rate: number | null,
-    finishedAt = new Date(),
-  ) {
-    const totalMs = totalStartMs > 0 ? Date.now() - totalStartMs : 0;
-    const toolMs = currentToolMs();
-    const usagePart = formatUsage(usage);
-    const avgLatencyMs = average(providerLatenciesMs);
-    const maxWidth = terminalWidth();
+  function formatStats(stats: TurnStats, maxWidth: number) {
+    const usagePart = formatUsage({ input: stats.inputTokens, output: stats.outputTokens });
+    const rate = stats.tokensPerSecond;
 
-    const totalPart = `${formatDuration(totalMs)} total`;
-    const toolPart = `${formatDuration(toolMs)} tools`;
-    const latencyPart = avgLatencyMs > 0 ? `${formatDuration(avgLatencyMs)} avg latency` : undefined;
-    const usageRatePart = [usagePart, rate === null ? undefined : formatTokenRate(rate, !usage.exact)]
+    const totalPart = `${formatDuration(stats.totalMs)} total`;
+    const toolPart = `${formatDuration(stats.toolMs)} tools`;
+    const latencyPart = stats.avgLatencyMs > 0 ? `${formatDuration(stats.avgLatencyMs)} avg latency` : undefined;
+    const usageRatePart = [usagePart, rate == null ? undefined : formatTokenRate(rate, stats.estimatedTokens)]
       .filter(Boolean).join(" · ") || undefined;
-    const clockPart = formatClock(finishedAt);
+    const clockPart = formatClock(new Date(stats.timestamp));
 
     const candidates = [
       [totalPart, toolPart, latencyPart, usageRatePart, clockPart],
@@ -214,7 +215,29 @@ export default function (pi: ExtensionAPI) {
     return clockPart;
   }
 
+  // Render saved data, not a status notification that later notices can replace.
+  // Pi also uses this renderer when it restores the transcript.
+  pi.registerEntryRenderer<TurnStats>("turn-stats", (entry, _options, theme) => {
+    const stats = entry.data;
+    if (!stats) return undefined;
+    return {
+      render(width) {
+        // Old transcript components can still render while Pi replaces the runtime.
+        const padding = " ".repeat(outputPad);
+        const contentWidth = Math.max(0, width - 2 * padding.length);
+        const text = truncateToWidth(theme.italic(theme.fg("dim", formatStats(stats, contentWidth))), contentWidth);
+        return [truncateToWidth(`${padding}${text}${padding}`, width)];
+      },
+      invalidate() {},
+    };
+  });
+
+  pi.on("session_start", () => {
+    outputPad = pi.getSettings().outputPad ?? 1;
+  });
+
   pi.on("agent_start", async () => {
+    outputPad = pi.getSettings().outputPad ?? 1;
     reset();
     totalStartMs = Date.now();
   });
@@ -261,18 +284,11 @@ export default function (pi: ExtensionAPI) {
     activeToolStarts.delete(event.toolCallId);
   });
 
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("agent_end", async (event) => {
     const totalMs = totalStartMs > 0 ? Date.now() - totalStartMs : 0;
     const usage = turnTokenUsage(event.messages);
     const rate = tokensPerSecond(usage);
-    const finishedAt = new Date();
-    const stats = formatStats(usage, rate, finishedAt);
-
-    lastStats = stats;
-    lastStatsAtMs = Date.now();
-    ctx.ui.notify(stats, "info");
-
-    pi.appendEntry("turn-stats", {
+    pi.appendEntry<TurnStats>("turn-stats", {
       totalMs,
       toolMs: currentToolMs(),
       inputTokens: usage.input,
@@ -289,24 +305,7 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  pi.on("session_before_compact", async () => {
-    reshowStatsAfterCompaction = Boolean(lastStats && Date.now() - lastStatsAtMs <= 30_000);
-  });
-
-  pi.on("session_compact", async (_event, ctx) => {
-    if (!lastStats || !reshowStatsAfterCompaction) return;
-    reshowStatsAfterCompaction = false;
-
-    const stats = lastStats;
-    setTimeout(() => {
-      ctx.ui.notify(stats, "info");
-    }, 100);
-  });
-
   pi.on("session_shutdown", async () => {
     reset();
-    lastStats = undefined;
-    lastStatsAtMs = 0;
-    reshowStatsAfterCompaction = false;
   });
 }
