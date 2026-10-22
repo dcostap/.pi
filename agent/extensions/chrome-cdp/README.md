@@ -15,6 +15,7 @@ The `raw` action remains available for CDP features not covered by first-class a
 Operational safeguards:
 
 - Automatic dumps and screenshots are stored in a private runtime directory with private file permissions on POSIX systems.
+- Relative `outputPath` and `expressionPath` values use the active working directory when the tool call starts.
 
 Run tests:
 

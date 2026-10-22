@@ -6,6 +6,7 @@ import { BackgroundProcessManager } from "./manager.ts";
 import { BACKGROUND_NOTICE_MARKER, MAX_BLOCKING_SECONDS } from "./prompt.ts";
 
 interface Execution {
+	cwd: string;
 	onData: (data: Buffer) => void;
 	resolve: (value: { exitCode: number | null }) => void;
 	env?: NodeJS.ProcessEnv;
@@ -15,9 +16,9 @@ interface Execution {
 class FakeOperations implements BashOperations {
 	readonly executions = new Map<string, Execution>();
 
-	exec(command: string, _cwd: string, options: { onData: (data: Buffer) => void; signal?: AbortSignal; env?: NodeJS.ProcessEnv }) {
+	exec(command: string, cwd: string, options: { onData: (data: Buffer) => void; signal?: AbortSignal; env?: NodeJS.ProcessEnv }) {
 		return new Promise<{ exitCode: number | null }>((resolve, reject) => {
-			const execution: Execution = { onData: options.onData, resolve, env: options.env, aborted: false };
+			const execution: Execution = { cwd, onData: options.onData, resolve, env: options.env, aborted: false };
 			this.executions.set(command, execution);
 			options.signal?.addEventListener("abort", () => {
 				execution.aborted = true;
@@ -46,10 +47,27 @@ function setup() {
 	const ctx = { cwd: "C:/work" } as any;
 	const run = (command: string, timeout?: number, signal?: AbortSignal) =>
 		tool.execute("call-1", { command, timeout }, signal, undefined, ctx) as Promise<any>;
-	return { operations, manager, interrupts, tool, run };
+	return { operations, manager, interrupts, tool, run, ctx };
 }
 
 describe("foreground bash", () => {
+	test("new calls use the active directory; running jobs keep their launch directory", async () => {
+		const { operations, manager, run, ctx } = setup();
+		ctx.cwd = "C:/worktree-one";
+		const first = await run("first command", 0.01);
+		ctx.cwd = "C:/worktree-two";
+		const second = run("second command", 5);
+		await tick();
+		operations.complete("second command");
+		await second;
+
+		expect(operations.executions.get("first command")!.cwd).toBe("C:/worktree-one");
+		expect(operations.executions.get("second command")!.cwd).toBe("C:/worktree-two");
+		expect(manager.get(first.structuredContent.background_id).cwd).toBe("C:/worktree-one");
+		operations.complete("first command");
+		await tick();
+	});
+
 	test("a command that finishes in time returns normally and is not tracked", async () => {
 		const { operations, manager, run } = setup();
 		const pending = run("echo hi", 5);

@@ -15,8 +15,8 @@ const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const OSC = "\x1b]";
 const BEL = "\x07";
 
-function getBaseTitle(pi: ExtensionAPI): string {
-	const cwd = path.basename(process.cwd());
+function getBaseTitle(pi: ExtensionAPI, activeCwd: string): string {
+	const cwd = path.basename(activeCwd);
 	const session = pi.getSessionName();
 	return session ? `π - ${session} - ${cwd}` : `π - ${cwd}`;
 }
@@ -68,7 +68,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		frameIndex = 0;
 		startedAt = 0;
-		ctx.ui.setTitle(getBaseTitle(pi));
+		ctx.ui.setTitle(getBaseTitle(pi, ctx.cwd));
 		clearWindowsTerminalProgress();
 		if (notifyDone) ringWindowsTerminalBell();
 	}
@@ -80,7 +80,7 @@ export default function (pi: ExtensionAPI) {
 		timer = setInterval(() => {
 			const frame = BRAILLE_FRAMES[frameIndex % BRAILLE_FRAMES.length];
 			const elapsed = formatElapsed(Date.now() - startedAt);
-			const cwd = path.basename(process.cwd());
+			const cwd = path.basename(ctx.cwd);
 			const session = pi.getSessionName();
 			const prefix = `${frame} ${elapsed}`;
 			const title = session ? `${prefix} π - ${session} - ${cwd}` : `${prefix} π - ${cwd}`;

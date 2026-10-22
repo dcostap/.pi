@@ -988,7 +988,17 @@ async function withTarget<T>(targetQuery: string | undefined, signal: AbortSigna
 // the default export below.
 export const __testing = {
   clickStr, typeStr, pressStr, waitStr, navStr, reloadStr, rawStr,
+  resolveLocalPaths, readExpressionFile,
 };
+
+// Resolve once per invocation. Async actions keep these paths if the session directory changes.
+function resolveLocalPaths(params: ChromeCdpParams, cwd: string): ChromeCdpParams {
+  return {
+    ...params,
+    expressionPath: params.expressionPath ? resolve(cwd, params.expressionPath) : undefined,
+    outputPath: params.outputPath ? resolve(cwd, params.outputPath) : undefined,
+  };
+}
 
 export default function chromeCdpExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
@@ -1012,8 +1022,9 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       "chrome_cdp dumps large outputs (>2KB) to temp files to protect context. When you see [Dumped … to C:\\...], use read with offset/limit to inspect the file instead of re-running chrome_cdp.",
     ],
     parameters: chromeCdpParams,
-    async execute(_toolCallId, params: ChromeCdpParams, signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params: ChromeCdpParams, signal, _onUpdate, ctx) {
       throwIfAborted(signal);
+      params = resolveLocalPaths(params, ctx.cwd);
       if (params.action === "list") {
         const started = Date.now();
         const cdp = await getSharedCdp(signal);

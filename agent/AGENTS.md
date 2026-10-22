@@ -4,6 +4,10 @@ When calling PowerShell from `bash`, single-quote the entire `-Command` script (
 
 `bash` runs Git Bash, not cmd.exe or PowerShell. Use Unix syntax: `/dev/null` (not `NUL`), forward slashes, and `$VAR` (not `%VAR%` or `$env:VAR`).
 
+## Working directory
+
+In extensions, use `ctx.cwd` for project paths and new local processes. Do not use `process.cwd()`. Pi does not change `process.cwd()` when a session switches to another project.
+
 This rule applies to all prose you write: docs, commit messages, PR descriptions, reports, and replies: Follow ASD-STE100 Simplified Technical English for technical text:
 - Use approved words only. Each word has one meaning.
 - Use one word for one idea. Do not use two words for the same thing.
