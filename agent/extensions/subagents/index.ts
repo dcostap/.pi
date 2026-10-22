@@ -349,7 +349,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function loadManagedSubagentCompactionPolicy(cwd: string): Promise<ManagedSubagentCompactionPolicy> {
+function loadManagedSubagentCompactionPolicy(cwd: string): ManagedSubagentCompactionPolicy {
 	const policy: ManagedSubagentCompactionPolicy = {
 		enabled: true,
 		reserveTokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
@@ -360,7 +360,7 @@ async function loadManagedSubagentCompactionPolicy(cwd: string): Promise<Managed
 	];
 	for (const settingsPath of settingsPaths) {
 		try {
-			const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+			const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
 			if (!isRecord(settings) || !isRecord(settings.compaction)) continue;
 			if (typeof settings.compaction.enabled === "boolean") policy.enabled = settings.compaction.enabled;
 			const reserveTokens = settings.compaction.reserveTokens;
@@ -2784,7 +2784,6 @@ async function resolveIds(params: { ids?: string[]; batch_id?: string; input_fil
 export default async function subagentsExtension(pi: ExtensionAPI) {
 	const extensionDir = path.dirname(fileURLToPath(import.meta.url));
 	const roles = await loadSubagentRoles(path.join(extensionDir, "roles"), path.join(extensionDir, "profiles"));
-	const compactionPolicy = await loadManagedSubagentCompactionPolicy(process.cwd());
 	pi.on("before_provider_request", (event) => {
 		const promptCacheKey = process.env[PROMPT_CACHE_ENV];
 		if (!promptCacheKey || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
@@ -3129,7 +3128,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
 		latestCtx = ctx;
 		if (shuttingDown) throw new Error("Subagent extension is shutting down");
 		if (manager) return manager;
-		manager = new SubagentManager(ctx.cwd, compactionPolicy, hierarchyRegistryDir);
+		manager = new SubagentManager(ctx.cwd, loadManagedSubagentCompactionPolicy(ctx.cwd), hierarchyRegistryDir);
 		const entries = [...ctx.sessionManager.getBranch(), ...readBridgeResults()];
 		manager.restore(scanSerializedAgents(entries).map((item) => item.contextWindow
 			? item

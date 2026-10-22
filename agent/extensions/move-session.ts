@@ -1,16 +1,16 @@
 /**
  * Session Move Extension
  *
- * Move the current session into another cwd bucket and relaunch pi in that directory
+ * Move the current session into another cwd bucket and continue it there, in the same pi process
  *
  * Implementation strategy:
- *  1) Fork the current session file into the target cwd bucket using SessionManager.forkFrom()
+ *  1) Fork the current session file into the target cwd bucket using SessionManager.forkFrom(), keeping the session ID
  *  2) Clear the fork header's parentSession pointer
- *  3) Tear down the parent's terminal usage (pop kitty protocol, reset modes)
- *  4) Spawn a new pi process in the target cwd with inherited stdio
- *  5) Once the child has spawned, trash the old session file
- *  6) Once the child has spawned, destroy the parent's stdin so it cannot steal key presses
- *  7) Parent stays alive as an inert wrapper, forwarding the child's exit code
+ *  3) Switch pi to the fork. Pi rebuilds tools, resources, and ctx.cwd for the target directory
+ *  4) Trash the old session file
+ *
+ * The agent uses the move_session tool. The tool queues the same command, which waits for the
+ * agent's turn to end, moves the session, and then lets the agent continue in the target.
  *
  * Usage:
  *   /move-session <targetCwd>
@@ -18,8 +18,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { spawn } from "node:child_process";
-import { basename } from "node:path";
+import { execFile } from "node:child_process";
 import {
     statSync,
     openSync,
@@ -29,6 +28,7 @@ import {
     renameSync,
     unlinkSync,
 } from "node:fs";
+import { Type } from "typebox";
 
 import {
     getMainWorktreeRootFromWorktreeList,
@@ -134,7 +134,48 @@ function clearParentSession(sessionFile: string): void {
     }
 }
 
+// Recycle-bin commands, tried in order. Each reads the file path from PI_TRASH_PATH or its last argument.
+function trashCommands(filePath: string): Array<[string, string[]]> {
+    const commands: Array<[string, string[]]> = [["trash", [filePath]]];
+    if (process.platform === "win32") {
+        commands.push(["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+            "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:PI_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')"]]);
+    } else if (process.platform === "darwin") {
+        commands.push(["osascript", ["-e", "on run argv", "-e", "tell application \"Finder\" to delete (POSIX file (item 1 of argv))", "-e", "end run", filePath]]);
+    } else {
+        commands.push(["gio", ["trash", filePath]], ["trash-put", [filePath]]);
+    }
+    return commands;
+}
+
+// Never permanently delete session files. If no recycle-bin command works, keep the old file.
+export async function trashFileBestEffort(filePath: string): Promise<boolean> {
+    const env = { ...process.env, PI_TRASH_PATH: filePath };
+    for (const [command, args] of trashCommands(filePath)) {
+        const ok = await new Promise<boolean>((resolve) => {
+            execFile(command, args, { env, timeout: TRASH_TIMEOUT_MS, windowsHide: true }, (error) => resolve(!error));
+        });
+        if (ok) return true;
+    }
+    return false;
+}
+
 export default function (pi: ExtensionAPI) {
+    // From a move_session call until the run ends, no other tool may run in the old directory.
+    let blockOtherTools = false;
+    // The run's abort signal of an agent-requested move. Only those moves continue the agent afterwards.
+    let agentMoveSignal: AbortSignal | undefined;
+
+    pi.on("tool_call", async (event) => {
+        if (blockOtherTools) {
+            return { block: true, reason: "A session move is pending. End your turn now. You continue in the target directory.", terminate: true };
+        }
+        if (event.toolName === "move_session") blockOtherTools = true;
+    });
+    pi.on("agent_end", async () => {
+        blockOtherTools = false;
+    });
+
     const resolveTargetCwd = async (rawTargetCwd: string, cwd: string): Promise<string> => {
         if (!isMainWorktreeTarget(rawTargetCwd)) {
             return normalizeTargetCwd(rawTargetCwd, process.env, cwd);
@@ -149,22 +190,59 @@ export default function (pi: ExtensionAPI) {
         return getMainWorktreeRootFromWorktreeList(result.stdout);
     };
 
-    const trashFileBestEffort = async (filePath: string) => {
+    const resolveExistingDirectory = async (rawTargetCwd: string, cwd: string): Promise<string> => {
+        const targetCwd = await resolveTargetCwd(rawTargetCwd, cwd);
+        let targetCwdStat;
         try {
-            const { code } = await pi.exec("trash", [filePath], { timeout: TRASH_TIMEOUT_MS });
-            if (code === 0) {
-                return;
-            }
-        } catch {
-            // ignore
+            targetCwdStat = statSync(targetCwd);
+        } catch (error: any) {
+            throw new Error(error?.code === "ENOENT" ? `Path does not exist: ${targetCwd}` : `Cannot access path: ${targetCwd}`);
         }
-
-        // If "trash" isn't available, do not fall back to unlink.
-        // This extension should never permanently delete session files.
+        if (!targetCwdStat.isDirectory()) throw new Error(`Not a directory: ${targetCwd}`);
+        return targetCwd;
     };
 
+    pi.registerTool({
+        name: "move_session",
+        label: "Move session",
+        description:
+            "Move this session to another existing directory, for example a git worktree, and continue there. " +
+            "The conversation moves with the session. Pi reloads tools, context files, and project configuration from the target. " +
+            "Background processes, subagents, and SSH connections of this session stop.",
+        promptSnippet: "Move this session to another directory, such as a git worktree",
+        promptGuidelines: [
+            "Use move_session to work in another directory, such as a git worktree. A shell `cd` does not move the session.",
+            "Call move_session alone. Pi ends your turn and continues the session in the target directory.",
+        ],
+        parameters: Type.Object({
+            path: Type.String({
+                description: `Target directory: absolute, relative to the current directory, ~, or ${MAIN_WORKTREE_TOKEN}`,
+            }),
+        }),
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+            let targetCwd: string;
+            try {
+                targetCwd = await resolveExistingDirectory(params.path.trim(), ctx.cwd);
+                if (targetCwd === ctx.cwd) throw new Error(`The session is already in ${targetCwd}`);
+                if (!ctx.sessionManager.getSessionFile()) throw new Error("No persistent session file (maybe started with --no-session)");
+            } catch (error) {
+                blockOtherTools = false;
+                throw error;
+            }
+
+            agentMoveSignal = signal ?? new AbortController().signal;
+            // Runs the command now. The command waits until this run ends.
+            pi.sendUserMessage(`/move-session ${targetCwd}`, { expandPromptTemplates: true });
+            return {
+                content: [{ type: "text", text: `Session move to ${targetCwd} is queued. You continue in ${targetCwd}.` }],
+                details: { targetCwd },
+                terminate: true,
+            };
+        },
+    });
+
     pi.registerCommand("move-session", {
-        description: "Move session to another directory and relaunch pi there",
+        description: "Move session to another directory and continue there",
         getArgumentCompletions: (argumentPrefix: string) => {
             const trimmedPrefix = argumentPrefix.trimStart();
             if (!MAIN_WORKTREE_TOKEN.startsWith(trimmedPrefix)) {
@@ -178,7 +256,15 @@ export default function (pi: ExtensionAPI) {
             }];
         },
         handler: async (args, ctx) => {
+            const moveSignal = agentMoveSignal;
+            agentMoveSignal = undefined;
+            const continueAgent = moveSignal !== undefined;
             await ctx.waitForIdle();
+
+            if (moveSignal?.aborted) {
+                ctx.ui.notify("Session move cancelled because the agent turn was aborted", "warning");
+                return;
+            }
 
             const rawTargetCwd = args.trim();
             if (!rawTargetCwd) {
@@ -188,27 +274,9 @@ export default function (pi: ExtensionAPI) {
 
             let targetCwd: string;
             try {
-                targetCwd = await resolveTargetCwd(rawTargetCwd, ctx.cwd);
+                targetCwd = await resolveExistingDirectory(rawTargetCwd, ctx.cwd);
             } catch (error: any) {
                 ctx.ui.notify(error?.message ?? String(error), "error");
-                return;
-            }
-
-            let targetCwdStat;
-            try {
-                targetCwdStat = statSync(targetCwd);
-            } catch (error: any) {
-                const code = error?.code;
-                if (code === "ENOENT") {
-                    ctx.ui.notify(`Path does not exist: ${targetCwd}`, "error");
-                } else {
-                    ctx.ui.notify(`Cannot access path: ${targetCwd}`, "error");
-                }
-                return;
-            }
-
-            if (!targetCwdStat.isDirectory()) {
-                ctx.ui.notify(`Not a directory: ${targetCwd}`, "error");
                 return;
             }
 
@@ -228,81 +296,45 @@ export default function (pi: ExtensionAPI) {
                 ctx.ui.notify(branchSelectionWarning, "warning");
             }
 
+            let destSessionFile: string | undefined;
             try {
-                const forked = SessionManager.forkFrom(sourceSessionFile, targetCwd);
-                const destSessionFile = forked.getSessionFile();
-
-                if (!destSessionFile) {
-                    ctx.ui.notify("Internal error: forkFrom() produced no session file", "error");
-                    return;
-                }
-
-                // We intend to move/replace the original session, so avoid leaving
-                // a parentSession pointer that may dangle after trashing the source.
-                try {
-                    clearParentSession(destSessionFile);
-                } catch (error: any) {
-                    ctx.ui.notify(
-                        `Warning: could not clear parent session reference: ${error?.message ?? String(error)}`,
-                        "warning"
-                    );
-                }
-
-                const piCommand = process.platform === "win32" ? process.execPath : "pi";
-                const needsScript = process.platform === "win32" && /^(node|bun)(\.exe)?$/i.test(basename(process.execPath));
-                const currentScript = process.argv[1];
-                if (needsScript && !currentScript) throw new Error("Cannot find the current Pi CLI entry point");
-                const piArgs = [
-                    ...(needsScript ? [currentScript!] : []),
-                    "--session",
-                    destSessionFile,
-                ];
-
-                // --- Tear down the parent's terminal usage ---
-                // We do this BEFORE spawning, to avoid nesting Kitty protocol flags.
-                process.stdout.write("\x1b[<u");      // Pop kitty keyboard protocol
-                process.stdout.write("\x1b[?2004l");  // Disable bracketed paste
-                process.stdout.write("\x1b[?25h");    // Show cursor
-                process.stdout.write("\r\n");         // Ensure child starts on a clean line
-
-                if (process.stdin.isTTY) {
-                    process.stdin.setRawMode(false);
-                }
-
-                // Spawn new pi in the target directory.
-                // On Windows, avoid both `spawn("pi")` (may not resolve npm shims)
-                // and `shell: true` (can split paths containing spaces). Launch the
-                // current CLI script with Node/Bun, or the compiled executable directly.
-                const child = spawn(piCommand, piArgs, {
-                    cwd: targetCwd,
-                    stdio: "inherit",
-                });
-
-                child.once("spawn", () => {
-                    // Trash the old session file *after* the new process is actually running
-                    void trashFileBestEffort(sourceSessionFile);
-
-                    // Stop the parent from stealing keypresses.
-                    // destroy() is important; pause() was not sufficient.
-                    process.stdin.removeAllListeners();
-                    process.stdin.destroy();
-
-                    // Avoid the parent reacting to Ctrl+C / termination signals.
-                    // (The child is the process the user is interacting with.)
-                    process.removeAllListeners("SIGINT");
-                    process.removeAllListeners("SIGTERM");
-                    process.on("SIGINT", () => {});
-                    process.on("SIGTERM", () => {});
-                });
-
-                child.on("exit", (code) => process.exit(code ?? 0));
-                child.on("error", (err) => {
-                    process.stderr.write(`Failed to launch pi: ${err.message}\n`);
-                    process.exit(1);
-                });
+                // Keep the session ID: providers key their prompt cache on it. IDs are unique per directory.
+                const sessionId = ctx.sessionManager.getSessionId();
+                const id = SessionManager.findById(targetCwd, sessionId) ? undefined : sessionId;
+                destSessionFile = SessionManager.forkFrom(sourceSessionFile, targetCwd, undefined, { id }).getSessionFile();
             } catch (error: any) {
                 ctx.ui.notify(`Failed to move session: ${error?.message ?? String(error)}`, "error");
+                return;
             }
+            if (!destSessionFile) {
+                ctx.ui.notify("Internal error: forkFrom() produced no session file", "error");
+                return;
+            }
+
+            // We intend to move/replace the original session, so avoid leaving
+            // a parentSession pointer that may dangle after trashing the source.
+            try {
+                clearParentSession(destSessionFile);
+            } catch (error: any) {
+                ctx.ui.notify(
+                    `Warning: could not clear parent session reference: ${error?.message ?? String(error)}`,
+                    "warning"
+                );
+            }
+
+            // After a successful switch, ctx and pi belong to the old session. Do not use them.
+            await ctx.switchSession(destSessionFile, {
+                // Runs only after a successful switch, before the agent continues.
+                withSession: async (next) => {
+                    void trashFileBestEffort(sourceSessionFile);
+                    if (!continueAgent) return;
+                    await next.sendMessage({
+                        customType: "move-session",
+                        content: `The session moved to ${targetCwd}. Your working directory is now ${targetCwd}. Continue the task there.`,
+                        display: true,
+                    }, { triggerTurn: true });
+                },
+            });
         },
     });
 }
