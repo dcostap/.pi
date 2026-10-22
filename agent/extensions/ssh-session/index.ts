@@ -62,6 +62,7 @@ interface ActiveSession {
 
 export default function sshSessionExtension(pi: ExtensionAPI) {
 	let session: ActiveSession | undefined;
+	let connecting = false;
 	let latestContext: ExtensionContext | undefined;
 
 	const setStatus = (ctx: ExtensionContext) => {
@@ -74,15 +75,14 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 		);
 	};
 
-	const announce = (content: string) => {
+	const announce = (content: string, deliverAs: "steer" | "nextTurn" = "nextTurn") => {
 		pi.sendMessage(
 			{ customType: "ssh-session-state", content, display: true },
-			{ deliverAs: "nextTurn" },
+			{ deliverAs },
 		);
 	};
 
 	const connect = async (rawTarget: string, ctx: ExtensionCommandContext) => {
-		await ctx.waitForIdle();
 		if (session) throw new Error(`Already connected to ${session.target.user}@${session.target.requested}; disconnect first`);
 		if (ctx.mode !== "tui") {
 			throw new Error("/ssh-connect currently requires Pi's TUI for masked password and sudo prompts");
@@ -110,6 +110,10 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			const remoteCwd = pwd.output.text.trim().split(/\r?\n/u).at(-1);
 			if (!remoteCwd?.startsWith("/")) throw new Error(`Remote pwd returned an invalid directory: ${remoteCwd ?? ""}`);
 
+			// Keep the session private until all requested authorization is complete.
+			const rootShell = privilege === "Unrestricted root until disconnect"
+				? await RootShell.start(ctx, client)
+				: undefined;
 			const backgroundOutputs = new BackgroundOutputRegistry(operations);
 			const manager = new BackgroundProcessManager(backgroundOutputs.operations, {
 				maxRunning: 8,
@@ -126,6 +130,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 				remoteCwd,
 				manager,
 				backgroundOutputs,
+				rootShell,
 				closing: false,
 			};
 
@@ -140,9 +145,6 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 				}
 			});
 
-			if (privilege === "Unrestricted root until disconnect") {
-				session.rootShell = await RootShell.start(ctx, client);
-			}
 			setStatus(ctx);
 			announce(
 				`The user authorized SSH access to ${target.user}@${target.hostName} (${remoteCwd}). ` +
@@ -151,6 +153,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 					: session.rootShell
 						? "The ssh_session tool may run normal and unrestricted root commands until disconnect."
 						: "The ssh_session tool may run normal commands; root access was not authorized."),
+				ctx.isIdle() ? "nextTurn" : "steer",
 			);
 			ctx.ui.notify(`Connected to ${target.user}@${target.hostName}:${target.port}${session.rootShell ? " with session root access" : ""}`, "info");
 		} catch (error) {
@@ -164,10 +167,17 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 	pi.registerCommand("ssh-connect", {
 		description: "Open a user-authorized persistent SSH session: /ssh-connect user@host",
 		handler: async (args, ctx) => {
+			if (connecting) {
+				ctx.ui.notify("SSH connection setup is already in progress", "warning");
+				return;
+			}
+			connecting = true;
 			try {
 				await connect(args, ctx);
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			} finally {
+				connecting = false;
 			}
 		},
 	});

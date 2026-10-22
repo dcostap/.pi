@@ -23,7 +23,12 @@ Commands:
 - `/ssh-status`
 - `/ssh-disconnect`
 
-The model receives one permanently registered `ssh_session` tool. It cannot initiate a connection. Connection state is announced as a tail message, so connecting does not change the tool/system-prompt prefix.
+The model receives one permanently registered `ssh_session` tool. It cannot initiate a connection.
+Connection setup does not wait for the agent to finish. The agent can continue working during configuration and authentication.
+The tool cannot use the new session until setup completes. Only one connection setup can run at a time.
+After setup, the authorization message steers a working agent at the next steering boundary.
+When idle, the message waits for the next turn. Connecting alone does not start agent work.
+These messages do not change the tool or system-prompt prefix.
 
 ## Current scope
 

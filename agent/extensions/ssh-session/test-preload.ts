@@ -50,10 +50,26 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+	Key: { enter: "enter", escape: "escape", backspace: "backspace", delete: "delete", ctrl: (key: string) => `ctrl+${key}` },
+	matchesKey: (data: string, key: string) => data === key,
+	truncateToWidth: (text: string, width: number) => text.slice(0, width),
 	Text: class Text {
 		constructor(private text: string) {}
 		setText(text: string) { this.text = text; }
 		render() { return this.text.split("\n"); }
 		invalidate() {}
+	},
+}));
+
+const schema = (..._args: unknown[]) => ({});
+mock.module("@earendil-works/pi-ai", () => ({ StringEnum: schema }));
+mock.module("typebox", () => ({
+	Type: {
+		Object: schema,
+		Array: schema,
+		Optional: schema,
+		String: schema,
+		Boolean: schema,
+		Integer: schema,
 	},
 }));
