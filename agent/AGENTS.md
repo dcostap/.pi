@@ -6,6 +6,8 @@ When calling PowerShell from `bash`, single-quote the entire `-Command` script (
 
 ## Working directory
 
+Before changing the session directory, ask for permission unless the user already approved the target directory for this task.
+
 In extensions, use `ctx.cwd` for project paths and new local processes. Do not use `process.cwd()`. Pi does not change `process.cwd()` when a session switches to another project.
 
 This rule applies to all prose you write: docs, commit messages, PR descriptions, reports, and replies: Follow ASD-STE100 Simplified Technical English for technical text:
