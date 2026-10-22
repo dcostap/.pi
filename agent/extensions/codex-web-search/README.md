@@ -25,6 +25,22 @@ The tool supports these operations:
 - `click` follows a numbered link.
 - `find` finds text in an opened result.
 
+## Citations
+
+Search results use plain `Reference:` IDs for tool navigation.
+The agent cites sources with standard Markdown links, not ChatGPT-only citation codes.
+The extension also converts citation codes in streamed and completed replies to source links.
+It restores source URLs from the active session branch, including older search results.
+If no source URL exists, it shows `URL unavailable`. It does not create a URL.
+
+Run the tests with:
+
+```sh
+node --test agent/extensions/codex-web-search/*.test.ts
+```
+
+## Configuration
+
 Optional environment variables:
 
 - `PI_CODEX_SEARCH_URL` overrides the search endpoint.

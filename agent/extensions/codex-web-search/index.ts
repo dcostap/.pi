@@ -11,6 +11,7 @@ import { Type, type Static } from "typebox";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { extractCitationSources, formatSearchOutput, registerCitationHandling } from "./citations.ts";
 import {
 	accountIdFromToken,
 	buildCodexSearchRequest,
@@ -168,6 +169,7 @@ function renderOutputPreview(output: string, expanded: boolean, theme: any): str
 
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
 	let firecrawlSearchDisplaced = false;
+	registerCitationHandling(pi);
 
 	function syncSearchTools(model: ExtensionContext["model"]): void {
 		const active = pi.getActiveTools();
@@ -188,6 +190,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use codex_web_search for web discovery and search when it is active; do not use another web search tool.",
 			"Use codex_web_search open, click, and find operations to inspect its search results.",
+			"Cite web sources with standard Markdown links to their URLs. Use Reference IDs only for tool navigation, not citations.",
 		],
 		parameters: Parameters,
 		renderCall(args, theme, context) {
@@ -201,7 +204,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 				component.setText(theme.fg("warning", "Searching through OpenAI Codex…"));
 				return component;
 			}
-			const output = resultText(result);
+			const output = formatSearchOutput(resultText(result));
 			if (context.isError) {
 				component.setText(theme.fg("error", `✗ ${output || "Codex search failed"}`));
 				return component;
@@ -259,7 +262,8 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 			const output = String(parsed?.output || parsed?.output_text || parsed?.text || "").trim();
 			if (!output) throw new Error("Codex search returned no output");
 
-			const truncation = truncateHead(output, {
+			const citationSources = extractCitationSources(output);
+			const truncation = truncateHead(formatSearchOutput(output), {
 				maxLines: DEFAULT_MAX_LINES,
 				maxBytes: DEFAULT_MAX_BYTES,
 			});
@@ -276,6 +280,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 					authModel: auth.authModel,
 					searchModel,
 					resultCount: Array.isArray(parsed?.results) ? parsed.results.length : 0,
+					citationSources,
 					artifactPath,
 					truncated: truncation.truncated,
 				},
