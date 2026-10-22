@@ -39,6 +39,7 @@ const ToolParameters = Type.Object({
 		["exec", "sudo_exec", "upload", "download", "bg_start", "bg_status", "bg_wait", "bg_kill", "list", "close"] as const,
 		{ description: "SSH session operation" },
 	),
+	session_id: Type.Optional(Type.String({ minLength: 1, description: "Connection ID from list, such as ssh-1. Required when multiple connections exist; list without it shows all connections." })),
 	command: Type.Optional(Type.String({ description: "Non-interactive remote shell command for exec, sudo_exec, or bg_start" })),
 	cwd: Type.Optional(Type.String({ description: "Absolute remote working directory; defaults to the connected session directory" })),
 	local_path: Type.Optional(Type.String({ description: "Local file path for upload or download; relative paths use Pi's current working directory" })),
@@ -51,6 +52,7 @@ const ToolParameters = Type.Object({
 });
 
 interface ActiveSession {
+	readonly id: string;
 	readonly target: ResolvedSshTarget;
 	readonly client: Client;
 	readonly remoteCwd: string;
@@ -61,16 +63,19 @@ interface ActiveSession {
 }
 
 export default function sshSessionExtension(pi: ExtensionAPI) {
-	let session: ActiveSession | undefined;
+	const sessions = new Map<string, ActiveSession>();
+	let nextSessionId = 1;
 	let connecting = false;
+	let setupClient: Client | undefined;
+	let shuttingDown = false;
 	let latestContext: ExtensionContext | undefined;
 
 	const setStatus = (ctx: ExtensionContext) => {
 		latestContext = ctx;
 		ctx.ui.setStatus(
 			"ssh-session",
-			session
-				? `SSH: ${session.target.user}@${session.target.requested}${session.rootShell ? " • root" : ""}`
+			sessions.size
+				? `SSH: ${[...sessions.values()].map((session) => `${session.id} ${formatTargetLabel(session.target)}${session.rootShell ? " • root" : ""}`).join(", ")}`
 				: undefined,
 		);
 	};
@@ -81,28 +86,45 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			{ deliverAs },
 		);
 	};
+	const connectionState = () => sessions.size
+		? `Available SSH sessions: ${[...sessions.keys()].join(", ")}.`
+		: "No SSH sessions remain connected.";
 
 	const connect = async (rawTarget: string, ctx: ExtensionCommandContext) => {
-		if (session) throw new Error(`Already connected to ${session.target.user}@${session.target.requested}; disconnect first`);
+		if (shuttingDown) throw new Error("The SSH extension is shutting down");
 		if (ctx.mode !== "tui") {
 			throw new Error("/ssh-connect currently requires Pi's TUI for masked password and sudo prompts");
 		}
 
 		const requested = validateTarget(rawTarget);
 		const target = resolveTarget(requested);
+		const existing = [...sessions.values()].find((session) =>
+			session.target.user === target.user && session.target.hostName === target.hostName && session.target.port === target.port,
+		);
+		if (existing) throw new Error(`Already connected as ${existing.id} to ${formatTargetLabel(existing.target)}; disconnect that session first`);
 		const knownFingerprints = getKnownFingerprints(target);
 
 		// A root login already runs every exec as root, so sudo adds nothing.
 		const loginIsRoot = target.user === "root";
 		const privilege = loginIsRoot
 			? "Normal commands only"
-			: await ctx.ui.select("Agent privilege for this SSH session", [
+			: await ctx.ui.select(`Agent privilege for ${formatTargetLabel(target)}`, [
 					"Normal commands only",
 					"Unrestricted root until disconnect",
 				]);
 		if (!privilege) return;
+		if (shuttingDown) throw new Error("The SSH extension is shutting down");
 
-		const client = await connectClient(ctx, target, knownFingerprints);
+		const client = await connectClient(ctx, target, knownFingerprints, (client) => {
+			if (shuttingDown) {
+				client.end();
+				throw new Error("The SSH extension is shutting down");
+			}
+			setupClient = client;
+		});
+		let connectionClosed = false;
+		client.once("close", () => { connectionClosed = true; });
+		let active: ActiveSession | undefined;
 		try {
 			const operations = createRemoteOperations(client);
 			const pwd = await captureExec(operations, "pwd", ".", 15_000);
@@ -114,6 +136,8 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			const rootShell = privilege === "Unrestricted root until disconnect"
 				? await RootShell.start(ctx, client)
 				: undefined;
+			if (shuttingDown) throw new Error("The SSH extension shut down during connection setup");
+			if (connectionClosed) throw new Error("The SSH connection closed during setup");
 			const backgroundOutputs = new BackgroundOutputRegistry(operations);
 			const manager = new BackgroundProcessManager(backgroundOutputs.operations, {
 				maxRunning: 8,
@@ -124,7 +148,8 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			manager.subscribe((event) => {
 				if (event.kind === "pruned") backgroundOutputs.forget(event.id);
 			});
-			session = {
+			active = {
+				id: `ssh-${nextSessionId++}`,
 				target,
 				client,
 				remoteCwd,
@@ -133,21 +158,25 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 				rootShell,
 				closing: false,
 			};
+			const session = active;
+			sessions.set(session.id, session);
 
 			client.on("close", () => {
-				if (!session || session.client !== client || session.closing) return;
-				const lost = session;
-				session = undefined;
-				void lost.manager.dispose(1000);
+				if (sessions.get(session.id) !== session || session.closing) return;
+				sessions.delete(session.id);
+				session.closing = true;
+				void Promise.allSettled([session.manager.dispose(1000), session.rootShell?.close()]);
 				if (latestContext) {
 					setStatus(latestContext);
-					latestContext.ui.notify(`SSH connection to ${target.user}@${target.hostName} closed`, "warning");
+					latestContext.ui.notify(`SSH session ${session.id} to ${formatTargetLabel(target)} closed`, "warning");
+					announce(`SSH session ${session.id} to ${formatTargetLabel(target)} was lost. ${connectionState()}`, latestContext.isIdle() ? "nextTurn" : "steer");
 				}
 			});
 
 			setStatus(ctx);
 			announce(
-				`The user authorized SSH access to ${target.user}@${target.hostName} (${remoteCwd}). ` +
+				`The user authorized SSH access to ${target.user}@${target.hostName}:${target.port} (${remoteCwd}). ` +
+				`Use session_id: "${session.id}" for this connection (${formatTargetLabel(target)}). ${connectionState()} ` +
 				(loginIsRoot
 					? "The session is logged in as root, so exec runs commands as root; sudo_exec is not needed."
 					: session.rootShell
@@ -155,11 +184,13 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 						: "The ssh_session tool may run normal commands; root access was not authorized."),
 				ctx.isIdle() ? "nextTurn" : "steer",
 			);
-			ctx.ui.notify(`Connected to ${target.user}@${target.hostName}:${target.port}${session.rootShell ? " with session root access" : ""}`, "info");
+			ctx.ui.notify(`Connected ${session.id} to ${formatTargetLabel(target)}${session.rootShell ? " with session root access" : ""}`, "info");
 		} catch (error) {
-			if (session) await closeSession(session);
-			else client.end();
-			session = undefined;
+			if (active) {
+				sessions.delete(active.id);
+				await closeSession(active);
+				setStatus(ctx);
+			} else client.end();
 			throw error;
 		}
 	};
@@ -175,35 +206,48 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			try {
 				await connect(args, ctx);
 			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				if (!shuttingDown) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			} finally {
+				setupClient = undefined;
 				connecting = false;
 			}
 		},
 	});
 
 	pi.registerCommand("ssh-disconnect", {
-		description: "Close the active persistent SSH session",
-		handler: async (_args, ctx) => {
-			await ctx.waitForIdle();
-			if (!session) {
+		description: "Close an SSH connection: /ssh-disconnect [session_id]",
+		handler: async (args, ctx) => {
+			if (!sessions.size) {
 				ctx.ui.notify("No SSH session is connected", "info");
 				return;
 			}
-			const target = `${session.target.user}@${session.target.hostName}`;
-			const active = session;
-			session = undefined;
-			await closeSession(active);
-			setStatus(ctx);
-			announce(`The user closed the SSH session to ${target}. The ssh_session tool is no longer authorized.`);
-			ctx.ui.notify(`Disconnected from ${target}`, "info");
+			try {
+				let id = args.trim();
+				if (!id && sessions.size > 1) {
+					const choice = await ctx.ui.select("Disconnect which SSH session?", [...sessions.values()].map((session) => `${session.id} ${formatTargetLabel(session.target)}`));
+					if (!choice) return;
+					id = choice.split(" ")[0];
+				}
+				const active = requireSession(sessions, id || undefined);
+				sessions.delete(active.id);
+				setStatus(ctx);
+				announce(`The user closed SSH session ${active.id} to ${formatTargetLabel(active.target)}. Do not use this session. ${connectionState()}`, ctx.isIdle() ? "nextTurn" : "steer");
+				await closeSession(active);
+				ctx.ui.notify(`Disconnected ${active.id} from ${formatTargetLabel(active.target)}`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
 		},
 	});
 
 	pi.registerCommand("ssh-status", {
-		description: "Show the active SSH connection and background jobs",
-		handler: async (_args, ctx) => {
-			ctx.ui.notify(session ? formatSession(session, true) : "No SSH session is connected", "info");
+		description: "Show SSH connections and their background jobs: /ssh-status [session_id]",
+		handler: async (args, ctx) => {
+			try {
+				ctx.ui.notify(formatSessions(sessions, args.trim() || undefined), "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
 		},
 	});
 
@@ -211,7 +255,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 		name: "ssh_session",
 		label: "SSH session",
 		description:
-			"Operate on an existing user-authorized persistent SSH session. This tool cannot establish connections; the user must invoke /ssh-connect. Actions: exec and sudo_exec run foreground commands; upload and download atomically transfer individual regular files over the authenticated SFTP channel; bg_start, bg_status, bg_wait, and bg_kill manage non-privileged background jobs; list reports state; close disconnects. sudo_exec is available only when the user granted unrestricted root access for the session. Command output is limited to 2000 lines or 50KB; complete output is saved to a local temp file when truncated.",
+			"Operate on user-authorized persistent SSH connections. Only the user can connect, with /ssh-connect for each server. Use list to get connection IDs, targets, root permissions, and background jobs. Unfiltered list shows all connections. Set session_id for other operations when multiple connections exist; omit it only when exactly one exists. Each connection has separate root authorization and background jobs. Job IDs belong to their connection. exec and sudo_exec run foreground commands. upload and download atomically transfer individual regular files over the selected authenticated SFTP channel. bg_start, bg_status, bg_wait, and bg_kill manage background jobs as the login user, without the sudo channel. close disconnects only the selected connection. sudo_exec requires root authorization for that connection; root logins use exec. Output is limited to 2000 lines or 50KB. Complete output is saved to a local temp file when truncated.",
 		parameters: ToolParameters,
 		renderCall(args, theme, context) {
 			return renderSshCall(args, theme, context.expanded, context.lastComponent as Text | undefined);
@@ -228,11 +272,19 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			latestContext = ctx;
 			if (params.action === "list") {
-				return textResult(session ? formatSession(session, true) : "No user-authorized SSH session is connected.", { action: "list" });
+				const selected = params.session_id ? [requireSession(sessions, params.session_id)] : [...sessions.values()];
+				return textResult(formatSessions(sessions, params.session_id), { action: "list", sessions: selected.map(sessionDetails) });
 			}
-			const active = requireSession(session);
+			const active = requireSession(sessions, params.session_id);
 			if (active.closing) throw new Error("The SSH session is closing");
 			const cwd = validateRemoteCwd(params.cwd ?? active.remoteCwd);
+			const resultForSession = (result: ReturnType<typeof textResult>) => ({
+				...result,
+				content: [{ type: "text" as const, text: `Session: ${active.id} (${formatTargetLabel(active.target)})\n${result.content[0].text}` }],
+				details: { ...result.details, sessionId: active.id, target: formatTargetLabel(active.target) },
+			});
+			const updateForSession = (text: string, details: Record<string, unknown>) =>
+				onUpdate?.(resultForSession(textResult(text, details)));
 
 			switch (params.action) {
 				case "exec": {
@@ -243,10 +295,10 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 						cwd,
 						params.timeout_seconds,
 						signal,
-						(text) => onUpdate?.({ content: [{ type: "text", text }], details: { running: true } }),
+						(text) => updateForSession(text, { running: true }),
 						"exec",
 					);
-					return commandResult("exec", result.exitCode, result.output, false);
+					return resultForSession(commandResult("exec", result.exitCode, result.output, active.target.user === "root"));
 				}
 				case "sudo_exec": {
 					const command = requireCommand(params.command);
@@ -261,7 +313,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 							timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
 							onData: (chunk) => capture.append(chunk),
 						});
-						return commandResult("sudo_exec", result.exitCode, capture.finish(), true);
+						return resultForSession(commandResult("sudo_exec", result.exitCode, capture.finish(), true));
 					} catch (error) {
 						throw enrichCaptureError(error, capture.finish());
 					}
@@ -278,9 +330,9 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 						signal,
 						timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
 						onProgress: (text, transferredBytes, totalBytes) =>
-							onUpdate?.({ content: [{ type: "text", text }], details: { running: true, transferredBytes, totalBytes } }),
+							updateForSession(text, { running: true, transferredBytes, totalBytes }),
 					});
-					return transferResult("upload", result);
+					return resultForSession(transferResult("upload", result));
 				}
 				case "download": {
 					const localPath = resolveLocalTransferPath(requirePath(params.local_path, "local_path"), ctx.cwd);
@@ -293,9 +345,9 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 						signal,
 						timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
 						onProgress: (text, transferredBytes, totalBytes) =>
-							onUpdate?.({ content: [{ type: "text", text }], details: { running: true, transferredBytes, totalBytes } }),
+							updateForSession(text, { running: true, transferredBytes, totalBytes }),
 					});
-					return transferResult("download", result);
+					return resultForSession(transferResult("download", result));
 				}
 				case "bg_start": {
 					if (signal?.aborted) throw new Error("Background start aborted before launch");
@@ -303,23 +355,23 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 					const title = (params.title?.trim() || command).slice(0, 80);
 					const started = active.manager.start(command, title, cwd);
 					active.backgroundOutputs.claim(started.id);
-					return textResult(`Started ${started.id}: ${title}\nHost: ${active.target.user}@${active.target.hostName}\nCWD: ${cwd}`, {
+					return resultForSession(textResult(`Started ${started.id}: ${title}\nHost: ${active.target.user}@${active.target.hostName}\nCWD: ${cwd}`, {
 						action: "bg_start",
 						jobId: started.id,
-					});
+					}));
 				}
 				case "bg_status": {
 					const ids = requireJobIds(params.job_ids);
 					const outputs = ids.map((id) => active.backgroundOutputs.get(id));
 					const outputPaths = ids.map((id) => active.backgroundOutputs.getPath(id));
-					return textResult(
+					return resultForSession(textResult(
 						ids.map((id, index) => formatJob(active.manager.get(id, true), true, outputs[index], outputPaths[index])).join("\n\n"),
 						{
 							action: "bg_status",
 							jobIds: ids,
 							fullOutputPaths: outputPaths.filter((path): path is string => Boolean(path)),
 						},
-					);
+					));
 				}
 				case "bg_wait": {
 					const ids = requireJobIds(params.job_ids);
@@ -327,7 +379,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 						timeoutMs: params.timeout_seconds === undefined ? undefined : params.timeout_seconds * 1000,
 						signal,
 						onUpdate: (runningIds) =>
-							onUpdate?.({ content: [{ type: "text", text: `Still running: ${runningIds.join(", ")}` }], details: { runningIds } }),
+							updateForSession(`Still running: ${runningIds.join(", ")}`, { runningIds }),
 					});
 					const settled = waited.settled
 						.map((item) => formatJob(item, true, active.backgroundOutputs.get(item.id), active.backgroundOutputs.getPath(item.id)))
@@ -336,25 +388,24 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 						const path = active.backgroundOutputs.get(item.id)?.fullOutputPath;
 						return path ? [path] : [];
 					});
-					return textResult(
+					return resultForSession(textResult(
 						[settled || "No selected jobs settled.", waited.runningIds.length ? `Still running: ${waited.runningIds.join(", ")}` : ""].filter(Boolean).join("\n\n"),
 						{ action: "bg_wait", jobIds: ids, runningIds: waited.runningIds, fullOutputPaths },
-					);
+					));
 				}
 				case "bg_kill": {
 					const ids = requireJobIds(params.job_ids);
 					const killed = await active.manager.kill(ids);
-					return textResult(killed.map((item) => `${item.id}: ${item.outcome}`).join("\n"), {
+					return resultForSession(textResult(killed.map((item) => `${item.id}: ${item.outcome}`).join("\n"), {
 						action: "bg_kill",
 						jobIds: ids,
-					});
+					}));
 				}
 				case "close": {
-					const target = `${active.target.user}@${active.target.hostName}`;
-					session = undefined;
-					await closeSession(active);
+					sessions.delete(active.id);
 					setStatus(ctx);
-					return textResult(`Closed SSH session to ${target}.`, { action: "close" });
+					await closeSession(active);
+					return resultForSession(textResult(`Closed SSH session to ${formatTargetLabel(active.target)}.`, { action: "close" }));
 				}
 			}
 		},
@@ -363,10 +414,13 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => setStatus(ctx));
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		shuttingDown = true;
+		setupClient?.end();
+		setupClient = undefined;
 		latestContext = ctx;
-		const active = session;
-		session = undefined;
-		if (active) await closeSession(active);
+		const active = [...sessions.values()];
+		sessions.clear();
+		await Promise.allSettled(active.map(closeSession));
 		ctx.ui.setStatus("ssh-session", undefined);
 	});
 }
@@ -375,9 +429,11 @@ async function connectClient(
 	ctx: ExtensionCommandContext,
 	target: ResolvedSshTarget,
 	knownFingerprints: string[],
+	onClient: (client: Client) => void,
 ): Promise<Client> {
 	const { Client, utils } = await import("ssh2");
 	const client = new Client();
+	onClient(client);
 	let authenticationCancelled = false;
 	let passwordAttempted = false;
 	let nextKeyIndex = 0;
@@ -413,6 +469,7 @@ async function connectClient(
 		client.on("error", (error) => {
 			fail(authenticationCancelled ? new Error("SSH authentication cancelled") : error);
 		});
+		client.once("close", () => fail(new Error("SSH connection closed before authentication completed")));
 
 		client.connect({
 			host: target.hostName,
@@ -778,9 +835,17 @@ function requireJobIds(ids: string[] | undefined): string[] {
 	return ids;
 }
 
-function requireSession(session: ActiveSession | undefined): ActiveSession {
-	if (!session) throw new Error("No user-authorized SSH session is connected. The user must run /ssh-connect user@host.");
-	return session;
+function requireSession(sessions: ReadonlyMap<string, ActiveSession>, id?: string): ActiveSession {
+	if (id !== undefined) {
+		const session = sessions.get(id);
+		if (!session) throw new Error(`Unknown SSH session: ${id}. Use ssh_session list to see connected session IDs.`);
+		return session;
+	}
+	if (!sessions.size) throw new Error("No user-authorized SSH session is connected. The user must run /ssh-connect user@host.");
+	if (sessions.size > 1) {
+		throw new Error(`Multiple SSH sessions are connected. Set session_id explicitly: ${[...sessions.keys()].join(", ")}.`);
+	}
+	return sessions.values().next().value!;
 }
 
 function commandResult(action: "exec" | "sudo_exec", exitCode: number, output: CapturedOutput, privileged: boolean) {
@@ -832,8 +897,33 @@ function textResult(text: string, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text }], details };
 }
 
+function formatTargetLabel(target: ResolvedSshTarget): string {
+	const host = target.requested.slice(target.requested.lastIndexOf("@") + 1);
+	return `${target.user}@${host}${target.port === 22 ? "" : `:${target.port}`}`;
+}
+
+function sessionDetails(session: ActiveSession) {
+	return {
+		sessionId: session.id,
+		target: formatTargetLabel(session.target),
+		hostName: session.target.hostName,
+		user: session.target.user,
+		port: session.target.port,
+		cwd: session.remoteCwd,
+		rootAccess: session.target.user === "root" ? "login" : session.rootShell ? "sudo" : "none",
+		jobs: session.manager.list().map(({ id, title, status }) => ({ id, title, status })),
+	};
+}
+
+function formatSessions(sessions: ReadonlyMap<string, ActiveSession>, id?: string): string {
+	if (id !== undefined) return formatSession(requireSession(sessions, id), true);
+	if (!sessions.size) return "No user-authorized SSH session is connected.";
+	return [...sessions.values()].map((session) => formatSession(session, true)).join("\n\n");
+}
+
 function formatSession(session: ActiveSession, includeJobs: boolean): string {
 	const lines = [
+		`Session: ${session.id} (${formatTargetLabel(session.target)})`,
 		`Target: ${session.target.user}@${session.target.hostName}:${session.target.port}`,
 		`CWD: ${session.remoteCwd}`,
 		`Root access: ${session.target.user === "root" ? "logged in as root" : session.rootShell ? "authorized until disconnect" : "not authorized"}`,
@@ -865,8 +955,7 @@ function enrichCaptureError(error: unknown, output: CapturedOutput): Error {
 async function closeSession(session: ActiveSession): Promise<void> {
 	if (session.closing) return;
 	session.closing = true;
-	await session.manager.dispose(5000);
-	await session.rootShell?.close();
+	await Promise.allSettled([session.manager.dispose(5000), session.rootShell?.close()]);
 	try {
 		await captureExec(createRemoteOperations(session.client), "sudo -k", session.remoteCwd, 5000);
 	} catch {

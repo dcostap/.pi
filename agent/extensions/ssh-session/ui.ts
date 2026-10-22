@@ -5,6 +5,7 @@ import { sanitizeTerminalText } from "./protocol.ts";
 
 interface SshToolArgs {
 	action?: unknown;
+	session_id?: unknown;
 	command?: unknown;
 	cwd?: unknown;
 	local_path?: unknown;
@@ -36,6 +37,7 @@ export function renderSshCall(
 	const action = typeof args.action === "string" ? args.action : "...";
 	const title = `${theme.fg("toolTitle", theme.bold("ssh_session"))} ${theme.fg("accent", action)}`;
 	const qualifiers: string[] = [];
+	if (typeof args.session_id === "string" && args.session_id) qualifiers.push(`on ${cleanInline(args.session_id)}`);
 	if (typeof args.cwd === "string" && args.cwd) qualifiers.push(`in ${cleanInline(args.cwd)}`);
 	if (Array.isArray(args.job_ids) && args.job_ids.length > 0) qualifiers.push(args.job_ids.map(String).join(", "));
 	if (typeof args.timeout_seconds === "number") qualifiers.push(`timeout ${args.timeout_seconds}s`);
@@ -115,7 +117,7 @@ function styleLine(line: string, isPartial: boolean, isError: boolean, theme: Th
 	if (/^Exit code:/u.test(line)) return theme.fg("error", line);
 	if (/^(?:Uploaded|Downloaded) /u.test(line)) return theme.fg("success", line);
 	if (/^(?:Local:|Remote:|SHA-256:|Remote mode:)/u.test(line)) return theme.fg("muted", line);
-	if (/^(?:Started bg-|Closed SSH session|Target:|CWD:|Root access:|Jobs:)/u.test(line)) {
+	if (/^(?:Started bg-|Closed SSH session|Session:|Target:|CWD:|Root access:|Jobs:)/u.test(line)) {
 		return theme.fg("muted", line);
 	}
 	return theme.fg("toolOutput", line);

@@ -7,6 +7,13 @@ const theme = {
 } as any;
 
 describe("SSH tool chat rendering", () => {
+	test("shows the selected connection in collapsed calls and results", () => {
+		const call = renderSshCall({ action: "exec", session_id: "ssh-2", command: "hostname" }, theme, false).render(200).join("\n");
+		expect(call).toContain("on ssh-2");
+		const result = renderSshResult({ content: [{ type: "text", text: "Session: ssh-2 (root@hero-1)\nhero-1\nExit code: 0 (root)" }] }, { expanded: false, isPartial: false }, theme).render(200).join("\n");
+		expect(result).toContain("Session: ssh-2 (root@hero-1)");
+	});
+
 	test("shows ordinary multiline commands without requiring expansion", () => {
 		const command = "echo one\necho two\necho three";
 		const collapsed = renderSshCall({ action: "exec", command, cwd: "/tmp" }, theme, false);
