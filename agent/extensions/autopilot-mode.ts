@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 
 const EXTENSION_ID = "autopilot-mode";
 const AUTOPILOT_PROMPT =
@@ -175,14 +175,6 @@ export default function autopilotMode(pi: ExtensionAPI): void {
 				return;
 			}
 
-			if (enabled) disableAutopilot(ctx, "Autopilot mode disabled.");
-			else enableAutopilot(ctx);
-		},
-	});
-
-	pi.registerShortcut(Key.ctrlAlt("a"), {
-		description: "Toggle autopilot mode",
-		handler: async (ctx) => {
 			if (enabled) disableAutopilot(ctx, "Autopilot mode disabled.");
 			else enableAutopilot(ctx);
 		},
