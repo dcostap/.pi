@@ -157,6 +157,11 @@ mock.module("@earendil-works/pi-tui", () => ({
 	visibleWidth(text: string) {
 		return text.replace(/\x1b\[[0-9;]*m/gu, "").length;
 	},
+	wrapTextWithAnsi(text: string, width: number) {
+		const lines: string[] = [];
+		for (let start = 0; start < text.length; start += width) lines.push(text.slice(start, start + width));
+		return lines.length > 0 ? lines : [""];
+	},
 }));
 
 const Type = {

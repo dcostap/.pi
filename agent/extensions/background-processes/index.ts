@@ -64,6 +64,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 	let widgetRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	let widgetLastRefreshAt = 0;
+	let expandedWidgetId: string | undefined;
 	let shuttingDown = false;
 	const interrupts = new WaitInterruptRegistry();
 
@@ -76,8 +77,15 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		const ctx = latestContext;
 		if (!ctx || ctx.mode !== "tui" || shuttingDown) return;
 		const running = manager?.list().filter((snapshot) => !snapshot.settled) ?? [];
+		if (!running.some((snapshot) => snapshot.id === expandedWidgetId)) expandedWidgetId = undefined;
 		ctx.ui.setWidget("background-processes", running.length > 0
-			? (tui, theme) => processWidgetComponent(running, theme, tui)
+			? (tui, theme) => processWidgetComponent(running, theme, tui, {
+				expandedId: expandedWidgetId,
+				onToggle: (id) => {
+					expandedWidgetId = expandedWidgetId === id ? undefined : id;
+					updateWidget();
+				},
+			})
 			: undefined);
 		widgetLastRefreshAt = Date.now();
 		if (running.length > 0 && !widgetTimer) widgetTimer = setInterval(updateWidget, 1_000);
@@ -351,6 +359,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		const activeManager = manager;
 		manager = undefined;
 		widgetLastRefreshAt = 0;
+		expandedWidgetId = undefined;
 		if (activeManager) await activeManager.dispose(5000);
 		pi.events.emit(MANAGED_WORK_STATE_EVENT, { source: "background-processes", pending: false });
 	});

@@ -88,4 +88,38 @@ describe("background process widget", () => {
 
 		for (const line of component.render(42)) expect(line.length).toBeLessThanOrEqual(42);
 	});
+
+	test("an expanded process shows its full command, cwd, and output tail", () => {
+		const lines = processWidgetLines([
+			snapshot("bg-1", { command: "bun test --watch\n  --coverage" }),
+			snapshot("bg-2", { title: "Dev server" }),
+		], theme, 13_000, 120, "bg-1");
+		const text = lines.join("\n");
+
+		expect(text).toContain("$ bun test --watch");
+		expect(text).toContain("--coverage");
+		expect(text).toContain("cwd C:/work");
+		expect(text).toContain("│ collecting");
+		expect(text).toContain("│ 42 tests passed");
+		expect(lines.findIndex((line) => line.includes("bg-2"))).toBeGreaterThan(lines.findIndex((line) => line.includes("cwd")));
+	});
+
+	test("a left click on a row or its details toggles that process", () => {
+		const toggled: string[] = [];
+		const component = processWidgetComponent([snapshot("bg-1"), snapshot("bg-2")], theme, undefined, {
+			expandedId: "bg-1",
+			onToggle: (id) => toggled.push(id),
+		});
+		const lines = component.render(120);
+		const detailRow = lines.findIndex((line) => line.includes("cwd"));
+		const secondRow = lines.findIndex((line) => line.includes("bg-2"));
+
+		expect(component.handleMouse({ type: "click", button: "left", y: 0 })).toBeUndefined();
+		expect(component.handleMouse({ type: "click", button: "left", y: detailRow })).toEqual({ handled: true });
+		expect(component.handleMouse({ type: "press", button: "left", y: secondRow })).toBeUndefined();
+		expect(component.handleMouse({ type: "click", button: "right", y: secondRow })).toBeUndefined();
+		component.handleMouse({ type: "click", button: "left", y: secondRow });
+
+		expect(toggled).toEqual(["bg-1", "bg-2"]);
+	});
 });

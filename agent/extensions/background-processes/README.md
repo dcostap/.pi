@@ -42,6 +42,8 @@ Background rows look like bash rows. The collapsed view shows the last 5 output 
 
 While processes run, a widget shows above the editor. It shows one line for each process: spinner, ID, title, elapsed time, and the latest output line. A header line shows only when two or more processes run. The widget shows the 5 newest processes.
 
+In fullscreen mode, click a process row to expand it. The expanded row shows the full command (8 lines at most), the working directory, the captured size, the full-output file, and the last 5 output lines. Click the row again to collapse it. One row expands at a time. In regular mode, the terminal owns the mouse: use `/ps` instead.
+
 Bash commands receive no stdin. Do not add `&`, `start`, `Start-Process`, `nohup`, or daemonization flags: `bash_bg_start` already owns the background lifetime.
 
 Managed subagent coordinators remain parked while owned background processes are active.
