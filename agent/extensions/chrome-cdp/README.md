@@ -43,7 +43,8 @@ Actions:
 - `list`, `open`, `nav`, `reload`, `close`, `activate`
 - `snap`, `html`, `inspect`, `net`, `diagnostics`
 - `click`, `clickxy`, `type`, `press`, `wait`
-- `eval`, `script`, `raw`, `shot`, `viewport`, `download` 
+- `eval`, `script`, `raw`, `shot`, `viewport`, `download`
+- `download_status`, `download_wait`, `download_cancel`
 
 Use `close` to close one tab. Use `chrome_browser stop` to stop a launched browser.
 Use `activate` to select a tab in its browser window.
@@ -55,6 +56,30 @@ They support accessible locators, trusted input, styles, screenshots, diagnostic
 There are no site-specific modes or confirmation prompts.
 Raw CDP commands retain browser-wide access, including `Browser.close`.
 Ownership controls lifecycle cleanup; it does not restrict CDP methods.
+
+## Downloads
+
+`download` waits up to two seconds. Small transfers return the saved path immediately.
+Long transfers return a `downloadId` and continue in the background.
+The terminal shows bytes, total size, speed, and estimated time remaining in an updating row.
+Servers without a known total size show only bytes and speed.
+Pi reports background completion or failure automatically.
+
+Use the same `browserId` with these actions:
+
+- `download_status`: Get one job with `downloadId`, or omit it to list jobs.
+- `download_wait`: Wait for `downloadId`. `timeoutMs` defaults to 480000 and cannot exceed that wait limit.
+- `download_cancel`: Cancel `downloadId` and remove its partial file.
+
+Interrupting a start or wait leaves the transfer running. Use `download_cancel` to stop it.
+Transfers have no default deadline. Set `timeoutMs` on `download` to add a transfer deadline.
+Session shutdown cancels all active transfers. Jobs do not survive reloads or session changes.
+
+Downloads stream to a unique `.part` file beside the destination.
+Only successful transfers replace the destination. Failed transfers leave an existing destination unchanged.
+Two active jobs cannot write the same destination.
+Browser cookies are collected before transfer when `useBrowserCookies` is true.
+The transfer then runs independently from the browser connection.
 
 ## Examples
 
@@ -121,6 +146,7 @@ Relative `outputPath` and `expressionPath` values use the working directory at t
 - `accessibility.ts`: accessibility-tree formatting
 - `inspector.ts`: styles and matched rules
 - `diagnostics.ts`: runtime errors, console entries, logs, and failed requests
+- `downloads.ts`: streaming transfers, job state, cancellation, and progress
 
 ## Tests
 

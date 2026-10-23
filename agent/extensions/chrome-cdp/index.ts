@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DownloadManager, formatDownload, type Download } from "./downloads.ts";
+import { WaitInterruptRegistry } from "../_shared/wait-interrupt.ts";
+import { MANAGED_WORK_STATE_EVENT } from "../_shared/managed-work.ts";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -99,6 +102,7 @@ function evalExpressionFromParams(params: { expression?: string; expressionPath?
 const ACTIONS = [
   "list", "snap", "html", "inspect", "diagnostics", "eval", "script", "wait", "net",
   "nav", "reload", "open", "close", "activate", "download", "raw", "click", "clickxy", "type", "press", "shot", "viewport",
+  "download_status", "download_wait", "download_cancel",
 ] as const;
 
 const locatorSchema = Type.Object({
@@ -112,6 +116,7 @@ const locatorSchema = Type.Object({
 
 const chromeCdpParams = Type.Object({
   action: StringEnum(ACTIONS, { description: "CDP action to perform" }),
+  downloadId: Type.Optional(Type.String({ description: "Download job ID for download_wait or download_cancel. Optional for download_status to list jobs." })),
   browserId: Type.String({ description: "Browser ID from chrome_browser, or personal for local Chrome discovery. Never inferred from a tab ID." }),
   target: Type.Optional(Type.String({ description: "Target tab id prefix from list output, or a distinctive substring of the tab URL/title" })),
   ...locatorSchema.properties,
@@ -132,7 +137,7 @@ const chromeCdpParams = Type.Object({
   x: Type.Optional(Type.Number({ description: "CSS pixel X coordinate for clickxy" })),
   y: Type.Optional(Type.Number({ description: "CSS pixel Y coordinate for clickxy" })),
   outputPath: Type.Optional(Type.String({ description: "Optional output path for shot, html, inspect, diagnostics, eval, net, snap, raw, or download" })),
-  timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds for CDP commands and waits" })),
+  timeoutMs: Type.Optional(Type.Number({ description: "Timeout in milliseconds. Downloads have no default transfer deadline. download_wait defaults to and caps at 480000ms." })),
   waitForSelector: Type.Optional(Type.String({ description: "CSS selector to wait for after open/nav/reload/click/type, or with action=wait" })),
   waitExpression: Type.Optional(Type.String({ description: "JavaScript predicate to wait for after open/nav/reload/click/type, or with action=wait" })),
   settleMs: Type.Optional(Type.Number({ description: "Optional extra delay after an action or successful wait, in milliseconds" })),
@@ -171,6 +176,7 @@ const chromeCdpParams = Type.Object({
 
 type ChromeCdpParams = Locator & {
   action: typeof ACTIONS[number];
+  downloadId?: string;
   browserId: string;
   target?: string;
   expression?: string;
@@ -831,35 +837,6 @@ function inferDownloadPath(url: string) {
   return resolve(RUNTIME_DIR, name);
 }
 
-async function downloadStr(options: { url?: string; outputPath?: string; headers?: Record<string, string>; cookies?: string; timeoutMs?: number; signal?: AbortSignal }) {
-  if (!options.url) throw new Error("url is required for download");
-  throwIfAborted(options.signal);
-  const headers: Record<string, string> = { ...(options.headers || {}) };
-  if (options.cookies && !headers.cookie && !headers.Cookie) headers.cookie = options.cookies;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), normalizeTimeout(options.timeoutMs, 30000));
-  const onAbort = () => controller.abort();
-  options.signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const response = await fetch(options.url, { headers, signal: controller.signal });
-    if (!response.ok) throw new Error(`Download failed: HTTP ${response.status} ${response.statusText}`);
-    const out = options.outputPath ? resolve(options.outputPath) : inferDownloadPath(options.url);
-    mkdirSync(dirname(out), { recursive: true });
-    const bytes = Buffer.from(await response.arrayBuffer());
-    writeFileSync(out, bytes, { mode: 0o600 });
-    makeFilePrivate(out);
-    const type = response.headers.get("content-type") || "unknown type";
-    return `${out}\nDownloaded ${formatBytes(bytes.length)} (${type}) from ${options.url}`;
-  } catch (e: any) {
-    throwIfAborted(options.signal);
-    if (e?.name === "AbortError") throw new Error(`Download timed out after ${normalizeTimeout(options.timeoutMs, 30000)}ms`);
-    throw e;
-  } finally {
-    clearTimeout(timeout);
-    options.signal?.removeEventListener("abort", onAbort);
-  }
-}
-
 const DEVICE_PRESETS: Record<NonNullable<ChromeCdpParams["devicePreset"]>, NonNullable<ChromeCdpParams["viewport"]>> = {
   desktop: { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
   laptop: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false },
@@ -945,11 +922,46 @@ function resolveLocalPaths(params: ChromeCdpParams, cwd: string): ChromeCdpParam
 
 export default function chromeCdpExtension(pi: ExtensionAPI) {
   let browsers = new BrowserManager();
-  pi.on("session_start", async () => {
+  let latestContext: ExtensionContext | undefined;
+  let widgetTimer: ReturnType<typeof setInterval> | undefined;
+  let closing = false;
+  const interrupts = new WaitInterruptRegistry();
+  const refresh = () => {
+    const active = downloads.list().filter(d => d.state === "running");
+    if (latestContext?.mode === "tui") latestContext.ui.setWidget("chrome-downloads", active.length ? active.map(formatDownload) : undefined);
+    pi.events?.emit(MANAGED_WORK_STATE_EVENT, { source: "chrome-downloads", pending: !closing && active.length > 0 });
+    if (active.length && !closing && !widgetTimer) widgetTimer = setInterval(refresh, 1000);
+    if ((!active.length || closing) && widgetTimer) { clearInterval(widgetTimer); widgetTimer = undefined; }
+  };
+  const createDownloads = () => new DownloadManager(refresh, d => {
+    if (closing) return;
+    pi.sendMessage({ customType: "chrome-download-result", content: `${formatDownload(d)}\n${d.outputPath}`, display: true, details: d }, { deliverAs: "followUp", triggerTurn: true });
+  });
+  let downloads = createDownloads();
+  pi.on("input", event => { if (event.streamingBehavior === "steer") interrupts.interruptForSteer(); });
+  pi.on("session_start", async (_event, ctx) => {
+    closing = true;
+    await downloads.shutdown();
+    downloads = createDownloads();
+    latestContext = ctx;
+    closing = false;
+    refresh();
     try { await browsers.shutdown(); }
     finally { browsers = new BrowserManager(); }
   });
-  pi.on("session_shutdown", () => browsers.shutdown());
+  pi.on("session_shutdown", async () => {
+    closing = true;
+    interrupts.abortAll();
+    await downloads.shutdown();
+    refresh();
+    await browsers.shutdown();
+  });
+
+  const downloadResult = (d: Download) => ({
+    content: [{ type: "text" as const, text: `${formatDownload(d)}\n${d.outputPath}${d.state === "running" ? "\nContinues in the background. Completion is reported automatically. Use download_status, download_wait, or download_cancel with downloadId." : ""}` }],
+    details: { action: "download", download: d },
+    isError: d.state === "failed" || d.state === "cancelled",
+  });
 
   pi.registerTool({
     name: "chrome_browser",
@@ -998,10 +1010,11 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "chrome_cdp",
     label: "Chrome CDP",
-    description: "Inspect and control tabs in an explicitly selected browser via Chrome DevTools Protocol. Use a browserId from chrome_browser or personal for local Chrome discovery. Supports locators, trusted input, styles, diagnostics, screenshots, viewport emulation, JavaScript, and raw CDP commands.",
+    description: "Inspect and control tabs in an explicitly selected browser via Chrome DevTools Protocol. Use a browserId from chrome_browser or personal for local Chrome discovery. Supports locators, trusted input, styles, diagnostics, screenshots, viewport emulation, JavaScript, and raw CDP commands. Downloads return after two seconds and continue in the background. Use download_status, download_wait, or download_cancel with downloadId. Completion is reported automatically.",
     promptSnippet: "Inspect and control tabs in a selected browser via Chrome DevTools Protocol (CDP)",
     promptGuidelines: [
       "Pass browserId on each chrome_cdp call. Browser selection never falls back to another browser.",
+      "download waits up to two seconds, then returns a background downloadId. Completion is reported automatically. download_status, download_wait, and download_cancel manage jobs. Interrupting a wait leaves the download running.",
       "Use chrome_cdp action=list before other chrome_cdp actions when you need a tab id.",
       "Use chrome_cdp action=net to inspect resource URLs loaded by the current page.",
       "Prefer chrome_cdp role/name/text/CSS locators over custom eval scripts for click, type, press, wait, html, inspect, and element screenshots.",
@@ -1016,6 +1029,20 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       throwIfAborted(signal);
       params = resolveLocalPaths(params, ctx.cwd);
       if (!params.browserId) throw new Error("browserId is required. Use chrome_browser action=list, or select personal explicitly.");
+      latestContext = ctx;
+      if (params.action.startsWith("download_")) {
+        if (params.action === "download_status" && !params.downloadId) return {
+          content: [{ type: "text", text: downloads.list(params.browserId).map(formatDownload).join("\n") || "No downloads." }],
+          details: { action: "download_status" },
+        };
+        if (!params.downloadId) throw new Error("downloadId is required");
+        if (params.action === "download_cancel") return downloadResult(await downloads.cancel(params.downloadId, params.browserId));
+        if (params.action === "download_status") return downloadResult(downloads.get(params.downloadId, params.browserId));
+        const wait = interrupts.begin(signal);
+        const timer = setInterval(() => _onUpdate?.(downloadResult(downloads.get(params.downloadId!, params.browserId))), 1000);
+        try { return downloadResult(await downloads.wait(params.downloadId, params.browserId, Math.min(normalizeTimeout(params.timeoutMs, 480000), 480000), wait.signal)); }
+        finally { clearInterval(timer); wait.dispose(); }
+      }
       const cdp = params.action === "download" && !params.useBrowserCookies ? undefined : await browsers.get(params.browserId, signal);
       if (params.action === "list") {
         const started = Date.now();
@@ -1063,12 +1090,24 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
         };
       }
 
-      if (params.action === "download" && !params.useBrowserCookies) {
-        const text = await downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, timeoutMs: params.timeoutMs, signal });
-        return {
-          content: [{ type: "text", text }],
-          details: { action: "download", elapsedMs: Date.now() - started, url: params.url, outputPath: params.outputPath },
-        };
+      if (params.action === "download") {
+        if (!params.url) throw new Error("url is required for download");
+        const headers = new Headers(params.headers);
+        if (params.useBrowserCookies && !headers.has("cookie")) {
+          const cookies = await withTarget(cdp!, params.target, signal, async (client, sessionId) => {
+            const result = await client.send("Network.getCookies", { urls: [params.url] }, sessionId, normalizeTimeout(params.timeoutMs), signal);
+            return (result.cookies || []).map((c: any) => `${c.name}=${c.value}`).join("; ");
+          });
+          if (cookies) headers.set("cookie", cookies);
+        }
+        throwIfAborted(signal);
+        const job = downloads.start({ browserId: params.browserId, url: params.url, outputPath: params.outputPath || inferDownloadPath(params.url), headers: Object.fromEntries(headers), timeoutMs: params.timeoutMs });
+        const wait = interrupts.begin(signal);
+        try {
+          const result = await downloads.wait(job.id, params.browserId, 2000, wait.signal);
+          if (result.state === "running") downloads.background(job.id, params.browserId);
+          return downloadResult(result);
+        } finally { wait.dispose(); }
       }
 
       let pageMeta: { url: string; title: string } = { url: "", title: "" };
@@ -1132,12 +1171,6 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
             return navStr(cdp, sessionId, { ...postOptions, url: params.url });
           }
           case "reload": return reloadStr(cdp, sessionId, postOptions);
-          case "download": {
-            if (!params.url) throw new Error("url is required for download");
-            const { cookies } = await cdp.send("Network.getCookies", { urls: params.url ? [params.url] : [] }, sessionId, normalizeTimeout(params.timeoutMs), signal);
-            const cookieHeader = Array.isArray(cookies) ? cookies.map((c: any) => `${c.name}=${c.value}`).join("; ") : undefined;
-            return downloadStr({ url: params.url, outputPath: params.outputPath, headers: params.headers, cookies: cookieHeader, timeoutMs: params.timeoutMs, signal });
-          }
           case "raw": return rawStr(cdp, sessionId, params.method, params.cdpParams, params.outputPath, params.timeoutMs, signal);
           case "click": {
             const clicked = await clickStr(cdp, sessionId, locator, {
@@ -1252,6 +1285,12 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       const details = result.details || {};
       const action = details.action || "?";
       const raw = String(result.content?.[0]?.text ?? "");
+      if (details.download) {
+        const d = details.download as Download;
+        const text = formatDownload(d);
+        return new Text(theme.fg(d.state === "running" ? "info" : d.state === "complete" ? "success" : "error", text) + (d.state === "complete" ? `\n${linkFile(d.outputPath, d.outputPath, context.cwd)}` : expanded ? `\n${d.outputPath}` : ""), 0, 0);
+      }
+      if (action === "download_status") return new Text(raw, 0, 0);
       const paths = context.isError || result.isError ? [] : savedOutputPaths(raw, action, details.outputPath ?? context.args?.outputPath);
       const summary = (text: string): Text => {
         const linked = linkFilePaths(text, paths, context.cwd);

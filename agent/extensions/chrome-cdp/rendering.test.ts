@@ -16,6 +16,19 @@ afterEach(() => {
 const render = (component: any) => component.render(200).join("\n");
 
 describe("Chrome file link rendering", () => {
+	test("download results distinguish progress, completion, and failure", () => {
+		const download = { id: "dl-test", browserId: "test", outputPath: resolve(cwd, "audio.mp3"), bytes: 1024, total: 4096, started: Date.now() - 1000 };
+		const result = (state: string) => ({ content: [], details: { action: "download", download: { ...download, state } } });
+		const active = render(tool.renderResult(result("running"), { expanded: false }, theme, { cwd }));
+		expect(active).toContain("running");
+		expect(active).toContain("1.0 KB / 4.0 KB");
+		expect(active).not.toContain("✓");
+		const complete = render(tool.renderResult(result("complete"), { expanded: false }, theme, { cwd }));
+		expect(complete).toContain(pathToFileURL(download.outputPath).href);
+		const failed = render(tool.renderResult(result("failed"), { expanded: false }, theme, { cwd }));
+		expect(failed).toContain("failed");
+		expect(failed).not.toContain("✓");
+	});
 	test("keeps full link targets for shortened call paths", () => {
 		const path = "long-directory-name/long-script-file-name-for-the-renderer.js";
 		const text = render(tool.renderCall({ action: "script", expressionPath: path, outputPath: path }, theme, { cwd }));
