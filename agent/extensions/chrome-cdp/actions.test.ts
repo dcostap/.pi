@@ -10,6 +10,8 @@ const metadata = {
 };
 
 class MockActionCdp {
+  onEvent() { return () => {}; }
+  onClose() { return () => {}; }
   calls: Array<{ method: string; params: any; sessionId?: string }> = [];
   currentValue = "old";
   focusOk = true;

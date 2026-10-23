@@ -20,14 +20,22 @@ export type InspectOptions = {
   includeInherited?: boolean;
 };
 
-const styleSheetStates = new Map<string, { headers: Map<string, any>; dispose: () => void }>();
+type StyleStates = Map<string, { headers: Map<string, any>; dispose: () => void }>;
+const browserStyleStates = new WeakMap<CDP, StyleStates>();
+function styleStates(cdp: CDP): StyleStates {
+  let states = browserStyleStates.get(cdp);
+  if (!states) { states = new Map(); browserStyleStates.set(cdp, states); }
+  return states;
+}
 
-export function disposeInspectorSession(sessionId: string): void {
+export function disposeInspectorSession(cdp: CDP, sessionId: string): void {
+  const styleSheetStates = styleStates(cdp);
   styleSheetStates.get(sessionId)?.dispose();
   styleSheetStates.delete(sessionId);
 }
 
-export function clearInspectorState(): void {
+export function clearInspectorState(cdp: CDP): void {
+  const styleSheetStates = styleStates(cdp);
   for (const state of styleSheetStates.values()) state.dispose();
   styleSheetStates.clear();
 }
@@ -84,6 +92,7 @@ export async function inspectLocator(
   return withResolvedLocator(cdp, sessionId, locator, timeoutMs, signal, async (resolved) => {
     await cdp.send("DOM.enable", {}, sessionId, timeoutMs, signal);
     await cdp.send("DOM.getDocument", { depth: 1, pierce: true }, sessionId, timeoutMs, signal);
+    const styleSheetStates = styleStates(cdp);
     let styleSheetState = styleSheetStates.get(sessionId);
     if (!styleSheetState) {
       const headers = new Map<string, any>();

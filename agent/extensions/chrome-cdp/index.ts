@@ -6,7 +6,8 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
-import { CDP, TargetSessionPool, abortableSleep, connectDiscoveredCdp, raceWithAbort, throwIfAborted } from "./protocol.ts";
+import { CDP, TargetSessionPool, abortableSleep, raceWithAbort, throwIfAborted } from "./protocol.ts";
+import { BrowserManager } from "./browsers.ts";
 import { type Locator, callOnObject, describeLocator, hasLocator, readLocatorMetadata, releaseLocator, resolveLocator, withResolvedLocator } from "./locator.ts";
 import { getAxTree } from "./accessibility.ts";
 import { DiagnosticsStore, formatDiagnostics, type DiagnosticLevel } from "./diagnostics.ts";
@@ -22,7 +23,6 @@ if (process.platform !== "win32") chmodSync(RUNTIME_DIR, 0o700);
 const MAX_INLINE_BYTES = 2_000;   // max bytes sent to LLM inline; rest goes to files
 const FIRST_LOOK_BYTES = 1_200;    // preview bytes embedded in the summary for LLM
 const MAX_SNAP_LINES = 80;         // cap AX tree lines
-const diagnosticsStore = new DiagnosticsStore();
 
 // ── file-dumping (same pattern as web-smart-fetch) ──
 
@@ -96,7 +96,7 @@ function evalExpressionFromParams(params: { expression?: string; expressionPath?
 
 const ACTIONS = [
   "list", "snap", "html", "inspect", "diagnostics", "eval", "script", "wait", "net",
-  "nav", "reload", "open", "download", "raw", "click", "clickxy", "type", "press", "shot", "viewport",
+  "nav", "reload", "open", "close", "activate", "download", "raw", "click", "clickxy", "type", "press", "shot", "viewport",
 ] as const;
 
 const locatorSchema = Type.Object({
@@ -110,6 +110,7 @@ const locatorSchema = Type.Object({
 
 const chromeCdpParams = Type.Object({
   action: StringEnum(ACTIONS, { description: "CDP action to perform" }),
+  browserId: Type.String({ description: "Browser ID from chrome_browser, or personal for local Chrome discovery. Never inferred from a tab ID." }),
   target: Type.Optional(Type.String({ description: "Target tab id prefix from list output, or a distinctive substring of the tab URL/title" })),
   ...locatorSchema.properties,
   locator: Type.Optional(locatorSchema),
@@ -168,6 +169,7 @@ const chromeCdpParams = Type.Object({
 
 type ChromeCdpParams = Locator & {
   action: typeof ACTIONS[number];
+  browserId: string;
   target?: string;
   expression?: string;
   expressionPath?: string;
@@ -227,22 +229,34 @@ function elementLocator(params: ChromeCdpParams): Locator {
 
 const sleep = abortableSleep;
 
-let sharedCdp: CDP | undefined;
-let sharedCdpPromise: Promise<CDP> | undefined;
-let sharedConnectController: AbortController | undefined;
-const sharedConnectWaiters = new Map<Promise<CDP>, number>();
-let connectionGeneration = 0;
-const sessionPool = new TargetSessionPool();
-const navigationTails = new Map<string, Promise<void>>();
-
-function clearCdpRuntimeState(): void {
-  sessionPool.clear();
-  navigationTails.clear();
-  diagnosticsStore.clear();
-  clearInspectorState();
+const runtimes = new WeakMap<CDP, { pool: TargetSessionPool; diagnostics: DiagnosticsStore; navigationTails: Map<string, Promise<void>> }>();
+function runtime(cdp: CDP) {
+  let state = runtimes.get(cdp);
+  if (state) return state;
+  state = { pool: new TargetSessionPool(), diagnostics: new DiagnosticsStore(), navigationTails: new Map() };
+  runtimes.set(cdp, state);
+  const current = state;
+  cdp.onEvent("Target.detachedFromTarget", ({ sessionId }) => {
+    current.pool.invalidateSession(sessionId);
+    current.diagnostics.disposeSession(sessionId);
+    disposeInspectorSession(cdp, sessionId);
+  });
+  cdp.onEvent("Target.targetDestroyed", ({ targetId }) => {
+    current.pool.invalidateTarget(targetId);
+    current.diagnostics.disposeTarget(targetId);
+  });
+  cdp.onClose(() => {
+    current.pool.clear();
+    current.diagnostics.clear();
+    current.navigationTails.clear();
+    clearInspectorState(cdp);
+    runtimes.delete(cdp);
+  });
+  return state;
 }
 
-async function withNavigationLock<T>(sessionId: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+async function withNavigationLock<T>(cdp: CDP, sessionId: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  const { navigationTails } = runtime(cdp);
   const previous = navigationTails.get(sessionId) ?? Promise.resolve();
   const run = (async () => {
     await raceWithAbort(previous, signal);
@@ -255,77 +269,6 @@ async function withNavigationLock<T>(sessionId: string, signal: AbortSignal | un
     return await run;
   } finally {
     if (navigationTails.get(sessionId) === tail) navigationTails.delete(sessionId);
-  }
-}
-
-function invalidateSharedConnection(closeSocket: boolean): void {
-  connectionGeneration++;
-  sharedConnectController?.abort();
-  sharedConnectController = undefined;
-  sharedCdpPromise = undefined;
-  const cdp = sharedCdp;
-  sharedCdp = undefined;
-  clearCdpRuntimeState();
-  if (closeSocket) cdp?.close();
-}
-
-async function getSharedCdp(signal?: AbortSignal) {
-  throwIfAborted(signal);
-  if (sharedCdp?.isOpen) return sharedCdp;
-  if (sharedCdp && !sharedCdp.isOpen) {
-    invalidateSharedConnection(true);
-  }
-  if (!sharedCdpPromise) {
-    const generation = connectionGeneration;
-    const controller = new AbortController();
-    sharedConnectController = controller;
-    const connecting = (async () => {
-      const cdp = await connectDiscoveredCdp({ signal: controller.signal });
-      if (generation !== connectionGeneration || sharedCdpPromise !== connecting) {
-        cdp.close();
-        throw new Error("Discarded stale Chrome CDP connection attempt");
-      }
-      sharedCdp = cdp;
-      sharedConnectController = undefined;
-      clearCdpRuntimeState();
-      cdp.onClose(() => {
-        if (sharedCdp === cdp) {
-          invalidateSharedConnection(false);
-        }
-      });
-      cdp.onEvent("Target.detachedFromTarget", ({ sessionId }: { sessionId?: string }) => {
-        if (!sessionId) return;
-        sessionPool.invalidateSession(sessionId);
-        diagnosticsStore.disposeSession(sessionId);
-        disposeInspectorSession(sessionId);
-      });
-      cdp.onEvent("Target.targetDestroyed", ({ targetId }: { targetId?: string }) => {
-      if (!targetId) return;
-      sessionPool.invalidateTarget(targetId);
-      diagnosticsStore.disposeTarget(targetId);
-    });
-      return cdp;
-    })();
-    sharedCdpPromise = connecting;
-    void connecting.catch(() => {
-      if (sharedCdpPromise === connecting) {
-        sharedCdpPromise = undefined;
-        if (sharedConnectController === controller) sharedConnectController = undefined;
-      }
-    });
-  }
-
-  const connecting = sharedCdpPromise;
-  sharedConnectWaiters.set(connecting, (sharedConnectWaiters.get(connecting) ?? 0) + 1);
-  try {
-    return await raceWithAbort(connecting, signal);
-  } finally {
-    const remaining = Math.max(0, (sharedConnectWaiters.get(connecting) ?? 1) - 1);
-    if (remaining === 0) sharedConnectWaiters.delete(connecting);
-    else sharedConnectWaiters.set(connecting, remaining);
-    if (sharedCdpPromise === connecting && !sharedCdp && remaining === 0 && signal?.aborted) {
-      sharedConnectController?.abort();
-    }
   }
 }
 
@@ -752,7 +695,7 @@ async function waitForReady(cdp: CDP, sessionId: string, timeoutMs = 30000, sign
 }
 
 async function navStr(cdp: CDP, sessionId: string, options: PostActionOptions & { url?: string }) {
-  return withNavigationLock(sessionId, options.signal, async () => {
+  return withNavigationLock(cdp, sessionId, options.signal, async () => {
     const { url } = options;
     if (!url) throw new Error("url is required for nav");
     const timeout = normalizeTimeout(options.timeoutMs, 30000);
@@ -781,7 +724,7 @@ async function navStr(cdp: CDP, sessionId: string, options: PostActionOptions & 
 }
 
 async function reloadStr(cdp: CDP, sessionId: string, options: PostActionOptions) {
-  return withNavigationLock(sessionId, options.signal, async () => {
+  return withNavigationLock(cdp, sessionId, options.signal, async () => {
     const timeout = normalizeTimeout(options.timeoutMs, 30000);
     await cdp.send("Page.enable", {}, sessionId, timeout, options.signal);
     const loadEvent = cdp.waitForEvent("Page.loadEventFired", timeout, sessionId, options.signal);
@@ -860,9 +803,8 @@ async function rawStr(cdp: CDP, sessionId: string, method?: string, cdpParams?: 
   return outputPath ? saveTextResult(outputPath, text) : text;
 }
 
-async function openStr(url: string | undefined, options: PostActionOptions) {
+async function openStr(cdp: CDP, url: string | undefined, options: PostActionOptions) {
   throwIfAborted(options.signal);
-  const cdp = await getSharedCdp(options.signal);
   const openUrl = url || "about:blank";
   const timeout = normalizeTimeout(options.timeoutMs);
   const { targetId } = await cdp.send("Target.createTarget", { url: openUrl }, undefined, timeout, options.signal);
@@ -960,14 +902,13 @@ async function viewportStr(cdp: CDP, sessionId: string, options: {
 }
 
 async function getOrAttachSession(cdp: CDP, targetId: string, timeoutMs = 15_000, signal?: AbortSignal) {
-  const sessionId = await sessionPool.get(cdp, targetId, signal);
-  await diagnosticsStore.ensure(cdp, sessionId, targetId, timeoutMs, signal);
+  const sessionId = await runtime(cdp).pool.get(cdp, targetId, signal);
+  await runtime(cdp).diagnostics.ensure(cdp, sessionId, targetId, timeoutMs, signal);
   return sessionId;
 }
 
-async function withTarget<T>(targetQuery: string | undefined, signal: AbortSignal | undefined, fn: (cdp: CDP, sessionId: string, page: any) => Promise<T>) {
+async function withTarget<T>(cdp: CDP, targetQuery: string | undefined, signal: AbortSignal | undefined, fn: (cdp: CDP, sessionId: string, page: any) => Promise<T>) {
   throwIfAborted(signal);
-  const cdp = await getSharedCdp(signal);
   const pages = await getPages(cdp, signal);
   const page = resolveTarget(pages, targetQuery);
   const sessionId = await getOrAttachSession(cdp, page.targetId, 15_000, signal);
@@ -977,8 +918,8 @@ async function withTarget<T>(targetQuery: string | undefined, signal: AbortSigna
   } catch (e: any) {
     // If Chrome invalidated a cached session, forget it so the next call re-attaches.
     if (String(e?.message || "").toLowerCase().includes("session")) {
-      sessionPool.invalidateTarget(page.targetId);
-      diagnosticsStore.disposeSession(sessionId);
+      runtime(cdp).pool.invalidateTarget(page.targetId);
+      runtime(cdp).diagnostics.disposeSession(sessionId);
     }
     throw e;
   }
@@ -1001,17 +942,64 @@ function resolveLocalPaths(params: ChromeCdpParams, cwd: string): ChromeCdpParam
 }
 
 export default function chromeCdpExtension(pi: ExtensionAPI) {
-  pi.on("session_shutdown", () => {
-    invalidateSharedConnection(true);
+  let browsers = new BrowserManager();
+  pi.on("session_start", async () => {
+    try { await browsers.shutdown(); }
+    finally { browsers = new BrowserManager(); }
+  });
+  pi.on("session_shutdown", () => browsers.shutdown());
+
+  pi.registerTool({
+    name: "chrome_browser",
+    label: "Chrome browsers",
+    description: "Launch, attach, list, stop, or disconnect Chrome-compatible browsers. Launch supports headless or visible windows and temporary or saved profiles. Returns a browserId for chrome_cdp. Pi owns launched processes and closes them at session shutdown. Attached browsers remain open.",
+    promptSnippet: "Manage Chrome browser processes and connections; use their IDs with chrome_cdp",
+    promptGuidelines: [
+      "Use chrome_browser to manage browsers instead of writing launch scripts or CDP clients.",
+      "Choose the browser explicitly. personal discovers an existing local Chrome; launch creates a separate browser; attach connects to an endpoint.",
+      "Saved profiles retain authentication and other browser data. Temporary profiles are removed when their browser stops.",
+    ],
+    outputSchema: Type.Object({ action: Type.String(), result: Type.Any() }),
+    parameters: Type.Object({
+      action: StringEnum(["list", "launch", "attach", "stop", "disconnect"] as const),
+      browserId: Type.Optional(Type.String({ description: "Required for stop or disconnect" })),
+      endpoint: Type.Optional(Type.String({ description: "For attach: HTTP debugging endpoint or browser WebSocket URL" })),
+      executablePath: Type.Optional(Type.String({ description: "Browser executable; otherwise discover Chrome or Edge" })),
+      profilePath: Type.Optional(Type.String({ description: "Saved user-data directory, relative to ctx.cwd or absolute. Omit for a temporary profile." })),
+      headless: Type.Optional(Type.Boolean({ description: "Launch without a window. Default true. Set false for visible interaction or login." })),
+      args: Type.Optional(Type.Array(Type.String(), { description: "Extra Chrome switches. Pi sets the profile and debugging switches." })),
+      url: Type.Optional(Type.String({ description: "Initial page for launch; default about:blank" })),
+      timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 600000, description: "Launch readiness timeout; default 30000ms" })),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      throwIfAborted(signal);
+      let result: unknown;
+      switch (params.action) {
+        case "list": result = browsers.list(); break;
+        case "launch": result = await browsers.launch(params, ctx.cwd, signal); break;
+        case "attach":
+          if (!params.endpoint) throw new Error("attach requires endpoint");
+          result = await browsers.attach(params.endpoint, signal); break;
+        case "stop":
+        case "disconnect":
+          if (!params.browserId) throw new Error(`${params.action} requires browserId`);
+          result = await browsers[params.action](params.browserId); break;
+      }
+      return {
+        content: [{ type: "text", text: maybeDump("browsers.json", JSON.stringify(result, null, 2)) }],
+        details: result,
+        structuredContent: { action: params.action, result },
+      };
+    },
   });
 
   pi.registerTool({
     name: "chrome_cdp",
     label: "Chrome CDP",
-    description: "Inspect and control tabs in already-open local Chrome via Chrome DevTools Protocol. Supports accessible locators, trusted clicks and keyboard input, compact style inspection, diagnostics, screenshots, viewport emulation, arbitrary JavaScript, and raw CDP commands.",
-    promptSnippet: "Inspect and control the user's live Chrome tabs via Chrome DevTools Protocol (CDP)",
+    description: "Inspect and control tabs in an explicitly selected browser via Chrome DevTools Protocol. Use a browserId from chrome_browser or personal for local Chrome discovery. Supports locators, trusted input, styles, diagnostics, screenshots, viewport emulation, JavaScript, and raw CDP commands.",
+    promptSnippet: "Inspect and control tabs in a selected browser via Chrome DevTools Protocol (CDP)",
     promptGuidelines: [
-      "Use chrome_cdp when the user wants to inspect or control their already-open Chrome instance.",
+      "Pass browserId on each chrome_cdp call. Browser selection never falls back to another browser.",
       "Use chrome_cdp action=list before other chrome_cdp actions when you need a tab id.",
       "Use chrome_cdp action=net to inspect resource URLs loaded by the current page.",
       "Prefer chrome_cdp role/name/text/CSS locators over custom eval scripts for click, type, press, wait, html, inspect, and element screenshots.",
@@ -1025,20 +1013,41 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params: ChromeCdpParams, signal, _onUpdate, ctx) {
       throwIfAborted(signal);
       params = resolveLocalPaths(params, ctx.cwd);
+      if (!params.browserId) throw new Error("browserId is required. Use chrome_browser action=list, or select personal explicitly.");
+      const cdp = params.action === "download" && !params.useBrowserCookies ? undefined : await browsers.get(params.browserId, signal);
       if (params.action === "list") {
         const started = Date.now();
-        const cdp = await getSharedCdp(signal);
-        const pages = await getPages(cdp, signal);
+        const pages = await getPages(cdp!, signal);
         return {
           content: [{ type: "text", text: formatPages(pages) || "No pages found." }],
-          details: { action: "list", count: pages.length, elapsedMs: Date.now() - started },
+          details: { action: "list", browserId: params.browserId, count: pages.length, elapsedMs: Date.now() - started },
         };
       }
 
       const started = Date.now();
 
+      if (params.action === "raw" && !params.target) {
+        if (!params.method) throw new Error("method is required for raw");
+        const result = await cdp!.send(params.method, params.cdpParams || {}, undefined, normalizeTimeout(params.timeoutMs), signal);
+        const text = JSON.stringify(result, null, 2);
+        return {
+          content: [{ type: "text", text: params.outputPath ? saveTextResult(params.outputPath, text) : maybeDump("raw.json", text) }],
+          details: { action: "raw", browserId: params.browserId, elapsedMs: Date.now() - started },
+        };
+      }
+
+      if (params.action === "close" || params.action === "activate") {
+        const page = resolveTarget(await getPages(cdp!, signal), params.target);
+        const result = await cdp!.send(params.action === "close" ? "Target.closeTarget" : "Target.activateTarget", { targetId: page.targetId }, undefined, normalizeTimeout(params.timeoutMs), signal);
+        if (result.success === false) throw new Error(`Could not ${params.action} tab ${page.targetId}`);
+        return {
+          content: [{ type: "text", text: `${params.action === "close" ? "Closed" : "Activated"} tab ${page.targetId}` }],
+          details: { action: params.action, browserId: params.browserId, target: page.targetId },
+        };
+      }
+
       if (params.action === "open") {
-        const opened = await openStr(params.url, {
+        const opened = await openStr(cdp!, params.url, {
           waitFor: params.waitFor,
           waitForSelector: params.waitForSelector,
           waitExpression: params.waitExpression,
@@ -1048,7 +1057,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
         });
         return {
           content: [{ type: "text", text: opened.text }],
-          details: { action: "open", target: String(opened.targetId).slice(0, 8), elapsedMs: Date.now() - started, url: params.url || "about:blank" },
+          details: { action: "open", browserId: params.browserId, target: String(opened.targetId).slice(0, 8), elapsedMs: Date.now() - started, url: params.url || "about:blank" },
         };
       }
 
@@ -1062,7 +1071,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
 
       let pageMeta: { url: string; title: string } = { url: "", title: "" };
 
-      const text = await withTarget(params.target, signal, async (cdp, sessionId, page) => {
+      const text = await withTarget(cdp!, params.target, signal, async (cdp, sessionId, page) => {
         pageMeta = { url: (page as any).url as string ?? "", title: (page as any).title as string ?? "" };
         const locator = elementLocator(params);
         const postOptions: PostActionOptions = {
@@ -1089,7 +1098,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
             return params.outputPath ? saveTextResult(params.outputPath, result) : result;
           }
           case "diagnostics": {
-            const result = formatDiagnostics(diagnosticsStore.read(page.targetId, {
+            const result = formatDiagnostics(runtime(cdp).diagnostics.read(page.targetId, {
               includeConsoleLogs: params.includeConsoleLogs,
               sinceMs: params.diagnosticsSinceMs,
               levels: params.diagnosticLevels,
@@ -1180,6 +1189,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: capped }],
         details: {
           action: params.action,
+          browserId: params.browserId,
           target: params.target,
           elapsedMs,
           pageUrl: pageMeta.url,
@@ -1198,6 +1208,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
     renderCall(args: ChromeCdpParams, theme: any) {
       const parts: string[] = [theme.bold("chrome_cdp")];
       parts.push(theme.fg("muted", args.action));
+      if (args.browserId) parts.push(theme.fg("muted", `[${args.browserId}]`));
 
       if (args.target) {
         parts.push(theme.fg("dim", args.target.length > 20 ? args.target.slice(0, 20) + "…" : args.target));

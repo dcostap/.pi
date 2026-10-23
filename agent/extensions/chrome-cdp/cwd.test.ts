@@ -15,7 +15,7 @@ describe("Chrome CDP working directory", () => {
       mkdirSync(second);
       writeFileSync(join(first, "script.js"), "'first checkout'");
       writeFileSync(join(second, "script.js"), "'second checkout'");
-      const args = { action: "script" as const, expressionPath: "script.js", outputPath: "result.txt" };
+      const args = { action: "script" as const, browserId: "personal", expressionPath: "script.js", outputPath: "result.txt" };
 
       const firstCall = __testing.resolveLocalPaths(args, first);
       const secondCall = __testing.resolveLocalPaths(args, second);
@@ -32,10 +32,10 @@ describe("Chrome CDP working directory", () => {
 
   test("absolute paths stay explicit; omitted paths retain automatic output handling", () => {
     const target = resolve(tmpdir(), "explicit-cdp-file");
-    const args = __testing.resolveLocalPaths({ action: "eval", expressionPath: target, outputPath: target }, tmpdir());
+    const args = __testing.resolveLocalPaths({ action: "eval", browserId: "personal", expressionPath: target, outputPath: target }, tmpdir());
     expect(args.expressionPath).toBe(target);
     expect(args.outputPath).toBe(target);
-    const omitted = __testing.resolveLocalPaths({ action: "shot" }, tmpdir());
+    const omitted = __testing.resolveLocalPaths({ action: "shot", browserId: "personal" }, tmpdir());
     expect(omitted.expressionPath).toBeUndefined();
     expect(omitted.outputPath).toBeUndefined();
   });
@@ -52,13 +52,13 @@ describe("Chrome CDP working directory", () => {
       mkdirSync(second);
       const ctx = { cwd: first };
       const pending = tool.execute("first", {
-        action: "download", url: "data:text/plain,first", outputPath,
+        action: "download", browserId: "personal", url: "data:text/plain,first", outputPath,
       }, undefined, undefined, ctx);
       // A running action keeps its original paths, even if a later call uses another directory.
       ctx.cwd = second;
       await pending;
       await tool.execute("second", {
-        action: "download", url: "data:text/plain,second", outputPath,
+        action: "download", browserId: "personal", url: "data:text/plain,second", outputPath,
       }, undefined, undefined, ctx);
 
       expect(readFileSync(join(first, outputPath), "utf8")).toBe("first");

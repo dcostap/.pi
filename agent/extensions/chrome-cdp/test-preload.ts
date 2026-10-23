@@ -11,6 +11,7 @@ const Type = {
   Optional(schema: unknown) { return schema; },
   String(options: Record<string, unknown> = {}) { return { type: "string", ...options }; },
   Number(options: Record<string, unknown> = {}) { return { type: "number", ...options }; },
+  Integer(options: Record<string, unknown> = {}) { return { type: "integer", ...options }; },
   Boolean(options: Record<string, unknown> = {}) { return { type: "boolean", ...options }; },
   Any(options: Record<string, unknown> = {}) { return { ...options }; },
   Array(items: unknown, options: Record<string, unknown> = {}) { return { type: "array", items, ...options }; },
