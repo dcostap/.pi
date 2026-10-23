@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProcessView } from "../formatting.ts";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { BACKGROUND_NOTICE_MARKER } from "../prompt.ts";
 import {
 	renderBackgroundCompletionMessage,
@@ -62,6 +64,24 @@ describe("background tool calls", () => {
 });
 
 describe("background tool results", () => {
+	test("links output files in collapsed, expanded, and automatic completion results", () => {
+		const previous = process.env.PI_TEST_HYPERLINKS;
+		process.env.PI_TEST_HYPERLINKS = "1";
+		try {
+			const path = resolve("background-test/output #1.log");
+			const processView = view({ fullOutputPath: path });
+			const result = { content: [{ type: "text", text: `Full output: ${path}` }], details: { process: processView } };
+			const link = `\x1b]8;;${pathToFileURL(path).href}\x1b\\${path}\x1b]8;;\x1b\\`;
+			for (const expanded of [false, true]) {
+				expect(render(renderBackgroundToolResult("bash_bg_status", result, { expanded, isPartial: false }, theme))).toContain(link);
+				expect(render(renderBackgroundCompletionMessage({ content: `Full output: ${path}`, details: { processes: [processView] } }, { expanded }, theme))).toContain(link);
+			}
+		} finally {
+			if (previous === undefined) delete process.env.PI_TEST_HYPERLINKS;
+			else process.env.PI_TEST_HYPERLINKS = previous;
+		}
+	});
+
 	test("a start that keeps running shows one line", () => {
 		const result = { content: [{ type: "text", text: "Started bg-3 (Dev) in C:/work. It is still running.\nlong hint" }], details: { process: view({ id: "bg-3", settled: false, status: "running", preview: "" }) } };
 		expect(render(renderBackgroundToolResult("bash_bg_start", result, collapsed, theme))).toBe("\n→ running in background as bg-3");

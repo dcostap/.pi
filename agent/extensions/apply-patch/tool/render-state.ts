@@ -1,5 +1,7 @@
+import { linkFile } from "../../_shared/file-links.ts";
 import type { ExecutePatchResult } from "../patch/types.ts";
 import { parsePatchActions } from "../patch/parser.ts";
+import { resolvePatchPath } from "../patch/paths.ts";
 import { collectionLabel, formatApplyPatchCollapsedDiff, formatApplyPatchSummary, formatPatchTarget, renderApplyPatchCall } from "./rendering.ts";
 
 interface ApplyPatchRenderState {
@@ -156,6 +158,15 @@ function styledCounts(suffix: string, theme: RenderTheme): string {
 	return ` (${theme.fg("toolDiffAdded", `+${match[1]}`)} ${theme.fg("toolDiffRemoved", `-${match[2]}`)})`;
 }
 
+function linkedPatchTarget(path: string, movePath: string | undefined, cwd: string, theme: RenderTheme): string {
+	const link = (rawPath: string): string => {
+		const styled = theme.fg("accent", formatPatchTarget(rawPath, undefined, cwd));
+		const absolutePath = resolvePatchPath({ cwd, patchPath: rawPath });
+		return linkFile(styled, absolutePath, cwd);
+	};
+	return movePath ? `${link(path)} → ${link(movePath)}` : link(path);
+}
+
 function actionLabel(action: { type: string }, theme: RenderTheme): string {
 	return action.type === "delete" ? `${theme.fg("toolDiffRemoved", "DELETED")} ` : "";
 }
@@ -195,7 +206,7 @@ function styleHeaders(
 		const action = actions[0]!;
 		const suffix = lines[0]?.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
-		lines[0] = `${title} ${outcomeLabel(target, 0)}${actionLabel(action, theme)}${theme.fg("accent", target)}${failureSuffix(target, 0)}${styledCounts(suffix, theme)}`;
+		lines[0] = `${title} ${outcomeLabel(target, 0)}${actionLabel(action, theme)}${linkedPatchTarget(action.path, action.movePath, cwd, theme)}${failureSuffix(target, 0)}${styledCounts(suffix, theme)}`;
 		return lines.join("\n");
 	}
 
@@ -208,7 +219,7 @@ function styleHeaders(
 		const action = actions[actionIndex++]!;
 		const suffix = lines[index]!.match(/ \(\+\d+ -\d+\)$/)?.[0] ?? "";
 		const target = formatPatchTarget(action.path, action.movePath, cwd);
-		const styledTarget = theme.fg("accent", target);
+		const styledTarget = linkedPatchTarget(action.path, action.movePath, cwd, theme);
 		lines[index] = `  └ ${outcomeLabel(target, currentActionIndex)}${actionLabel(action, theme)}${styledTarget}${failureSuffix(target, currentActionIndex)}${styledCounts(suffix, theme)}`;
 	}
 	return lines.join("\n");
@@ -266,7 +277,7 @@ function pendingCall(patchText: string, cwd: string, tokens: number | undefined,
 	const lines = [`${theme.fg("toolTitle", theme.bold("apply_patch"))}${tokenSuffix(tokens, theme)}`];
 	const actions = pendingActions(patchText);
 	for (const action of actions.slice(0, MAX_PENDING_ACTIONS)) {
-		lines.push(`  └ ${pendingActionLabel(action, theme)} ${formatPatchTarget(action.path, action.movePath, cwd)}`);
+		lines.push(`  └ ${pendingActionLabel(action, theme)} ${linkedPatchTarget(action.path, action.movePath, cwd, theme)}`);
 	}
 	if (actions.length > MAX_PENDING_ACTIONS) {
 		lines.push(`    ${theme.fg("dim", `… ${actions.length - MAX_PENDING_ACTIONS} more actions`)}`);

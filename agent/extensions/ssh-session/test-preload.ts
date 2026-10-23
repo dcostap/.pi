@@ -50,6 +50,8 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+	getCapabilities: () => ({ hyperlinks: process.env.PI_TEST_HYPERLINKS === "1" }),
+	hyperlink: (label: string, url: string) => `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`,
 	Key: { enter: "enter", escape: "escape", backspace: "backspace", delete: "delete", ctrl: (key: string) => `ctrl+${key}` },
 	matchesKey: (data: string, key: string) => data === key,
 	truncateToWidth: (text: string, width: number) => text.slice(0, width),

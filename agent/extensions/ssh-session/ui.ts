@@ -2,6 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { highlightCode, keyHint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./protocol.ts";
+import { linkFile, linkFilePaths } from "../_shared/file-links.ts";
 
 interface SshToolArgs {
 	action?: unknown;
@@ -32,6 +33,7 @@ export function renderSshCall(
 	theme: Theme,
 	expanded: boolean,
 	previous?: Text,
+	cwd?: string,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 	const action = typeof args.action === "string" ? args.action : "...";
@@ -44,7 +46,7 @@ export function renderSshCall(
 	if (args.overwrite === true) qualifiers.push("overwrite");
 	if (typeof args.mode === "number") qualifiers.push(`mode 0${args.mode.toString(8)}`);
 	const suffix = qualifiers.length > 0 ? theme.fg("muted", ` (${qualifiers.join(" • ")})`) : "";
-	const transferPaths = formatTransferPaths(args);
+	const transferPaths = formatTransferPaths(args, cwd);
 	if (transferPaths) {
 		component.setText(`${title}${suffix}\n${theme.fg("toolOutput", transferPaths)}`);
 		return component;
@@ -68,6 +70,7 @@ export function renderSshResult(
 	theme: Theme,
 	previous?: Text,
 	isError = false,
+	cwd?: string,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 	const raw = result.content.find((item) => item.type === "text" && typeof item.text === "string")?.text ?? "";
@@ -79,7 +82,16 @@ export function renderSshResult(
 
 	const lines = text.split("\n");
 	const visible = options.expanded ? lines : collapseLines(lines, options.isPartial);
-	const styled = visible.map((line) => styleLine(line, options.isPartial, isError, theme));
+	const details = result.details ?? {};
+	const outputPaths = [details.fullOutputPath, ...(Array.isArray(details.fullOutputPaths) ? details.fullOutputPaths : [])]
+		.filter((path): path is string => typeof path === "string" && path.length > 0);
+	const styled = visible.map((line) => {
+		const paths = line.startsWith("Local: ") && typeof details.localPath === "string"
+			? [details.localPath]
+			: line.includes("Full output") ? outputPaths : [];
+		const linked = cwd ? linkFilePaths(line, paths, cwd) : line;
+		return styleLine(linked, options.isPartial, isError, theme);
+	});
 	component.setText(`\n${styled.join("\n")}`);
 	return component;
 }
@@ -127,9 +139,11 @@ function cleanInline(value: string): string {
 	return sanitizeTerminalText(value).replace(/[\r\n]+/gu, " ").replace(/\s+/gu, " ").trim();
 }
 
-function formatTransferPaths(args: SshToolArgs): string | undefined {
+function formatTransferPaths(args: SshToolArgs, cwd?: string): string | undefined {
 	if (typeof args.local_path !== "string" || typeof args.remote_path !== "string") return undefined;
-	const local = cleanInline(args.local_path);
+	const rawLocal = cleanInline(args.local_path);
+	const target = args.local_path.startsWith("@") ? args.local_path.slice(1) : args.local_path;
+	const local = cwd && target ? linkFile(rawLocal, target, cwd) : rawLocal;
 	const remote = cleanInline(args.remote_path);
 	if (!local || !remote) return undefined;
 	return args.action === "download" ? `${remote} → ${local}` : `${local} → ${remote}`;

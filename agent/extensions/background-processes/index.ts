@@ -127,8 +127,8 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	};
 
 	const renderers = (toolName: BackgroundToolName) => ({
-		renderCall(args: Record<string, unknown>, theme: Theme, context: { lastComponent?: unknown }) {
-			return renderBackgroundToolCall(toolName, args, theme, context.lastComponent as Text | undefined, processLookup(manager));
+		renderCall(args: Record<string, unknown>, theme: Theme, context: { lastComponent?: unknown; cwd: string }) {
+			return renderBackgroundToolCall(toolName, args, theme, context.lastComponent as Text | undefined, processLookup(manager), context.cwd);
 		},
 		renderResult(
 			result: { content: Array<{ type: string; text?: string }>; details?: unknown },

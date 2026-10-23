@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { hyperlink, Text } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
+import { linkFile, linkUrl } from "../../_shared/file-links.ts";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { ConcurrencyLimiter } from "./concurrency-limiter.ts";
@@ -36,7 +37,7 @@ function entryTitle(entry: any): string {
 function clickableUrl(url: unknown, max = 88): string {
 	const fullUrl = String(url || "").trim();
 	if (!fullUrl) return "";
-	return hyperlink(`↗ ${oneLine(fullUrl, max)}`, fullUrl);
+	return linkUrl(`↗ ${oneLine(fullUrl, max)}`, fullUrl);
 }
 
 function textOutput(result: any): string {
@@ -215,18 +216,18 @@ export default async function (pi: ExtensionAPI) {
 				const payload = githubPayloadKind(output, d.strategy);
 				if (d.owner && d.repo) text += `\n${theme.fg("success", "Repository:")} ${theme.fg("accent", `${d.owner}/${d.repo}`)}`;
 				if (d.ref) text += `\n${theme.fg("success", "Ref:")} ${theme.fg("dim", String(d.ref))}`;
-				if (d.localPath) text += `\n${theme.fg("success", "Cache path:")} ${theme.fg("dim", String(d.localPath))}`;
+				if (d.localPath) text += `\n${theme.fg("success", "Cache path:")} ${linkFile(theme.fg("dim", String(d.localPath)), String(d.localPath), context.cwd)}`;
 				if (d.requestedPath) text += `\n${theme.fg("success", "Requested path:")} ${theme.fg("dim", String(d.requestedPath))}`;
 				text += `\n${theme.fg("success", "Payload:")} ${theme.fg("accent", payload.label)}`;
 				text += `\n${theme.fg("muted", payload.note)}`;
 				if (d.answer) text += `\n\n${theme.fg("success", "Answer:")}\n${String(d.answer).trim()}`;
 				if (d.contentTruncated) text += `\n${theme.fg("warning", "Content:")} ${theme.fg("muted", "bounded before answer processing")}`;
 				text += renderGitHubInjectedBlock(githubPreviewOnly(output), expanded, theme);
-				if (d.artifactDir) text += `\n\n${theme.fg("success", "Artifact directory:")} ${theme.fg("dim", String(d.artifactDir))}`;
+				if (d.artifactDir) text += `\n\n${theme.fg("success", "Artifact directory:")} ${linkFile(theme.fg("dim", String(d.artifactDir)), String(d.artifactDir), context.cwd)}`;
 				if (d.files && Object.keys(d.files).length > 0) {
 					text += `\n${theme.fg("success", "Artifacts:")}`;
 					for (const [key, value] of Object.entries(d.files)) {
-						if (value) text += `\n- ${key}: ${theme.fg("dim", String(value))}`;
+						if (value) text += `\n- ${key}: ${linkFile(theme.fg("dim", String(value)), String(value), context.cwd)}`;
 					}
 				}
 				return renderLine(text, theme, context);
@@ -272,10 +273,10 @@ export default async function (pi: ExtensionAPI) {
 			if (d.files && Object.keys(d.files).length > 0) {
 				text += `\n\n${theme.fg("success", "Artifacts:")}`;
 				for (const [key, value] of Object.entries(d.files)) {
-					if (value) text += `\n- ${key}: ${theme.fg("dim", String(value))}`;
+					if (value) text += `\n- ${key}: ${linkFile(theme.fg("dim", String(value)), String(value), context.cwd)}`;
 				}
 			}
-			if (d.artifactDir) text += `\n- artifactDir: ${theme.fg("dim", d.artifactDir)}`;
+			if (d.artifactDir) text += `\n- artifactDir: ${linkFile(theme.fg("dim", d.artifactDir), d.artifactDir, context.cwd)}`;
 			return renderLine(text, theme, context);
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -327,7 +328,7 @@ export default async function (pi: ExtensionAPI) {
 					text += `\n- ${theme.fg("accent", title)}${url ? `\n  ${theme.fg("dim", url)}\n` : ""}`;
 				}
 			}
-			if (expanded && d.files?.json) text += `\nJSON: ${theme.fg("dim", d.files.json)}`;
+			if (expanded && d.files?.json) text += `\nJSON: ${linkFile(theme.fg("dim", d.files.json), d.files.json, context.cwd)}`;
 			return renderLine(text, theme, context);
 		}, 
 		async execute(_toolCallId, params, signal, onUpdate) {
@@ -382,8 +383,8 @@ export default async function (pi: ExtensionAPI) {
 			let text = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", "firecrawl_crawl")} ${theme.fg("accent", oneLine(context.args?.url, 100))}`;
 			if (typeof d.pages === "number") text += ` · ${d.pages} pages`;
 			if (expanded) {
-				if (d.mergedPath) text += `\nMerged: ${theme.fg("dim", d.mergedPath)}`;
-				if (d.jsonPath) text += `\nJSON: ${theme.fg("dim", d.jsonPath)}`;
+				if (d.mergedPath) text += `\nMerged: ${linkFile(theme.fg("dim", d.mergedPath), d.mergedPath, context.cwd)}`;
+				if (d.jsonPath) text += `\nJSON: ${linkFile(theme.fg("dim", d.jsonPath), d.jsonPath, context.cwd)}`;
 			}
 			return renderLine(text, theme, context);
 		},

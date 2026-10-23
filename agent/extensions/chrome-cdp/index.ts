@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
+import { linkFile, linkFilePaths } from "../_shared/file-links.ts";
+import { savedOutputPaths } from "./output-files.ts";
 import { CDP, TargetSessionPool, abortableSleep, raceWithAbort, throwIfAborted } from "./protocol.ts";
 import { BrowserManager } from "./browsers.ts";
 import { type Locator, callOnObject, describeLocator, hasLocator, readLocatorMetadata, releaseLocator, resolveLocator, withResolvedLocator } from "./locator.ts";
@@ -1205,7 +1207,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
 
     // ── custom TUI rendering ──
 
-    renderCall(args: ChromeCdpParams, theme: any) {
+    renderCall(args: ChromeCdpParams, theme: any, context: any) {
       const parts: string[] = [theme.bold("chrome_cdp")];
       parts.push(theme.fg("muted", args.action));
       if (args.browserId) parts.push(theme.fg("muted", `[${args.browserId}]`));
@@ -1219,7 +1221,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
       }
       if (args.expressionPath) {
         const short = args.expressionPath.length > 50 ? args.expressionPath.slice(0, 50) + "…" : args.expressionPath;
-        parts.push(theme.fg("dim", short));
+        parts.push(linkFile(theme.fg("dim", short), args.expressionPath, context.cwd));
       }
       if (args.method) {
         parts.push(theme.fg("dim", args.method));
@@ -1239,49 +1241,57 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
         parts.push(theme.fg("dim", args.waitForSelector.length > 30 ? args.waitForSelector.slice(0, 30) + "…" : args.waitForSelector));
       }
       if (args.outputPath) {
-        parts.push(theme.fg("dim", `→ ${args.outputPath.length > 34 ? args.outputPath.slice(0, 34) + "…" : args.outputPath}`));
+        const label = args.outputPath.length > 34 ? args.outputPath.slice(0, 34) + "…" : args.outputPath;
+        parts.push(`${theme.fg("dim", "→ ")}${linkFile(theme.fg("dim", label), args.outputPath, context.cwd)}`);
       }
 
       return new Text(parts.join(" "), 0, 0);
     },
 
-    renderResult(result: any, { expanded }: { expanded: boolean }, theme: any) {
+    renderResult(result: any, { expanded }: { expanded: boolean }, theme: any, context: any) {
       const details = result.details || {};
       const action = details.action || "?";
+      const raw = String(result.content?.[0]?.text ?? "");
+      const paths = context.isError || result.isError ? [] : savedOutputPaths(raw, action, details.outputPath ?? context.args?.outputPath);
+      const summary = (text: string): Text => {
+        const linked = linkFilePaths(text, paths, context.cwd);
+        const missing = paths.filter((path) => !text.includes(path));
+        const links = missing.map((path) => linkFile(theme.fg("info", path), path, context.cwd));
+        return new Text([linked, ...links].join("\n"), 0, 0);
+      };
 
       switch (action) {
         case "list": {
           const n = details.count ?? 0;
-          return new Text(theme.fg("success", `\u2713 ${n} tab${n === 1 ? "" : "s"}${details.elapsedMs != null ? ` \u00b7 ${(details.elapsedMs / 1000).toFixed(1)}s` : ""}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${n} tab${n === 1 ? "" : "s"}${details.elapsedMs != null ? ` \u00b7 ${(details.elapsedMs / 1000).toFixed(1)}s` : ""}`));
         }
         case "eval":
         case "script": {
           const raw = String(result.content?.[0]?.text ?? "");
           if (raw.startsWith("Eval failed:")) {
             const firstLine = raw.split("\n")[0].replace("Eval failed: ", "");
-            return new Text(theme.fg("error", `\u2717 ${firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine}`), 0, 0);
+            return summary(theme.fg("error", `\u2717 ${firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine}`));
           }
           const dumped = (details.dumped ?? false) || raw.includes("[Dumped ") || raw.includes("[Saved ");
           if (dumped) {
-            return new Text(theme.fg("info", `\u2713 ${action} \u2192 file (${formatBytes(details.outputBytes)})`), 0, 0);
+            return summary(theme.fg("info", `\u2713 ${action} \u2192 file (${formatBytes(details.outputBytes)})`));
           }
           const short = raw.length > 120 ? raw.slice(0, 120).replace(/\n/g, " \u00b7 ") + "…" : raw.replace(/\n/g, " \u00b7 ");
-          return new Text(theme.fg("success", `\u2713 ${short}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${short}`));
         }
         case "snap": {
           const raw = String(result.content?.[0]?.text ?? "");
           const firstLine = raw.split("\n")[0] || "";
           const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
-          return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
+          return summary(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`));
         }
         case "html": {
           const bytes = details.outputBytes ?? 0;
           const selector = details.selector;
           const raw = String(result.content?.[0]?.text ?? "");
           const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
-          return new Text(
+          return summary(
             theme.fg(dumped ? "info" : "success", `\u2713 HTML ${formatBytes(bytes)}${selector ? ` (${selector})` : ""}${dumped ? " \u2192 file" : ""}`),
-            0, 0
           );
         }
         case "net":
@@ -1290,7 +1300,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
           const raw = String(result.content?.[0]?.text ?? "");
           const firstLine = raw.split("\n")[0] || "";
           const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
-          return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
+          return summary(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`));
         }
         case "nav":
         case "wait":
@@ -1300,30 +1310,30 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
           const raw = String(result.content?.[0]?.text ?? "");
           const firstLine = raw.split("\n")[0] || action;
           const dumped = (details.dumped ?? false) || raw.includes("[Saved ") || raw.includes("[Dumped ");
-          return new Text(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`), 0, 0);
+          return summary(theme.fg(dumped ? "info" : "success", `\u2713 ${firstLine}${dumped ? " \u2192 file" : ""}`));
         }
         case "reload": {
-          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`));
         }
         case "click":
         case "clickxy":
         case "press":
         case "viewport": {
-          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`));
         }
         case "type": {
-          return new Text(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${String(result.content?.[0]?.text ?? "")}`));
         }
         case "shot": {
           const text = String(result.content?.[0]?.text ?? "");
           const firstLine = text.split("\n")[0] || "";
-          return new Text(theme.fg("success", `\u2713 ${firstLine}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${firstLine}`));
         }
         default: {
           if (result.isError) {
-            return new Text(theme.fg("error", `\u2717 ${String(result.content?.[0]?.text ?? "").split("\n")[0]}`), 0, 0);
+            return summary(theme.fg("error", `\u2717 ${String(result.content?.[0]?.text ?? "").split("\n")[0]}`));
           }
-          return new Text(theme.fg("success", `\u2713 ${action}`), 0, 0);
+          return summary(theme.fg("success", `\u2713 ${action}`));
         }
       }
     },

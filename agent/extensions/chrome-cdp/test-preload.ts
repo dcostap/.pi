@@ -20,6 +20,8 @@ const Type = {
 mock.module("typebox", () => ({ Type }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+  getCapabilities: () => ({ hyperlinks: process.env.PI_TEST_HYPERLINKS === "1" }),
+  hyperlink: (label: string, url: string) => `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`,
   Text: class Text {
     constructor(public text: string, public paddingX = 0, public paddingY = 0) {}
     setText(text: string) { this.text = text; }

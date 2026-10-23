@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { linkFilePaths } from "./_shared/file-links.ts";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { constants, createWriteStream, type WriteStream } from "node:fs";
@@ -634,9 +635,11 @@ export default async function (pi: ExtensionAPI) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			const query = currentArgs?.query ?? "";
 			const options = formatSearchOptions(currentArgs);
+			const scope = currentArgs?.scope_path?.trim();
+			const linkedOptions = scope ? linkFilePaths(options, [scope], context.cwd) : options;
 			let output = `${theme.fg("toolTitle", theme.bold("Everything Search"))}`;
 			if (query) output += `  ${theme.fg("accent", query)}`;
-			if (options) output += `  ${theme.fg("muted", options)}`;
+			if (options) output += `  ${theme.fg("muted", linkedOptions)}`;
 			text.setText(output);
 			return text;
 		},
@@ -647,9 +650,11 @@ export default async function (pi: ExtensionAPI) {
 			const summaryLine = bodyLines[0] ?? "";
 			const resultLines = bodyLines.slice(1).filter((line) => line.trim().length > 0);
 			const previewLines = options.expanded ? resultLines : resultLines.slice(0, 10);
-			let output = summaryLine ? theme.fg("muted", summaryLine) : "";
+			const details = result.details as { output_path?: string; results?: EverythingItem[] } | undefined;
+			const paths = [details?.output_path, ...(details?.results ?? []).map(buildFullPath)].filter((path): path is string => Boolean(path));
+			let output = summaryLine ? theme.fg("muted", linkFilePaths(summaryLine, paths, context.cwd)) : "";
 			if (previewLines.length > 0) {
-				output += `\n\n${theme.fg("muted", previewLines.join("\n"))}`;
+				output += `\n\n${theme.fg("muted", linkFilePaths(previewLines.join("\n"), paths, context.cwd))}`;
 				if (!options.expanded && resultLines.length > previewLines.length) {
 					output += `\n${theme.fg("muted", `... (${resultLines.length - previewLines.length} more lines, to expand)`)}`;
 				}

@@ -94,6 +94,8 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+	getCapabilities: () => ({ hyperlinks: process.env.PI_TEST_HYPERLINKS === "1" }),
+	hyperlink: (label: string, url: string) => `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`,
 	Box: class Box {
 		private readonly children: Array<{ render(width?: number): string[] }> = [];
 		constructor(

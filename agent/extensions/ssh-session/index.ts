@@ -258,7 +258,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 			"Operate on user-authorized persistent SSH connections. Only the user can connect, with /ssh-connect for each server. Use list to get connection IDs, targets, root permissions, and background jobs. Unfiltered list shows all connections. Set session_id for other operations when multiple connections exist; omit it only when exactly one exists. Each connection has separate root authorization and background jobs. Job IDs belong to their connection. exec and sudo_exec run foreground commands. upload and download atomically transfer individual regular files over the selected authenticated SFTP channel. bg_start, bg_status, bg_wait, and bg_kill manage background jobs as the login user, without the sudo channel. close disconnects only the selected connection. sudo_exec requires root authorization for that connection; root logins use exec. Output is limited to 2000 lines or 50KB. Complete output is saved to a local temp file when truncated.",
 		parameters: ToolParameters,
 		renderCall(args, theme, context) {
-			return renderSshCall(args, theme, context.expanded, context.lastComponent as Text | undefined);
+			return renderSshCall(args, theme, context.expanded, context.lastComponent as Text | undefined, context.cwd);
 		},
 		renderResult(result, options, theme, context) {
 			return renderSshResult(
@@ -267,6 +267,7 @@ export default function sshSessionExtension(pi: ExtensionAPI) {
 				theme,
 				context.lastComponent as Text | undefined,
 				context.isError,
+				context.cwd,
 			);
 		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

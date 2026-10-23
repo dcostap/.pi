@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderSshCall, renderSshResult } from "./ui.ts";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const theme = {
 	fg: (_color: string, text: string) => text,
@@ -7,6 +9,27 @@ const theme = {
 } as any;
 
 describe("SSH tool chat rendering", () => {
+	test("links local transfer paths and output files, but not identical remote paths", () => {
+		const previous = process.env.PI_TEST_HYPERLINKS;
+		process.env.PI_TEST_HYPERLINKS = "1";
+		try {
+			const cwd = resolve("ssh-test");
+			const path = resolve(cwd, "file #1.txt");
+			const url = pathToFileURL(path).href;
+			const call = renderSshCall({ action: "upload", local_path: "@file #1.txt", remote_path: "/srv/file.txt" }, theme, false, undefined, cwd).render(200).join("\n");
+			expect(call).toContain(`\x1b]8;;${url}\x1b\\@file #1.txt\x1b]8;;\x1b\\ → /srv/file.txt`);
+			const spaced = renderSshCall({ action: "download", local_path: "file  with  spaces.txt", remote_path: "/srv/file.txt" }, theme, false, undefined, cwd).render(200).join("\n");
+			expect(spaced).toContain(pathToFileURL(resolve(cwd, "file  with  spaces.txt")).href);
+			const result = renderSshResult({ content: [{ type: "text", text: `Local: ${path}\nRemote: ${path}\nFull output saved to: ${path}` }], details: { localPath: path, fullOutputPath: path } }, { expanded: true, isPartial: false }, theme, undefined, false, cwd).render(200).join("\n");
+			expect(result).toContain(`Local: \x1b]8;;${url}\x1b\\${path}`);
+			expect(result).toContain(`Remote: ${path}\n`);
+			expect(result).toContain(`Full output saved to: \x1b]8;;${url}\x1b\\${path}`);
+		} finally {
+			if (previous === undefined) delete process.env.PI_TEST_HYPERLINKS;
+			else process.env.PI_TEST_HYPERLINKS = previous;
+		}
+	});
+
 	test("shows the selected connection in collapsed calls and results", () => {
 		const call = renderSshCall({ action: "exec", session_id: "ssh-2", command: "hostname" }, theme, false).render(200).join("\n");
 		expect(call).toContain("on ssh-2");

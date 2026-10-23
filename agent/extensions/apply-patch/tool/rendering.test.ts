@@ -1,13 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { hyperlink, resetCapabilitiesCache, setCapabilities, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { clearApplyPatchRenderState, renderApplyPatchCallFromState, setApplyPatchRenderState } from "./render-state.ts";
 import { formatApplyPatchCollapsedDiff, formatApplyPatchSummary } from "./rendering.ts";
 
 const temporaryDirectories: string[] = [];
 
+beforeEach(() => {
+	setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+});
+
 afterEach(() => {
+	resetCapabilitiesCache();
 	clearApplyPatchRenderState();
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
@@ -60,6 +67,70 @@ const taggedTheme = {
 };
 
 describe("apply_patch terminal rendering", () => {
+	test("links the styled path to an encoded absolute file URL, not the counts or diff", () => {
+		const { cwd } = fixture();
+		const path = "folder/file #1.ts";
+		const patchText = `*** Begin Patch\n*** Add File: ${path}\n+content\n*** End Patch`;
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = renderApplyPatchCallFromState({ input: patchText }, taggedTheme, {
+			cwd, argsComplete: true, showCollapsedDiff: true, settledStatus: "success",
+		});
+		const link = hyperlink(`<accent>${path}</accent>`, pathToFileURL(join(cwd, path)).href);
+		expect(rendered).toContain(`${link} (`);
+		expect(rendered.split("\n").slice(1).join("\n")).not.toContain("\u001b]8;");
+	});
+
+	test("links each file and both move paths separately", () => {
+		const { cwd, patchText } = fixture();
+		const multiPatch = patchText
+			.replace("*** Update File: index.ts", "*** Update File: index.ts\n*** Move to: renamed.ts")
+			.replace("*** End Patch", "*** Add File: new.ts\n+new\n*** End Patch");
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = renderApplyPatchCallFromState({ input: multiPatch }, taggedTheme, {
+			cwd, argsComplete: true, showCollapsedDiff: true,
+		});
+		for (const path of ["index.ts", "renamed.ts", "new.ts"]) {
+			expect(rendered).toContain(hyperlink(`<accent>${path}</accent>`, pathToFileURL(join(cwd, path)).href));
+		}
+	});
+
+	test("uses the raw absolute path when the displayed path is relative", () => {
+		const { cwd } = fixture();
+		const path = join(cwd, "new.ts");
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = renderApplyPatchCallFromState({ input: `*** Begin Patch\n*** Add File: ${path}\n+new\n*** End Patch` }, taggedTheme, {
+			cwd, argsComplete: true,
+		});
+		expect(rendered).toContain(hyperlink("<accent>new.ts</accent>", pathToFileURL(path).href));
+	});
+
+	test("links complete streamed paths but not incomplete paths", () => {
+		const { cwd } = fixture();
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = renderApplyPatchCallFromState({ input: "*** Begin Patch\n*** Add File: new.ts\n+new\n*** Add File: partial" }, taggedTheme, {
+			cwd, argsComplete: false,
+		});
+		expect(rendered).toContain(hyperlink("<accent>new.ts</accent>", pathToFileURL(join(cwd, "new.ts")).href));
+		expect(rendered).not.toContain("partial");
+	});
+
+	test("closes links before padding and reopens them across wrapped lines", () => {
+		const { cwd } = fixture();
+		const path = "long-folder-name/long-file-name.ts";
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = renderApplyPatchCallFromState({ input: `*** Begin Patch\n*** Add File: ${path}\n+new\n*** End Patch` }, {
+			fg: (_role, text) => text, bold: (text) => text,
+		}, { cwd, argsComplete: true });
+		const lines = new Text(rendered, 0, 0).render(24);
+		const open = `\u001b]8;;${pathToFileURL(join(cwd, path)).href}\u001b\\`;
+		const close = "\u001b]8;;\u001b\\";
+		expect(lines.filter((line) => line.includes(open)).length).toBeGreaterThan(1);
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+			if (line.includes(open)) expect(line.lastIndexOf(close)).toBeGreaterThan(line.lastIndexOf(open));
+		}
+	});
+
 	test("renders Codex's headerless first update chunk", () => {
 		const { cwd } = fixture();
 		const patchText = [

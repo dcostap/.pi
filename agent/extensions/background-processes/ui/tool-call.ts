@@ -5,6 +5,7 @@ import { highlightBashCommand } from "../../_shared/bash-command-highlight.ts";
 import { formatDuration, type KillView, type ProcessView } from "../formatting.ts";
 import { normalizeTitle, stripBackgroundNotice } from "../prompt.ts";
 import { sanitizeTerminalText } from "../sanitize.ts";
+import { linkFile, linkFilePaths } from "../../_shared/file-links.ts";
 
 export type BackgroundToolName = "bash_bg_start" | "bash_bg_status" | "bash_bg_wait" | "bash_bg_kill";
 
@@ -56,13 +57,16 @@ export function renderBackgroundToolCall(
 	theme: Theme,
 	previous?: Text,
 	lookupProcess?: BackgroundProcessLookup,
+	cwd?: string,
 ): Text {
 	const component = previous ?? new Text("", 0, 0);
 
 	if (toolName === "bash_bg_start") {
 		const command = typeof args.command === "string" ? sanitizeTerminalText(args.command) : "";
 		const title = typeof args.title === "string" ? cleanInline(normalizeTitle(args.title)) : "";
-		const workingDirectory = typeof args.working_dir === "string" ? cleanInline(args.working_dir) : "";
+		const rawDirectory = typeof args.working_dir === "string" ? cleanInline(args.working_dir) : "";
+		const targetDirectory = typeof args.working_dir === "string" ? args.working_dir.replace(/^@(?=[A-Za-z]:[\\/]|[./\\])/u, "") : "";
+		const workingDirectory = rawDirectory && cwd ? linkFile(rawDirectory, targetDirectory, cwd) : rawDirectory;
 		const qualifiers = ["background", title, workingDirectory ? `in ${workingDirectory}` : ""].filter(Boolean);
 		const commandDisplay = command ? highlightBashCommand(command) : theme.fg("toolOutput", "...");
 		component.setText(
@@ -117,7 +121,9 @@ export function renderBackgroundToolResult(
 		return component;
 	}
 	if (options.expanded && !options.isPartial && text) {
-		component.addChild(new Text(`\n${text.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n")}`, 0, 0));
+		const views = [asView(details.process), ...(Array.isArray(details.processes) ? details.processes.map(asView) : [])].filter((view) => view !== undefined);
+		const linkedText = linkFilePaths(text, views.flatMap((view) => view.fullOutputPath ? [view.fullOutputPath] : []), views[0]?.cwd ?? "");
+		component.addChild(new Text(`\n${linkedText.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n")}`, 0, 0));
 		return component;
 	}
 
@@ -202,11 +208,13 @@ export function renderBackgroundCompletionMessage(
 	if (options.expanded || views.length === 0) {
 		const text = sanitizeTerminalText(message.content).trimEnd();
 		body.addChild(new Text(theme.fg("toolTitle", theme.bold("background process finished")), 0, 0));
-		addOutputPreview(body, text, theme, options.expanded, PREVIEW_LINES);
+		const linkedText = linkFilePaths(text, views.flatMap((view) => view.fullOutputPath ? [view.fullOutputPath] : []), views[0]?.cwd ?? "");
+		addOutputPreview(body, linkedText, theme, options.expanded, PREVIEW_LINES);
 	} else {
 		views.forEach((view, index) => {
 			body.addChild(new Text(`${index === 0 ? "" : "\n"}${processHeadline(view, theme, true)}`, 0, 0));
 			if (view.preview) addOutputPreview(body, view.preview, theme, false, views.length === 1 ? PREVIEW_LINES : MULTI_PREVIEW_LINES);
+			if (view.fullOutputPath) body.addChild(fullOutputLink(view, theme));
 		});
 	}
 	box.addChild(body);
@@ -228,8 +236,13 @@ function addProcessBlock(
 	if (view.preview) addOutputPreview(container, view.preview, theme, expanded, previewLines);
 	else if (!withHeadline) container.addChild(new Text(`\n${theme.fg("muted", view.settled ? "(no output)" : "(no output yet)")}`, 0, 0));
 	if (view.errorText) container.addChild(new Text(theme.fg("error", cleanInline(view.errorText)), 0, 0));
-	if (view.fullOutputPath) container.addChild(new Text(`\n${theme.fg("warning", `[Full output: ${view.fullOutputPath}]`)}`, 0, 0));
+	if (view.fullOutputPath) container.addChild(fullOutputLink(view, theme));
 	if (!withHeadline) container.addChild(new Text(`\n${statusFooter(view, theme)}`, 0, 0));
+}
+
+function fullOutputLink(view: ProcessView, theme: Theme): Text {
+	const path = view.fullOutputPath!;
+	return new Text(`\n${theme.fg("warning", "[Full output: ")}${linkFile(theme.fg("warning", path), path, view.cwd)}${theme.fg("warning", "]")}`, 0, 0);
 }
 
 function addProcessList(container: Container, views: ProcessView[], omitted: number, theme: Theme, expanded: boolean): void {

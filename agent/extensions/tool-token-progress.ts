@@ -7,6 +7,9 @@ import {
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
+import { linkFile } from "./_shared/file-links.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const OUTPUT_ARROW = "↓";
 const TRACKED_TOOLS = new Set(["edit", "write"]);
@@ -57,49 +60,51 @@ function shortenPath(filePath: string): string {
 	return filePath;
 }
 
-function formatToolHeader(toolName: "edit" | "write", args: any, theme: Theme, toolCallId?: string): string {
+function formatToolHeader(toolName: "edit" | "write", args: any, theme: Theme, cwd: string): string {
 	const rawPath = stringArg(args?.file_path ?? args?.path);
 	const path = rawPath !== null ? shortenPath(rawPath) : null;
+	const target = rawPath === "~" ? homedir() : rawPath?.startsWith("~/") || rawPath?.startsWith("~\\") ? join(homedir(), rawPath.slice(2)) : rawPath;
 	const pathDisplay = path === null
 		? theme.fg("error", "[invalid arg]")
 		: path
-			? theme.fg("accent", path)
+			? linkFile(theme.fg("accent", path), target!, cwd)
 			: theme.fg("toolOutput", "...");
 
-	const tokens = estimateTokens(args, toolCallId);
-	const tokenDisplay = tokens > 0 ? ` ${theme.fg("dim", `${OUTPUT_ARROW}${formatTokens(tokens)}`)}` : "";
-
-	return `${theme.fg("toolTitle", theme.bold(toolName))} ${pathDisplay}${tokenDisplay}`;
+	return `${theme.fg("toolTitle", theme.bold(toolName))} ${pathDisplay}`;
 }
 
-function replaceFirstLine(text: string, replacement: string): string {
+const tokenSuffixes = new WeakMap<Text, string>();
+
+// Keep the native header and its file link. Replace only our own token suffix.
+function appendTokenSuffix(component: Text, suffix: string): void {
+	const text = (component as any).text;
+	if (typeof text !== "string") return;
 	const newline = text.indexOf("\n");
-	return newline === -1 ? replacement : `${replacement}${text.slice(newline)}`;
-}
-
-function patchTextFirstLine(component: Text, header: string): void {
-	const current = (component as any).text;
-	component.setText(replaceFirstLine(typeof current === "string" ? current : "", header));
+	let header = newline === -1 ? text : text.slice(0, newline);
+	const previous = tokenSuffixes.get(component);
+	if (previous && header.endsWith(previous)) header = header.slice(0, -previous.length);
+	component.setText(`${header}${suffix}${newline === -1 ? "" : text.slice(newline)}`);
+	tokenSuffixes.set(component, suffix);
 }
 
 function patchHeader(
-	toolName: "edit" | "write",
 	component: Component | undefined,
 	args: unknown,
 	theme: Theme,
 	toolCallId?: string,
 ): void {
-	const header = formatToolHeader(toolName, args, theme, toolCallId);
+	const tokens = estimateTokens(args, toolCallId);
+	const suffix = tokens > 0 ? ` ${theme.fg("dim", `${OUTPUT_ARROW}${formatTokens(tokens)}`)}` : "";
 
 	if (component instanceof Text) {
-		patchTextFirstLine(component, header);
+		appendTokenSuffix(component, suffix);
 		return;
 	}
 
 	const maybeContainer = component as { children?: unknown[] } | undefined;
 	const firstChild = maybeContainer?.children?.[0];
 	if (firstChild instanceof Text) {
-		firstChild.setText(header);
+		appendTokenSuffix(firstChild, suffix);
 	}
 }
 
@@ -156,15 +161,15 @@ export default function (pi: ExtensionAPI) {
 			renderCall(args, theme, context) {
 				const component = baseEdit.renderCall
 					? baseEdit.renderCall(args, theme, context)
-					: new Text(formatToolHeader("edit", args, theme, context.toolCallId), 0, 0);
-				patchHeader("edit", component, args, theme, context.toolCallId);
+					: new Text(formatToolHeader("edit", args, theme, context.cwd), 0, 0);
+				patchHeader(component, args, theme, context.toolCallId);
 				return component;
 			},
 			renderResult(result, options, theme, context) {
 				const component = baseEdit.renderResult
 					? baseEdit.renderResult(result, options, theme, context)
 					: new Text("", 0, 0);
-				patchHeader("edit", context.state?.callComponent as Component | undefined, context.args, theme, context.toolCallId);
+				patchHeader(context.state?.callComponent as Component | undefined, context.args, theme, context.toolCallId);
 				return component;
 			},
 		});
@@ -174,8 +179,8 @@ export default function (pi: ExtensionAPI) {
 			renderCall(args, theme, context) {
 				const component = baseWrite.renderCall
 					? baseWrite.renderCall(args, theme, context)
-					: new Text(formatToolHeader("write", args, theme, context.toolCallId), 0, 0);
-				patchHeader("write", component, args, theme, context.toolCallId);
+					: new Text(formatToolHeader("write", args, theme, context.cwd), 0, 0);
+				patchHeader(component, args, theme, context.toolCallId);
 				return component;
 			},
 		});
