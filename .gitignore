@@ -51,6 +51,7 @@ web-smart-fetch.json
 
 # Runtime/generated/bulky Pi state
 agent/sessions/
+agent/feedback/
 agent/bin/
 agent/npm/
 agent/git/
