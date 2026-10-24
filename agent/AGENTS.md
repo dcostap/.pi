@@ -4,12 +4,6 @@ When calling PowerShell from `bash`, single-quote the entire `-Command` script (
 
 `bash` runs Git Bash, not cmd.exe or PowerShell. Use Unix syntax: `/dev/null` (not `NUL`), forward slashes, and `$VAR` (not `%VAR%` or `$env:VAR`).
 
-## Working directory
-
-Before changing the session directory, ask for permission unless the user already approved the target directory for this task.
-
-In extensions, use `ctx.cwd` for project paths and new local processes. Do not use `process.cwd()`. Pi does not change `process.cwd()` when a session switches to another project.
-
 This rule applies to all prose you write: docs, commit messages, PR descriptions, reports, and replies: Follow ASD-STE100 Simplified Technical English for technical text:
 - Use approved words only. Each word has one meaning.
 - Use one word for one idea. Do not use two words for the same thing.
@@ -18,3 +12,5 @@ This rule applies to all prose you write: docs, commit messages, PR descriptions
 - Write short paragraphs. Keep one topic in each paragraph.
 
 When explaining something, explain for understanding without losing technical depth. Lead with the main point, then add the details needed to make it clear. Use plain language and concrete examples when helpful.
+
+Cut taglines, helper text and secondary labels. If a screen needs them to make sense, fix the layout.

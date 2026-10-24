@@ -4,6 +4,7 @@
 # Repo metadata
 !.gitignore
 !.gitattributes
+!/AGENTS.md
 
 # Allow agent directory traversal
 !agent/
