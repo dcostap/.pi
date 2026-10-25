@@ -4,7 +4,6 @@ import { linkFile, linkUrl } from "../../_shared/file-links.ts";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { ConcurrencyLimiter } from "./concurrency-limiter.ts";
-import { fetchUrl } from "./fetch-url.ts";
 import { crawlWithFirecrawl, getFirecrawlClient, getFirecrawlCreditUsage, searchWithFirecrawl } from "./firecrawl.ts";
 import { join } from "node:path";
 import { makeArtifactDir, preview, saveJson, saveText, truncate } from "./utils.ts";
@@ -135,26 +134,13 @@ function githubPreviewOnly(output: string): string {
 	return end === undefined ? output : output.slice(0, end);
 }
 
-async function hasUsableFirecrawl(config: ReturnType<typeof loadConfig>): Promise<boolean> {
-	if (!config.firecrawlApiKey) return false;
-	try {
-		const client = await getFirecrawlClient(config);
-		if (!client) return false;
-		const usage = await getFirecrawlCreditUsage(client, AbortSignal.timeout(8_000));
-		return usage.remainingCredits > config.firecrawlMinimumCredits;
-	} catch {
-		// Invalid credentials and unavailable accounts must not add unusable tools.
-		return false;
-	}
-}
-
-export default async function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
-	const firecrawlAvailable = await hasUsableFirecrawl(config);
-	const fetchConfig = firecrawlAvailable ? config : { ...config, firecrawlApiKey: undefined };
+	// Check credits at use time, before each paid request, not during startup.
+	const firecrawlConfigured = Boolean(config.firecrawlApiKey);
 	const fetchLimiter = new ConcurrencyLimiter(config.maxConcurrentFetches);
 
-	if (firecrawlAvailable) {
+	if (firecrawlConfigured) {
 		pi.registerCommand("firecrawl-credits", {
 			description: "Show the Firecrawl credit balance and safety reserve",
 			handler: async (_args, ctx) => {
@@ -171,7 +157,7 @@ export default async function (pi: ExtensionAPI) {
 						usage.remainingCredits <= config.firecrawlMinimumCredits ? "warning" : "info",
 					);
 				} catch {
-					// Stay quiet if credentials become unusable after startup.
+					ctx.ui.notify("Could not check Firecrawl credits.", "error");
 				}
 			},
 		});
@@ -287,7 +273,9 @@ export default async function (pi: ExtensionAPI) {
 			}
 			const release = await fetchLimiter.acquire(signal);
 			try {
-				const result = await fetchUrl(params.url, fetchConfig, ctx, params.prompt, onUpdate, signal);
+				const { fetchUrl } = await import("./fetch-url.ts");
+				signal?.throwIfAborted();
+				const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
 				return {
 					content: [{ type: "text", text: result.text }],
 					details: result.details,
@@ -298,7 +286,7 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	if (!firecrawlAvailable) return;
+	if (!firecrawlConfigured) return;
 
 	pi.registerTool({
 		name: "firecrawl_search",
