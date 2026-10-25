@@ -1010,6 +1010,7 @@ export default function chromeCdpExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "chrome_cdp",
     label: "Chrome CDP",
+    executionMode: "sequential",
     description: "Inspect and control tabs in an explicitly selected browser via Chrome DevTools Protocol. Use a browserId from chrome_browser or personal for local Chrome discovery. Supports locators, trusted input, styles, diagnostics, screenshots, viewport emulation, JavaScript, and raw CDP commands. Downloads return after two seconds and continue in the background. Use download_status, download_wait, or download_cancel with downloadId. Completion is reported automatically.",
     promptSnippet: "Inspect and control tabs in a selected browser via Chrome DevTools Protocol (CDP)",
     promptGuidelines: [
