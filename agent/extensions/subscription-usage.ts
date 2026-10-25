@@ -17,7 +17,8 @@ import {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sharedClaudeUsage } from "./_shared/claude-usage-cache.js";
+import { createHash, randomUUID } from "node:crypto";
+import { readUsageSnapshot, sharedClaudeUsage } from "./_shared/claude-usage-cache.js";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
 const LOG_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
@@ -28,6 +29,7 @@ const AGENT_DIR = getAgentDir();
 const AUTH_FILE = path.join(AGENT_DIR, "auth.json");
 const OBSERVATIONS_FILE = path.join(AGENT_DIR, "codex-usage-observations.jsonl");
 const CLAUDE_USAGE_CACHE = path.join(AGENT_DIR, "claude-usage-cache.json");
+const USAGE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 
 const PRIMARY_CODEX_PROVIDER_ID = "openai-codex" as const;
 const SECONDARY_CODEX_PROVIDER_ID = "openai-codex-secondary" as const;
@@ -108,6 +110,7 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<FetchResponseLik
 interface RequestConfig {
   fetchFn?: FetchLike;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 interface JsonRequestSuccess {
@@ -153,7 +156,9 @@ async function requestJson(url: string, init: RequestInit, config: RequestConfig
   const timeout = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
   try {
-    const response = await fetchFn(url, { ...init, signal: controller.signal });
+    const signal = config.signal ? AbortSignal.any([config.signal, controller.signal]) : controller.signal;
+    signal.throwIfAborted();
+    const response = await fetchFn(url, { ...init, signal });
     if (!response.ok) {
       return { ok: false, error: `HTTP ${response.status}`, status: response.status, headers: response.headers };
     }
@@ -202,6 +207,61 @@ function readAuth(authFile = AUTH_FILE): AuthData | null {
     return asObject(parsed) as AuthData;
   } catch {
     return null;
+  }
+}
+
+function usageCacheIdentity(providerId: OAuthProviderId): string | undefined {
+  // Token changes invalidate the cache. Never show a previous account's usage.
+  const access = readAuth()?.[providerId]?.access;
+  if (!access) return undefined;
+  return createHash("sha256").update(access).digest("hex");
+}
+
+function refreshCountdowns(data: UsageData): UsageData {
+  const refreshed = { ...data };
+  for (const window of ["session", "weekly"] as const) {
+    const resetAt = data[`${window}ResetAt`];
+    if (resetAt === undefined) continue;
+    const seconds = Math.max(0, Math.round((resetAt - Date.now()) / 1000));
+    refreshed[`${window}ResetAfterSeconds`] = seconds;
+    refreshed[`${window}ResetsIn`] = window === "session" ? formatDuration(seconds) : formatResetAt(seconds);
+    // An old window cannot describe usage after its reset.
+    if (resetAt <= Date.now()) refreshed[window] = undefined;
+  }
+  refreshed.resetCreditsExpireText = formatResetCreditExpiries(data.resetCredits);
+  return refreshed;
+}
+
+function readCachedUsage(providerId: ProviderKey): UsageData | null {
+  try {
+    let snapshot;
+    if (providerId === CLAUDE_BRIDGE_PROVIDER_ID) {
+      snapshot = readUsageSnapshot<UsageData>(CLAUDE_USAGE_CACHE);
+    } else {
+      const cached = readUsageSnapshot<{ identity: string; usage: UsageData }>(path.join(AGENT_DIR, `${providerId}-usage-cache.json`));
+      const identity = usageCacheIdentity(providerId);
+      if (!identity || cached?.data?.identity !== identity) return null;
+      snapshot = { attemptedAt: cached.attemptedAt, data: cached.data.usage };
+    }
+    const maxAge = providerId === CLAUDE_BRIDGE_PROVIDER_ID ? 60 * 60 * 1000 : USAGE_CACHE_MAX_AGE_MS;
+    if (!snapshot?.data || snapshot.data.error || Date.now() - snapshot.attemptedAt > maxAge) return null;
+    return refreshCountdowns(snapshot.data);
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedUsage(providerId: OAuthProviderId, identity: string, data: UsageData): void {
+  if (data.error) return;
+  const file = path.join(AGENT_DIR, `${providerId}-usage-cache.json`);
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify({ attemptedAt: Date.now(), data: { identity, usage: data } }), { mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } catch {
+    // Cache failures must not stop usage updates.
+  } finally {
+    try { fs.rmSync(temporary, { force: true }); } catch {}
   }
 }
 
@@ -801,6 +861,7 @@ export default function (pi: ExtensionAPI) {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let pollInFlight: Promise<void> | null = null;
   let pollQueued = false;
+  let sessionController = new AbortController();
   let ctx: any = null;
   let lastLoggedSnapshotAt = 0;
   let lastLoggedSnapshotKey: string | null = null;
@@ -945,7 +1006,7 @@ export default function (pi: ExtensionAPI) {
 
     if (previous !== state.activeProvider) {
       // Never display one account's quota while the other account is active.
-      state.usage = null;
+      state.usage = readCachedUsage(state.activeProvider);
       updateStatus();
       return true;
     }
@@ -1065,29 +1126,27 @@ export default function (pi: ExtensionAPI) {
     lastRollupFlushAt = now;
   }
 
-  async function fetchUsage(providerId: ProviderKey, manual = false): Promise<UsageData> {
+  async function fetchUsage(providerId: ProviderKey, manual = false, signal?: AbortSignal): Promise<UsageData> {
     if (providerId === CLAUDE_BRIDGE_PROVIDER_ID) {
       const data = await sharedClaudeUsage<UsageData>(CLAUDE_USAGE_CACHE, async () => {
         const auth = readClaudeAccess();
         return auth.access ? fetchClaudeUsage(auth.access) : { error: auth.error ?? "missing Claude access token" };
       }, manual) ?? { error: "Claude usage refresh is in progress in another Pi session." };
-      // Cached percentages stay unchanged, but reset countdowns must use the current time.
-      if (data.sessionResetAt !== undefined) {
-        data.sessionResetAfterSeconds = Math.max(0, Math.round((data.sessionResetAt - Date.now()) / 1000));
-        data.sessionResetsIn = formatDuration(data.sessionResetAfterSeconds);
-      }
-      if (data.weeklyResetAt !== undefined) {
-        data.weeklyResetAfterSeconds = Math.max(0, Math.round((data.weeklyResetAt - Date.now()) / 1000));
-        data.weeklyResetsIn = formatResetAt(data.weeklyResetAfterSeconds);
-      }
-      return data;
+      return refreshCountdowns(data);
     }
     const auth = await getFreshCodexAccess(providerId);
+    signal?.throwIfAborted();
     if (!auth.access) return { session: 0, weekly: 0, error: auth.error ?? "missing access token (try /login again)" };
-    return fetchCodexUsage(auth.access);
+    const identity = createHash("sha256").update(auth.access).digest("hex");
+    const data = await fetchCodexUsage(auth.access, { signal });
+    signal?.throwIfAborted();
+    saveCachedUsage(providerId, identity, data);
+    return data;
   }
 
   async function runPoll(reason: string, forceLog = false) {
+    const controller = sessionController;
+    if (controller.signal.aborted) return;
     const providerId = state.activeProvider;
     // A queued Codex timer must not poll Claude after a model switch.
     if (providerId === CLAUDE_BRIDGE_PROVIDER_ID && reason !== "claude_inference") return;
@@ -1098,10 +1157,10 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const usage = await fetchUsage(providerId);
+    const usage = await fetchUsage(providerId, false, controller.signal);
 
     // A model switch may have happened while the request was in flight.
-    if (state.activeProvider !== providerId) return;
+    if (controller !== sessionController || controller.signal.aborted || state.activeProvider !== providerId) return;
     state.usage = usage;
 
     state.lastPoll = Date.now();
@@ -1127,14 +1186,18 @@ export default function (pi: ExtensionAPI) {
         });
 
       await pollInFlight;
-    } while (pollQueued);
+    } while (pollQueued && !sessionController.signal.aborted);
   }
 
-  pi.on("session_start", async (_event, _ctx) => {
+  pi.on("session_start", (_event, _ctx) => {
+    sessionController.abort();
+    sessionController = new AbortController();
     ctx = _ctx;
     updateProviderFrom(_ctx.model);
+    state.usage = readCachedUsage(state.activeProvider);
+    updateStatus();
 
-    if (state.activeProvider !== CLAUDE_BRIDGE_PROVIDER_ID) await poll("session_start", true);
+    if (state.activeProvider !== CLAUDE_BRIDGE_PROVIDER_ID) void poll("session_start", true);
 
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(() => {
@@ -1143,6 +1206,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
+    sessionController.abort();
+    pollQueued = false;
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -1329,7 +1394,7 @@ export default function (pi: ExtensionAPI) {
             render(width: number) {
               const separator = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
               const title = fitLine(theme.bold(`${providerDisplayName(providerId)} usage`), width);
-              if (loading) return [separator, title, fitLine(theme.fg("dim", "Fetching usage…"), width), separator];
+              if (loading && !data) return [separator, title, fitLine(theme.fg("dim", "Fetching usage…"), width), separator];
               if (!data) return [separator, title, fitLine(theme.fg("error", "No usage data"), width), separator];
               if (data.error) return [separator, title, fitLine(theme.fg("error", data.error), width), separator];
               const lines = [
