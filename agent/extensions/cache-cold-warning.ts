@@ -24,6 +24,7 @@ function lastAssistantTime(ctx: ExtensionContext): number | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
+	let outputPad = 1;
 	let lastResponseAt: number | undefined;
 	let running = false;
 	let shown = false;
@@ -40,13 +41,19 @@ export default function (pi: ExtensionAPI) {
 		// Re-set each tick so the idle time stays current.
 		const text = `⚠ cache's probably cold (idle ${formatIdle(Date.now() - lastResponseAt!)})`;
 		ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
-			render: (width: number) => [theme.fg("warning", truncateToWidth(text, width))],
+			render(width: number) {
+				const padding = " ".repeat(outputPad);
+				const contentWidth = Math.max(0, width - 2 * padding.length);
+				const content = theme.fg("warning", truncateToWidth(text, contentWidth));
+				return [truncateToWidth(`${padding}${content}${padding}`, width)];
+			},
 			invalidate: () => {},
 		}));
 		shown = true;
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		outputPad = pi.getSettings().outputPad ?? 1;
 		lastResponseAt = lastAssistantTime(ctx);
 		running = false;
 		update(ctx);
@@ -56,6 +63,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
+		outputPad = pi.getSettings().outputPad ?? 1;
 		running = true;
 		update(ctx);
 	});
