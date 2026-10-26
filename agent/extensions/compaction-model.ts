@@ -169,35 +169,36 @@ class CompactionModelSelector extends Container implements Focusable {
 		initialQuery: string,
 		private readonly current: CompactionModelConfig | undefined,
 		private readonly done: (selection: CompactionModelSelection | undefined) => void,
+		purpose: "configure" | "compact",
+		private readonly requestRender: () => void,
 	) {
 		super();
-		const sortedModels = sortModels(models, current);
-		const currentIndex = sortedModels.findIndex(
-			(item) => current?.provider === item.provider && current.model === item.id,
-		);
-		this.allItems = currentIndex >= 0
-			? [sortedModels[currentIndex]!, { kind: "off" }, ...sortedModels.filter((_, index) => index !== currentIndex)]
-			: [{ kind: "off" }, ...sortedModels];
+		if (purpose === "compact") {
+			this.allItems = models.map((model) => ({ kind: "model" as const, provider: model.provider, id: model.id, model }));
+		} else {
+			const sortedModels = sortModels(models, current);
+			const currentIndex = sortedModels.findIndex(
+				(item) => current?.provider === item.provider && current.model === item.id,
+			);
+			this.allItems = currentIndex >= 0
+				? [sortedModels[currentIndex]!, { kind: "off" }, ...sortedModels.filter((_, index) => index !== currentIndex)]
+				: [{ kind: "off" }, ...sortedModels];
+		}
 		this.filteredItems = this.allItems;
 
-		this.addChild(new Text(theme.fg("accent", theme.bold("Compaction model")), 0, 0));
-		this.addChild(
-			new Text(
-				theme.fg(
-					"muted",
-					`Current: ${current ? modelLabel(current) : "off (Pi's current model)"}`,
+		this.addChild(new Text(theme.fg("accent", theme.bold(purpose === "compact" ? "Compact with model" : "Compaction model")), 0, 0));
+		if (purpose === "configure") {
+			this.addChild(
+				new Text(
+					theme.fg(
+						"muted",
+						`Current: ${current ? modelLabel(current) : "off (Pi's current model)"}`,
+					),
+					0,
+					0,
 				),
-				0,
-				0,
-			),
-		);
-		this.addChild(
-			new Text(
-				theme.fg("dim", "The selected model summarizes old context; Pi's active model is unchanged."),
-				0,
-				0,
-			),
-		);
+			);
+		}
 		this.addChild(new Spacer(1));
 
 		if (initialQuery.trim()) this.searchInput.setValue(initialQuery.trim());
@@ -206,14 +207,14 @@ class CompactionModelSelector extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 		this.addChild(this.listContainer);
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "↑↓ select • type to search • Enter save • Esc cancel"), 0, 0));
+		this.addChild(new Text(theme.fg("dim", `Type to search • ↑↓ select • Enter ${purpose === "compact" ? "compact" : "save"} • Esc cancel`), 0, 0));
 
 		this.filterModels(this.searchInput.getValue());
 	}
 
 	private filterModels(query: string): void {
 		this.filteredItems = query ? fuzzyFilter(this.allItems, query, modelSearchText) : this.allItems;
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredItems.length - 1));
+		this.selectedIndex = 0;
 		this.updateList();
 	}
 
@@ -262,6 +263,7 @@ class CompactionModelSelector extends Container implements Focusable {
 		if (this.filteredItems.length === 0) {
 			this.listContainer.addChild(new Text(this.theme.fg("muted", "  No matching models"), 0, 0));
 		}
+		this.requestRender();
 	}
 
 	private selectCurrent(): void {
@@ -299,8 +301,13 @@ class CompactionModelSelector extends Container implements Focusable {
 			return;
 		}
 
+		const previousQuery = this.searchInput.getValue();
 		this.searchInput.handleInput(keyData);
-		this.filterModels(this.searchInput.getValue());
+		if (this.searchInput.getValue() !== previousQuery) {
+			this.filterModels(this.searchInput.getValue());
+		} else {
+			this.requestRender();
+		}
 	}
 }
 
@@ -384,8 +391,8 @@ async function pickModel(ctx: any, initialQuery = ""): Promise<void> {
 	const models = ctx.modelRegistry.getAvailable();
 	const current = await readConfig();
 	const selected = await ctx.ui.custom<CompactionModelSelection | undefined>(
-		(_tui: any, theme: Theme, _keybindings: any, done: (selection: CompactionModelSelection | undefined) => void) =>
-			new CompactionModelSelector(theme, models, initialQuery, current, done),
+		(tui: any, theme: Theme, _keybindings: any, done: (selection: CompactionModelSelection | undefined) => void) =>
+			new CompactionModelSelector(theme, models, initialQuery, current, done, "configure", () => tui.requestRender()),
 	);
 	if (!selected) return;
 
@@ -450,15 +457,27 @@ export default function compactionModelExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("No models are available. Use /login to add a provider.", "warning");
 					return;
 				}
-				const labels = models.map((model) => `${model.provider}/${model.id}`);
-				const selected = await ctx.ui.select("Compact once with model (chat model stays unchanged)", labels);
-				if (selected === undefined) return;
+				let model;
+				if (ctx.mode === "tui") {
+					const selection = await ctx.ui.custom<CompactionModelSelection | undefined>(
+						(tui, theme, _keybindings, done) => new CompactionModelSelector(
+							theme, models, "", undefined, done, "compact", () => tui.requestRender(),
+						),
+					);
+					if (selection?.kind !== "model") return;
+					model = selection.model;
+				} else {
+					const labels = models.map((model) => `${model.provider}/${model.id}`);
+					const selected = await ctx.ui.select("Compact with model", labels);
+					if (selected === undefined) return;
+					model = models[labels.indexOf(selected)];
+				}
+				if (!model) return;
 				if (!ctx.isIdle()) {
 					ctx.ui.notify("The session is busy. Run /compact-with-model again when it is idle.", "warning");
 					return;
 				}
-				const model = models[labels.indexOf(selected)];
-				if (!model) return;
+				const selected = `${model.provider}/${model.id}`;
 				const settings = pi.getSettings();
 				const scoped = ctx.scopedModels.find(
 					(item) => item.model.provider === model.provider && item.model.id === model.id,

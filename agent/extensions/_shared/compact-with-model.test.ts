@@ -30,12 +30,39 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 	serializeConversation: (messages: any[]) => JSON.stringify(messages),
 }));
 mock.module("@earendil-works/pi-tui", () => ({
-	Container: class {},
-	Input: class {},
-	Spacer: class {},
-	Text: class {},
-	fuzzyFilter: (items: any[]) => items,
-	matchesKey: () => false,
+	Container: class {
+		children: any[] = [];
+		addChild(child: any) { this.children.push(child); }
+		clear() { this.children = []; }
+		render(width: number): string[] { return this.children.flatMap((child) => child.render(width)); }
+	},
+	Input: class {
+		value = "";
+		focused = false;
+		getValue() { return this.value; }
+		setValue(value: string) { this.value = value; }
+		handleInput(data: string) {
+			if (data === "\x7f") this.value = this.value.slice(0, -1);
+			else if (data === "\x15") this.value = "";
+			else this.value += data;
+		}
+		render() { return [`> ${this.value}`]; }
+	},
+	Spacer: class { render() { return [""]; } },
+	Text: class {
+		constructor(private text: string) {}
+		render() { return [this.text]; }
+	},
+	fuzzyFilter: (items: any[], query: string, text: (item: any) => string) => items.filter((item) => {
+		let index = 0;
+		for (const character of text(item).toLowerCase()) {
+			if (character === query[index]?.toLowerCase()) index++;
+		}
+		return index === query.length;
+	}),
+	matchesKey: (data: string, key: string) => data === ({
+		up: "\x1b[A", down: "\x1b[B", enter: "\r", escape: "\x1b",
+	} as Record<string, string>)[key],
 }));
 mock.module("@earendil-works/pi-ai/compat", () => ({
 	clampThinkingLevel: (model: any, level: string) => model.reasoning ? level : "off",
@@ -72,6 +99,8 @@ function setup() {
 		beforeCompact: undefined as (() => Promise<void>) | undefined,
 		select: undefined as (() => Promise<string | undefined>) | undefined,
 		pickerOptions: [] as string[],
+		renderCount: 0,
+		interact: (picker: any) => { picker.handleInput("chosen"); picker.handleInput("\r"); },
 		compactCount: 0,
 		find: (provider: string, id: string) => [chat, chosen, global].find((item) => item.provider === provider && item.id === id),
 		async emit(name: string, event: any) {
@@ -125,6 +154,24 @@ function setup() {
 				state.pickerOptions = options;
 				return state.select ? state.select() : state.selection;
 			},
+			custom: async (factory: any) => {
+				let selection: any;
+				let completed = false;
+				const picker = factory(
+					{ requestRender: () => state.renderCount++ },
+					{ fg: (_color: string, text: string) => text, bold: (text: string) => text },
+					{},
+					(value: any) => {
+						assert.ok(!completed, "The picker must complete only once");
+						completed = true;
+						selection = value;
+					},
+				);
+				picker.focused = true;
+				state.interact(picker);
+				assert.ok(completed, "The picker must complete");
+				return selection;
+			},
 		},
 		compact: (options: any) => {
 			state.compactCount++;
@@ -148,6 +195,7 @@ function setup() {
 	};
 	const pi: any = {
 		on: (name: string, handler: any) => events.set(name, [...(events.get(name) ?? []), handler]),
+		events: { emit: () => {} },
 		registerCommand: (name: string, definition: any) => commands.set(name, definition),
 		getSettings: () => settings,
 		setModel: () => assert.fail("Must not change the chat model"),
@@ -352,6 +400,112 @@ test("adds no widget or footer status during compaction", async () => {
 	state.setGlobal();
 	await state.emit("session_before_compact", state.event("threshold"));
 	assert.equal(calls[1][1], state.global);
+});
+
+test("TUI picker filters as the user types and keeps scoped model order", async () => {
+	const { state, ctx } = setup();
+	ctx.mode = "tui";
+	state.interact = (picker) => {
+		const initial = picker.render(80).join("\n");
+		assert.ok(initial.includes("→ chosen"));
+		assert.ok(initial.includes("200K ctx"));
+		assert.ok(!initial.includes("global"));
+		assert.ok(!initial.includes("Off"));
+		assert.equal(picker.children.find((child: any) => "focused" in child)?.focused, true);
+		const before = state.renderCount;
+		for (const character of "chat") picker.handleInput(character);
+		const filtered = picker.render(80).join("\n");
+		assert.ok(filtered.includes("→ chat"));
+		assert.ok(!filtered.includes("chosen"));
+		assert.ok(state.renderCount >= before + 4);
+		picker.handleInput("\r");
+	};
+	await state.command("compact-with-model", "Keep decisions");
+	assert.equal(calls[0][1], state.chat);
+	assert.equal(calls[0][4], "Keep decisions");
+	assert.equal(state.pickerOptions.length, 0);
+});
+
+test("TUI picker searches provider, model ID, and display name", async () => {
+	const { state, ctx } = setup();
+	ctx.mode = "tui";
+	state.chosen.name = "Summary Writer";
+	for (const query of ["TEST/CHOSEN", "smrywrtr"]) {
+		state.interact = (picker) => {
+			picker.handleInput(query);
+			const text = picker.render(80).join("\n");
+			assert.ok(text.includes("→ chosen"));
+			assert.ok(!text.includes("→ chat"));
+			picker.handleInput("\r");
+		};
+		await state.command();
+		assert.equal(calls.at(-1)?.[1], state.chosen);
+	}
+});
+
+test("TUI picker supports empty results, backspace, and clearing search", async () => {
+	const { state, ctx } = setup();
+	ctx.mode = "tui";
+	state.interact = (picker) => {
+		picker.handleInput("chosen!");
+		assert.ok(picker.render(80).join("\n").includes("No matching models"));
+		picker.handleInput("\x1b[B");
+		picker.handleInput("\x1b[A");
+		picker.handleInput("\r");
+		picker.handleInput("\x7f");
+		assert.ok(picker.render(80).join("\n").includes("→ chosen"));
+		picker.handleInput("\x15");
+		assert.ok(picker.render(80).join("\n").includes("  chat"));
+		picker.handleInput("\x1b[A");
+		assert.ok(picker.render(80).join("\n").includes("→ chat"));
+		picker.handleInput("\x1b[B");
+		picker.handleInput("\r");
+	};
+	await state.command();
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0][1], state.chosen);
+});
+
+test("TUI picker resets selection to the first search result", async () => {
+	const { state, ctx } = setup();
+	ctx.mode = "tui";
+	state.interact = (picker) => {
+		picker.handleInput("\x1b[B");
+		assert.ok(picker.render(80).join("\n").includes("→ chat"));
+		picker.handleInput("test");
+		assert.ok(picker.render(80).join("\n").includes("→ chosen"));
+		picker.handleInput("\r");
+	};
+	await state.command();
+	assert.equal(calls[0][1], state.chosen);
+});
+
+test("TUI picker cancels without compaction or config changes", async () => {
+	const { state, ctx } = setup();
+	ctx.mode = "tui";
+	state.setGlobal();
+	const before = readFileSync(configPath, "utf8");
+	state.interact = (picker) => { picker.handleInput("chosen"); picker.handleInput("\x1b"); };
+	await state.command();
+	assert.equal(state.compactCount, 0);
+	assert.equal(readFileSync(configPath, "utf8"), before);
+	state.interact = (picker) => picker.handleInput("\r");
+	await state.command();
+	assert.equal(calls[0][1], state.chosen);
+	assert.equal(readFileSync(configPath, "utf8"), before);
+});
+
+test("global picker retains its Off option and search", async () => {
+	const { state, ctx } = setup();
+	ctx.mode = "tui";
+	state.setGlobal();
+	state.interact = (picker) => {
+		assert.ok(picker.render(80).join("\n").includes("→ Off"));
+		picker.handleInput("\r");
+	};
+	await state.command("compaction-model", "pick off");
+	assert.throws(() => readFileSync(configPath), { code: "ENOENT" });
+	assert.equal(state.compactCount, 0);
 });
 
 test("does not wrap or inspect the provider stream", async () => {
