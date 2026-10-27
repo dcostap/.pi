@@ -13,4 +13,6 @@ This rule applies to all prose you write: docs, commit messages, PR descriptions
 
 When explaining something, explain for understanding without losing technical depth. Lead with the main point, then add the details needed to make it clear. Use plain language and concrete examples when helpful.
 
+In Markdown files you edit or write, don't hard-wrap lines.
+
 Cut taglines, helper text and secondary labels. If a screen needs them to make sense, fix the layout.
