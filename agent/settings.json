@@ -29,10 +29,10 @@
     "openai-codex/gpt-5.6-sol": "high",
     "openai-codex-secondary/gpt-6-sol": "xhigh",
     "openai-codex-secondary/gpt-6-luna": "max",
-    "openai-codex-secondary/gpt-6-astra": "medium",
+    "openai-codex-secondary/gpt-6-astra": "high",
     "openai-codex-secondary/gpt-5.6-sol": "high",
     "openai-codex-secondary/gpt-5.6-luna": "xhigh",
-    "openai-codex/gpt-6-astra": "medium",
+    "openai-codex/gpt-6-astra": "high",
     "deepseek/deepseek-flash": "high"
   },
   "fullscreenCopyOnSelect": false,
