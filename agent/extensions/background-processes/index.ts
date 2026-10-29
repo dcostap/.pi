@@ -185,7 +185,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_bg_status",
 		label: "bash background status",
-		description: "Without waiting, return the status and recent output of one background bash process. Omit id to list the 30 most recent processes without their output.",
+		description: "Without waiting, return the status and recent output of one background bash process. Omit id to list the 30 most recent processes without their output. Finished processes in the list are not reported again.",
 		parameters: StatusParameters,
 		...renderers("bash_bg_status"),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -193,6 +193,8 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 			if (params.id === undefined) {
 				const snapshots = manager?.list() ?? [];
 				const visible = recentListSnapshots(snapshots);
+				// The agent sees which processes finished, so automatic delivery must not report them again.
+				manager?.consume(visible.map((snapshot) => snapshot.id));
 				return {
 					content: [{ type: "text", text: formatList(snapshots) }],
 					details: {

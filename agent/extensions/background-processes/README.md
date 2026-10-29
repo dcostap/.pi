@@ -29,7 +29,7 @@ The transcript does not show the notice. Expand the row to see the full text tha
 ## Tools
 
 - `bash_bg_start` — wait up to two seconds, then return the completion result or the background ID
-- `bash_bg_status` — inspect one background process without waiting. Without `id`, list the 30 most recent processes.
+- `bash_bg_status` — inspect one background process without waiting. Without `id`, list the 30 most recent processes. Finished processes in the list count as seen, so automatic delivery does not report them again.
 - `bash_bg_wait` — wait without polling, at most 8 minutes per call. Steering interrupts only the wait.
 - `bash_bg_kill` — stop through Pi's bash abort behavior
 - `/ps` — responsive TUI dashboard or RPC textual inventory. The dashboard has live status
