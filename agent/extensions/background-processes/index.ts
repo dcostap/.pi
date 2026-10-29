@@ -110,12 +110,7 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 		if (manager) return manager;
 
 		manager = new BackgroundProcessManager(createLocalBashOperations());
-		delivery = new ResultDeliveryCoordinator(manager, {
-			isIdle: () => !shuttingDown && Boolean(latestContext?.isIdle()),
-			send: (message) => {
-				pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
-			},
-		});
+		delivery = new ResultDeliveryCoordinator(manager, pi);
 		managerWidgetSubscription = manager.subscribe((event) => {
 			if (event.kind === "output") scheduleWidgetUpdate();
 			else if (event.kind === "started" || event.kind === "settled" || event.kind === "pruned") {
@@ -342,7 +337,8 @@ export default function backgroundProcessesExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		latestContext = ctx;
-		delivery?.flushWhenIdle();
+		// Retry results only if an earlier send failed.
+		delivery?.flush();
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
