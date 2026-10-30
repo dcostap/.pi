@@ -52,6 +52,10 @@ Output is a merged stdout/stderr stream. Waiting shows a live, auto-truncated ta
 
 If a command finishes during the first two seconds, `bash_bg_start` returns its completion output. It does not send a second completion message. Commands that continue past two seconds still send their completion message later.
 
+Completion messages use steering delivery, not the follow-up queue. A busy agent receives results after its current tool calls, before its next model request. An idle agent wakes to process them. These custom messages do not interrupt active tools or waits.
+
+Results returned by start, detailed status, wait, or completed termination do not send a second completion message. The list view does not consume results.
+
 ## Tests
 
 The installed Pi executable provides its packages virtually, so standalone Bun tests use `test-preload.ts` only to stub the small formatting/TUI exports needed by unit tests.
