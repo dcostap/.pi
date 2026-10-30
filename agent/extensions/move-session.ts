@@ -211,8 +211,11 @@ export default function (pi: ExtensionAPI) {
             "Background processes, subagents, and SSH connections of this session stop.",
         promptSnippet: "Move this session to another directory, such as a git worktree",
         promptGuidelines: [
-            "Use move_session to work in another directory, such as a git worktree. A shell `cd` does not move the session.",
-            "Call move_session alone. Pi ends your turn and continues the session in the target directory.",
+            "When you choose another directory as your task workspace, call move_session before editing or testing there.",
+            "After creating a task worktree, your next tool call must be move_session with that worktree's path.",
+            "Do not substitute shell cd, absolute paths, or tool working-directory options for moving the session.",
+            "Call move_session alone. Pi continues the task automatically after the move; no user reply is needed.",
+            "You may read reference files or use existing build tools outside the task workspace without moving.",
         ],
         parameters: Type.Object({
             path: Type.String({
