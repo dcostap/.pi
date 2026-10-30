@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -62,39 +62,6 @@ export function stripMarkdown(text: string): string {
 		.trim();
 }
 
-export function listTree(root: string, maxEntries = 120, depth = 2, prefix = ""): string[] {
-	if (depth < 0) return [];
-	const out: string[] = [];
-	for (const name of readdirSync(root).sort()) {
-		if (name === ".git" || name === "node_modules") continue;
-		const full = join(root, name);
-		let isDir = false;
-		try {
-			isDir = statSync(full).isDirectory();
-		} catch {
-			continue;
-		}
-		out.push(`${prefix}${name}${isDir ? "/" : ""}`);
-		if (out.length >= maxEntries) break;
-		if (isDir && depth > 0) {
-			for (const child of listTree(full, maxEntries - out.length, depth - 1, `${prefix}${name}/`)) {
-				out.push(child);
-				if (out.length >= maxEntries) break;
-			}
-		}
-		if (out.length >= maxEntries) break;
-	}
-	return out;
-}
-
-export function readMaybe(path: string): string | undefined {
-	try {
-		return readFileSync(path, "utf8");
-	} catch {
-		return undefined;
-	}
-}
-
 export function tempFile(name: string): string {
 	return join(tmpdir(), name);
 }
@@ -112,7 +79,5 @@ export default {
 	truncate,
 	preview,
 	stripMarkdown,
-	listTree,
-	readMaybe,
 	tempFile,
 };

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionConfig } from "./config.ts";
 import { readResponseText } from "./response-body.ts";
-import { ensureDir, listTree, readMaybe } from "./utils.ts";
+import { ensureDir } from "./utils.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -147,8 +147,7 @@ export type GitHubResolution = {
 	url: string;
 	owner: string;
 	repo: string;
-	strategy: "github-api" | "github-sparse-checkout";
-	cache: "none" | "managed";
+	strategy: "github-api" | "github-checkout";
 	repoDir?: string;
 	ref?: string;
 	requestedPath?: string;
@@ -160,9 +159,8 @@ export type GitHubResolution = {
 	 * this value contains the actual file text when it is available.
 	 */
 	content: string;
-	contentKind: "api" | "text";
+	contentKind: "api" | "text" | "listing";
 	contentTruncated?: boolean;
-	contentUnavailable?: boolean;
 };
 
 type ParsedGitHubUrl =
@@ -199,7 +197,7 @@ export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
 		const [owner, repo, mode, ...rest] = parts;
 		if (!safeSlug(owner) || !safeSlug(repo) || !safeRest(rest)) return undefined;
 
-		// Only treat exact repository URLs and source URLs as clone-backed GitHub URLs.
+		// Only treat exact repository URLs and source URLs as checkout-backed GitHub URLs.
 		// Other github.com pages should either use a targeted API fetch below or fall
 		// through to the normal page fetcher; otherwise /pull/123, /issues/123, etc.
 		// get incorrectly collapsed to the repository root.
@@ -217,52 +215,16 @@ export function parseGitHubUrl(input: string): ParsedGitHubUrl | undefined {
 	}
 }
 
-async function git(args: string[], cwd?: string, signal?: AbortSignal) {
+async function git(args: string[], cwd?: string, signal?: AbortSignal, trim = true) {
 	const { stdout } = await execFileAsync("git", args, {
 		cwd,
 		windowsHide: true,
-		maxBuffer: 10 * 1024 * 1024,
+		maxBuffer: 64 * 1024 * 1024,
 		signal,
-		 timeout: GITHUB_GIT_TIMEOUT_MS,
-		env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" },
+		timeout: GITHUB_GIT_TIMEOUT_MS,
+		env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never", GIT_LFS_SKIP_SMUDGE: "1" },
 	} as any);
-	return String(stdout).trim();
-}
-
-export function buildPartialCloneArgs(owner: string, repo: string, targetDir: string): string[] {
-	return [
-		"clone",
-		"--depth=1",
-		"--filter=blob:none",
-		"--sparse",
-		"--no-checkout",
-		"--origin",
-		"origin",
-		`https://github.com/${owner}/${repo}.git`,
-		targetDir,
-	];
-}
-
-async function ensureRepo(config: ExtensionConfig, owner: string, repo: string, signal?: AbortSignal, onProgress?: ProgressReporter) {
-	const ownerDir = ensureDir(join(config.githubCacheDir, owner));
-	const repoDir = join(ownerDir, repo);
-	if (!existsSync(join(repoDir, ".git"))) {
-		const tempDir = join(ownerDir, `${repo}.tmp-${process.pid}-${Date.now()}`);
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(tempDir, { recursive: true, force: true });
-		try {
-			await withProgress(onProgress, `Creating shallow sparse cache for ${owner}/${repo} (5 minute timeout)...`, () =>
-				git(buildPartialCloneArgs(owner, repo, tempDir), undefined, signal),
-			);
-			await rename(tempDir, repoDir);
-		} catch (error) {
-			await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-			throw error;
-		}
-	} else {
-		await cleanupStaleGitIndexLock(repoDir);
-	}
-	return repoDir;
+	return trim ? String(stdout).trim() : String(stdout);
 }
 
 async function getRemoteRefs(owner: string, repo: string, signal?: AbortSignal): Promise<{ defaultRef: string; refs: Set<string> }> {
@@ -287,8 +249,8 @@ async function getRemoteDefaultRef(owner: string, repo: string, signal?: AbortSi
 	return raw.match(/^ref:\s+refs\/heads\/(.+?)\s+HEAD$/m)?.[1] || "main";
 }
 
-async function resolveRemoteRefAndPath(owner: string, repo: string, mode: "root" | "tree" | "blob" | "raw", rest: string[], signal?: AbortSignal) {
-	if (mode === "root") return { ref: await getRemoteDefaultRef(owner, repo, signal), relPath: "" };
+async function resolveRemoteRefAndPath(owner: string, repo: string, mode: "root" | "tree", rest: string[], signal?: AbortSignal) {
+	if (mode === "root" || rest.length === 0) return { ref: await getRemoteDefaultRef(owner, repo, signal), relPath: "" };
 	const remote = await getRemoteRefs(owner, repo, signal);
 	for (let i = rest.length; i >= 1; i--) {
 		const maybeRef = rest.slice(0, i).join("/");
@@ -296,17 +258,164 @@ async function resolveRemoteRefAndPath(owner: string, repo: string, mode: "root"
 			return { ref: maybeRef, relPath: rest.slice(i).join("/") };
 		}
 	}
-	return { ref: rest[0] || remote.defaultRef, relPath: rest.slice(1).join("/") };
+	return { ref: rest[0], relPath: rest.slice(1).join("/") };
 }
 
-async function checkoutSparse(repoDir: string, ref: string, relPath: string, signal?: AbortSignal, onProgress?: ProgressReporter) {
-	await cleanupStaleGitIndexLock(repoDir);
-	await git(["sparse-checkout", "init", "--cone"], repoDir, signal);
-	await git(["sparse-checkout", "set", "--cone", ...(relPath ? [relPath] : [])], repoDir, signal);
-	await withProgress(onProgress, `Fetching ${ref} with depth 1...`, () =>
-		git(["fetch", "--depth=1", "--filter=blob:none", "--prune", "origin", ref], repoDir, signal),
+/** Repositories with more file bytes than this at the requested commit get a sparse checkout. */
+export const FULL_CHECKOUT_MAX_BYTES = 500 * 1024 * 1024;
+/** When GitHub cannot report the size, repositories with more files than this get a sparse checkout. */
+export const FULL_CHECKOUT_MAX_FILES = 20_000;
+const TREE_API_MAX_BYTES = 64 * 1024 * 1024;
+const LISTING_MAX_ENTRIES = 200;
+
+export type TreeEntry = { path: string; type: string };
+
+type Checkout = {
+	dir: string;
+	sha: string;
+	entries: TreeEntry[];
+	fileCount: number;
+	sparse: boolean;
+	/** Why the checkout is sparse. Kept in the checkout's git config. */
+	sparseReason?: string;
+	/** Folders on disk in a sparse checkout, besides the root files. */
+	sparsePaths: string[];
+};
+
+/** Parses `git ls-tree -r -t -z` output. */
+export function parseLsTree(output: string): TreeEntry[] {
+	return output.split("\0").filter(Boolean).map((line) => {
+		const tab = line.indexOf("\t");
+		return { type: line.slice(0, tab).split(" ")[1], path: line.slice(tab + 1) };
+	});
+}
+
+/** Folder name of one ref's checkout. Refs can contain slashes. */
+export function checkoutDirName(ref: string): string {
+	return encodeURIComponent(ref);
+}
+
+/** Lists the entries below `relPath` two levels deep, or one level when that is too long. */
+export function formatListing(entries: TreeEntry[], relPath: string): string[] {
+	const prefix = relPath ? `${relPath}/` : "";
+	const below = entries
+		.filter((entry) => entry.path.startsWith(prefix))
+		.map((entry) => ({ path: entry.path.slice(prefix.length), dir: entry.type !== "blob" }));
+	const depth = (path: string) => path.split("/").length;
+	let shown = below.filter((entry) => depth(entry.path) <= 2);
+	if (shown.length > LISTING_MAX_ENTRIES) shown = below.filter((entry) => depth(entry.path) === 1);
+	const lines = shown.slice(0, LISTING_MAX_ENTRIES).map((entry) => `${entry.path}${entry.dir ? "/" : ""}`);
+	if (shown.length > LISTING_MAX_ENTRIES) lines.push(`[${shown.length - LISTING_MAX_ENTRIES} more entries]`);
+	return lines;
+}
+
+/** Sums file sizes at one commit with the GitHub trees API, without downloading the files. */
+async function measureFileBytes(owner: string, repo: string, sha: string, signal?: AbortSignal): Promise<{ bytes?: number; reason?: string }> {
+	try {
+		const tree: any = await fetchGitHubJson(
+			`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${sha}?recursive=1`,
+			TREE_API_MAX_BYTES,
+			signal,
+		);
+		if (tree?.truncated || !Array.isArray(tree?.tree)) return { reason: "GitHub could not report their size" };
+		return { bytes: tree.tree.reduce((sum: number, entry: any) => sum + (entry?.type === "blob" ? Number(entry.size) || 0 : 0), 0) };
+	} catch (error) {
+		if (signal?.aborted) throw error;
+		return { reason: `the size check failed: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
+function formatMegabytes(bytes: number): string {
+	return `${Math.round(bytes / (1024 * 1024)).toLocaleString("en-US")} MB`;
+}
+
+async function initCheckout(owner: string, repo: string, dir: string, signal?: AbortSignal) {
+	const tempDir = `${dir}.tmp-${process.pid}-${Date.now()}`;
+	await rm(dir, { recursive: true, force: true });
+	await mkdir(tempDir, { recursive: true });
+	try {
+		await git(["init", "--quiet"], tempDir, signal);
+		await git(["remote", "add", "origin", `https://github.com/${owner}/${repo}.git`], tempDir, signal);
+		// A partial clone remote lets git download file contents on demand.
+		await git(["config", "remote.origin.promisor", "true"], tempDir, signal);
+		await git(["config", "remote.origin.partialclonefilter", "blob:none"], tempDir, signal);
+		await git(["config", "core.longpaths", "true"], tempDir, signal);
+		await rename(tempDir, dir);
+	} catch (error) {
+		await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
+/**
+ * Brings the checkout of one ref up to date. A new checkout is full when the
+ * files at that commit are small enough, otherwise sparse. In a sparse
+ * checkout, each requested folder is added and stays on disk.
+ */
+async function ensureCheckout(
+	config: ExtensionConfig,
+	owner: string,
+	repo: string,
+	ref: string,
+	relPath: string,
+	signal?: AbortSignal,
+	onProgress?: ProgressReporter,
+): Promise<Checkout> {
+	const repoRoot = join(config.githubCacheDir, owner, repo);
+	if (existsSync(join(repoRoot, ".git"))) {
+		// Older versions kept one sparse checkout directly in the repository folder.
+		onProgress?.(`Removing the old cache of ${owner}/${repo}...`);
+		await rm(repoRoot, { recursive: true, force: true });
+	}
+	const dir = join(repoRoot, checkoutDirName(ref));
+	if (!existsSync(join(dir, ".git"))) await initCheckout(owner, repo, dir, signal);
+	else await cleanupStaleGitIndexLock(dir);
+
+	await withProgress(onProgress, `Fetching ${owner}/${repo} at ${ref}...`, () =>
+		git(["fetch", "--quiet", "--depth=1", "--filter=blob:none", "origin", ref], dir, signal),
 	);
-	await withProgress(onProgress, `Checking out ${ref} sparsely...`, () => git(["checkout", "--force", "FETCH_HEAD"], repoDir, signal));
+	const sha = await git(["rev-parse", "FETCH_HEAD"], dir, signal);
+	const head = await git(["rev-parse", "--verify", "--quiet", "HEAD"], dir, signal).catch(() => "");
+	const entries = parseLsTree(await git(["ls-tree", "-r", "-t", "-z", sha], dir, signal));
+	const fileCount = entries.filter((entry) => entry.type === "blob").length;
+	const target = relPath ? entries.find((entry) => entry.path === relPath) : undefined;
+	if (relPath && !target) throw new Error(`${relPath} does not exist in ${owner}/${repo} at ${ref}`);
+
+	let sparseReason = await git(["config", "--get", "pi.sparseReason"], dir, signal).catch(() => "");
+	if (!head) {
+		onProgress?.(`Checking the size of ${owner}/${repo}...`);
+		const size = await measureFileBytes(owner, repo, sha, signal);
+		if (size.bytes !== undefined) {
+			sparseReason = size.bytes > FULL_CHECKOUT_MAX_BYTES ? `the files total ${formatMegabytes(size.bytes)}` : "";
+		} else {
+			sparseReason = fileCount > FULL_CHECKOUT_MAX_FILES
+				? `more than ${FULL_CHECKOUT_MAX_FILES.toLocaleString("en-US")} files, and ${size.reason}`
+				: "";
+		}
+		if (sparseReason) {
+			await git(["config", "pi.sparseReason", sparseReason], dir, signal);
+			await git(["sparse-checkout", "set", "--cone"], dir, signal);
+		}
+	}
+	const sparse = Boolean(sparseReason);
+
+	if (head !== sha) {
+		const message = sparse || head
+			? `Checking out ${owner}/${repo} at ${ref}...`
+			: `Downloading ${fileCount.toLocaleString("en-US")} files of ${owner}/${repo}...`;
+		await withProgress(onProgress, message, () => git(["checkout", "--quiet", "--force", "--detach", sha], dir, signal));
+	}
+
+	let sparsePaths: string[] = [];
+	if (sparse) {
+		sparsePaths = (await git(["sparse-checkout", "list"], dir, signal)).split(/\r?\n/).filter(Boolean);
+		const covered = sparsePaths.some((path) => relPath === path || relPath.startsWith(`${path}/`));
+		if (target?.type === "tree" && !covered) {
+			await withProgress(onProgress, `Adding ${relPath} to the checkout...`, () => git(["sparse-checkout", "add", relPath], dir, signal));
+			sparsePaths = (await git(["sparse-checkout", "list"], dir, signal)).split(/\r?\n/).filter(Boolean);
+		}
+	}
+	return { dir, sha, entries, fileCount, sparse, sparseReason: sparseReason || undefined, sparsePaths };
 }
 
 async function fetchGitHubJson(apiPath: string, maxBytes: number, signal?: AbortSignal) {
@@ -338,10 +447,6 @@ async function fetchGitHubJson(apiPath: string, maxBytes: number, signal?: Abort
 	}
 }
 
-function encodeApiPath(path: string): string {
-	return path.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-}
-
 const GITHUB_CONTENT_PREVIEW_CHARS = 20_000;
 
 function limitUtf8Text(text: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -361,145 +466,6 @@ function boundFormattedPayload(text: string, maxBytes: number): { text: string; 
 				truncated: true,
 			}
 		: bounded;
-}
-
-export function decodeGitHubContentsText(contents: any): string {
-	if (typeof contents?.content !== "string") return "";
-	if (contents.encoding === "base64") {
-		try {
-			return Buffer.from(contents.content.replace(/\s+/g, ""), "base64").toString("utf8");
-		} catch {
-			return "";
-		}
-	}
-	return contents.content;
-}
-
-function getGitHubContentsPayload(contents: any, maxBytes: number, preview: string): {
-	content: string;
-	contentKind: "api" | "text";
-	contentTruncated: boolean;
-	contentUnavailable: boolean;
-} {
-	if (Array.isArray(contents)) {
-		return {
-			content: preview,
-			contentKind: "api",
-			contentTruncated: false,
-			contentUnavailable: false,
-		};
-	}
-
-	const decoded = decodeGitHubContentsText(contents);
-	if (!decoded && contents?.type === "file" && Number(contents?.size) !== 0) {
-		return {
-			content: preview,
-			contentKind: "api",
-			contentTruncated: false,
-			contentUnavailable: true,
-		};
-	}
-
-	const bounded = limitUtf8Text(decoded, maxBytes);
-	return {
-		content: bounded.text,
-		contentKind: "text",
-		contentTruncated: bounded.truncated,
-		contentUnavailable: false,
-	};
-}
-
-export function formatGitHubContentsPreview(
-	owner: string,
-	repo: string,
-	ref: string,
-	relPath: string,
-	contents: any,
-): string {
-	if (Array.isArray(contents)) {
-		const entries = contents.slice(0, 140).map((entry: any) => {
-			const type = entry?.type === "dir" ? "dir" : entry?.type || "file";
-			const suffix = type === "dir" ? "/" : "";
-			const size = type === "file" && Number.isFinite(entry?.size) ? ` (${entry.size} bytes)` : "";
-			return `- [${type}] ${entry?.name || "(unnamed)"}${suffix}${size}`;
-		});
-		return [
-			`Directory: ${relPath || "/"}`,
-			`Repository: ${owner}/${repo}`,
-			`Ref: ${ref}`,
-			"Source: GitHub Contents API (no repository clone)",
-			"",
-			...entries,
-			contents.length > entries.length ? `\n[${contents.length - entries.length} additional entries omitted]` : "",
-		].filter(Boolean).join("\n");
-	}
-
-	const decoded = decodeGitHubContentsText(contents);
-	const text = decoded.slice(0, GITHUB_CONTENT_PREVIEW_CHARS);
-	const truncated = decoded.length > text.length;
-	const unavailable = !decoded && contents?.type === "file";
-	return [
-		`File: ${relPath || contents?.name || "/"}`,
-		`Repository: ${owner}/${repo}`,
-		`Ref: ${ref}`,
-		"Source: GitHub Contents API (no repository clone)",
-		Number.isFinite(contents?.size) ? `Size: ${contents.size} bytes` : "",
-		unavailable ? "Content unavailable through the GitHub Contents API; use the raw/download URL or a sparse checkout." : undefined,
-		unavailable && contents?.download_url ? `Download URL: ${contents.download_url}` : undefined,
-		text || undefined,
-		truncated ? `\n[GitHub API file preview truncated at 20,000 characters; decoded content has ${decoded.length} characters]` : undefined,
-	].filter((line) => line !== undefined && line !== "").join("\n");
-}
-
-async function handleGitHubTree(
-	config: ExtensionConfig,
-	parsed: Extract<ParsedGitHubUrl, { mode: "tree" }>,
-	url: string,
-	onProgress?: ProgressReporter,
-	signal?: AbortSignal,
-): Promise<GitHubResolution> {
-	const fetchContents = (ref: string, relPath: string) => fetchGitHubJson(
-		`/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}/contents/${encodeApiPath(relPath)}?ref=${encodeURIComponent(ref)}`,
-		config.maxTextResponseBytes,
-		signal,
-	);
-
-	let resolved = parsed.rest.length > 0
-		? { ref: parsed.rest[0], relPath: parsed.rest.slice(1).join("/") }
-		: { ref: await getRemoteDefaultRef(parsed.owner, parsed.repo, signal), relPath: "" };
-	onProgress?.(`Listing ${resolved.relPath || "/"} through the GitHub Contents API...`);
-	let contents: any;
-	try {
-		contents = await fetchContents(resolved.ref, resolved.relPath);
-	} catch (firstError) {
-		if (signal?.aborted) throw firstError;
-		// The common URL shape has a one-segment ref and needs no git operation.
-		// Only consult remote refs when that API request fails, which preserves
-		// support for branch/tag names containing slashes.
-		onProgress?.(`Resolving a possible slash-containing GitHub ref without cloning...`);
-		const retry = await resolveRemoteRefAndPath(parsed.owner, parsed.repo, parsed.mode, parsed.rest, signal);
-		if (retry.ref === resolved.ref && retry.relPath === resolved.relPath) throw firstError;
-		resolved = retry;
-		onProgress?.(`Retrying ${resolved.relPath || "/"} through the GitHub Contents API at ${resolved.ref}...`);
-		contents = await fetchContents(resolved.ref, resolved.relPath);
-	}
-	const preview = formatGitHubContentsPreview(parsed.owner, parsed.repo, resolved.ref, resolved.relPath, contents);
-	const payload = getGitHubContentsPayload(contents, config.maxTextResponseBytes, preview);
-	return {
-		kind: "github",
-		url,
-		owner: parsed.owner,
-		repo: parsed.repo,
-		strategy: "github-api",
-		cache: "none",
-		ref: resolved.ref,
-		requestedPath: resolved.relPath || undefined,
-		preview,
-		content: payload.content,
-		contentKind: payload.contentKind,
-		contentTruncated: payload.contentTruncated,
-		contentUnavailable: payload.contentUnavailable,
-	};
 }
 
 function formatUser(user: any): string {
@@ -574,7 +540,6 @@ async function handleGitHubCommit(
 		owner: parsed.owner,
 		repo: parsed.repo,
 		strategy: "github-api",
-		cache: "none",
 		ref: commit?.sha || parsed.ref,
 		preview,
 		content: preview,
@@ -623,7 +588,6 @@ async function handleGitHubPullOrIssue(
 			owner: parsed.owner,
 			repo: parsed.repo,
 			strategy: "github-api",
-			cache: "none",
 			preview,
 			content: preview,
 			contentKind: "api",
@@ -661,12 +625,59 @@ async function handleGitHubPullOrIssue(
 		owner: parsed.owner,
 		repo: parsed.repo,
 		strategy: "github-api",
-		cache: "none",
 		preview,
 		content: preview,
 		contentKind: "api",
 		contentTruncated: bounded.truncated,
 	};
+}
+
+export type CheckoutPreviewInput = {
+	owner: string;
+	repo: string;
+	ref: string;
+	sha: string;
+	relPath: string;
+	dir: string;
+	localPath: string;
+	fileCount: number;
+	sparse: boolean;
+	sparseReason?: string;
+	sparsePaths: string[];
+	fileListPath?: string;
+	listing?: string[];
+	fileText?: string;
+};
+
+export function formatCheckoutPreview(input: CheckoutPreviewInput): string {
+	const { owner, repo, ref } = input;
+	const isFile = input.fileText !== undefined;
+	const onDisk = existsSync(input.localPath);
+	const guidance = input.sparse
+		? [
+				`On disk: root files${input.sparsePaths.length ? `, ${input.sparsePaths.join(", ")}` : ""}`,
+				"",
+				"Only some folders of this repository are on disk. Explore them with read, rg and ls in the local checkout.",
+				`To add a folder, call fetch_url with its tree URL, for example https://github.com/${owner}/${repo}/tree/${ref}/<folder>.`,
+				input.fileListPath ? `The file list of the whole repository is in ${input.fileListPath}` : undefined,
+			]
+		: [
+				"",
+				"The whole repository is on disk. Explore it with read, rg and ls in the local checkout.",
+				"Do not call fetch_url for other files or folders of this repository.",
+			];
+	return [
+		`Repository: ${owner}/${repo}`,
+		`Ref: ${ref} (${input.sha.slice(0, 12)})`,
+		`Local checkout: ${input.dir}`,
+		input.relPath ? `${isFile ? "File" : "Path"}: ${input.relPath}` : undefined,
+		input.relPath && onDisk ? `Local path: ${input.localPath}` : undefined,
+		`Checkout: ${input.sparse ? "sparse" : "full"}, ${input.fileCount.toLocaleString("en-US")} files${input.sparseReason ? ` (${input.sparseReason})` : ""}`,
+		...guidance,
+		"",
+		isFile ? "Contents:" : `Listing of ${input.relPath || "/"}:`,
+		...(isFile ? [input.fileText || "(empty file)"] : input.listing || []),
+	].filter((line) => line !== undefined).join("\n");
 }
 
 export async function handleGitHubUrl(config: ExtensionConfig, url: string, onProgress?: ProgressReporter, signal?: AbortSignal): Promise<GitHubResolution> {
@@ -677,88 +688,68 @@ export async function handleGitHubUrl(config: ExtensionConfig, url: string, onPr
 	if (parsed.mode === "raw" || parsed.mode === "blob") {
 		throw new Error("Raw and blob GitHub URLs must be routed through the direct HTTP fetcher");
 	}
-	if (parsed.mode === "tree") {
-		try {
-			return await handleGitHubTree(config, parsed, url, onProgress, signal);
-		} catch (error) {
-			if (signal?.aborted) throw error;
-			const reason = error instanceof Error ? error.message : String(error);
-			onProgress?.(`GitHub Contents API unavailable (${reason}). Falling back to a shallow sparse checkout...`);
+
+	const source = parsed as Extract<ParsedGitHubUrl, { mode: "root" | "tree" }>;
+	const { owner, repo } = source;
+	const { ref, relPath } = await resolveRemoteRefAndPath(owner, repo, source.mode, source.rest, signal);
+	return await withRepoLock(config, owner, repo, onProgress, signal, async () => {
+		const checkout = await ensureCheckout(config, owner, repo, ref, relPath, signal, onProgress);
+		const localPath = relPath ? join(checkout.dir, ...relPath.split("/")) : checkout.dir;
+		const isFile = checkout.entries.some((entry) => entry.path === relPath && entry.type === "blob");
+
+		let fileListPath: string | undefined;
+		if (checkout.sparse) {
+			fileListPath = join(config.githubCacheDir, owner, repo, `${checkoutDirName(ref)}.files.txt`);
+			const files = checkout.entries.filter((entry) => entry.type === "blob").map((entry) => entry.path);
+			await writeFile(fileListPath, `${files.join("\n")}\n`, "utf8");
 		}
-	}
 
-	const sourceUrl = parsed as Extract<ParsedGitHubUrl, { mode: "root" | "tree" }>;
-	const resolved = await resolveRemoteRefAndPath(sourceUrl.owner, sourceUrl.repo, sourceUrl.mode, sourceUrl.rest, signal);
-	return await withRepoLock(config, sourceUrl.owner, sourceUrl.repo, onProgress, signal, async () => {
-		const repoDir = await ensureRepo(config, sourceUrl.owner, sourceUrl.repo, signal, onProgress);
-		await checkoutSparse(repoDir, resolved.ref, resolved.relPath, signal, onProgress);
-
-		const localPath = resolved.relPath ? join(repoDir, resolved.relPath) : repoDir;
-		let preview = "";
 		let content = "";
-		let contentKind: "api" | "text" = "api";
+		let fileText: string | undefined;
 		let contentTruncated = false;
-		let contentUnavailable = false;
-		if (!resolved.relPath) {
-			const entries = listTree(repoDir, 140, 1);
-			preview = [
-				`Repository: ${parsed.owner}/${parsed.repo}`,
-				`Ref: ${resolved.ref}`,
-				`Cache path: ${repoDir}`,
-				"Checkout: shallow, blob-filtered, sparse (top-level files only)",
-				"",
-				...entries,
-				entries.length >= 140 ? "\n[cache listing limited to 140 entries]" : "",
-			].join("\n");
-			content = preview;
-		} else if (existsSync(localPath) && statSync(localPath).isDirectory()) {
-			const entries = listTree(localPath, 140, 2);
-			preview = [
-				`Directory: ${resolved.relPath}`,
-				`Ref: ${resolved.ref}`,
-				`Cache path: ${localPath}`,
-				"",
-				entries.join("\n"),
-				entries.length >= 140 ? "\n[cache listing limited to 140 entries]" : "",
-			].join("\n");
-			content = preview;
-		} else {
-			onProgress?.(`Reading ${resolved.relPath} from ${sourceUrl.owner}/${sourceUrl.repo}...`);
-			const text = readMaybe(localPath) ?? (await git(["show", `${resolved.ref}:${resolved.relPath}`], repoDir, signal).catch(() => ""));
+		if (isFile) {
+			onProgress?.(`Reading ${relPath}...`);
+			// `git show` also works for files outside a sparse checkout.
+			const text = await git(["show", `${checkout.sha}:${relPath}`], checkout.dir, signal, false);
 			const bounded = limitUtf8Text(text, config.maxTextResponseBytes);
-			const displayText = text.slice(0, GITHUB_CONTENT_PREVIEW_CHARS);
-			preview = [
-				`File: ${resolved.relPath}`,
-				`Ref: ${resolved.ref}`,
-				`Cache path: ${localPath}`,
-				"",
-				displayText,
-				displayText.length < text.length
-					? `\n[GitHub sparse file preview truncated at ${GITHUB_CONTENT_PREVIEW_CHARS.toLocaleString()} characters; bounded answer content has ${bounded.text.length.toLocaleString()} characters]`
-					: "",
-			].filter(Boolean).join("\n");
 			content = bounded.text;
-			contentKind = "text";
 			contentTruncated = bounded.truncated;
-			contentUnavailable = !existsSync(localPath) && !text;
+			fileText = text.length > GITHUB_CONTENT_PREVIEW_CHARS
+				? `${text.slice(0, GITHUB_CONTENT_PREVIEW_CHARS)}\n\n[preview truncated at ${GITHUB_CONTENT_PREVIEW_CHARS.toLocaleString("en-US")} characters; read the local file for the rest]`
+				: text;
 		}
+
+		const preview = formatCheckoutPreview({
+			owner,
+			repo,
+			ref,
+			sha: checkout.sha,
+			relPath,
+			dir: checkout.dir,
+			localPath,
+			fileCount: checkout.fileCount,
+			sparse: checkout.sparse,
+			sparseReason: checkout.sparseReason,
+			sparsePaths: checkout.sparsePaths,
+			fileListPath,
+			listing: isFile ? undefined : formatListing(checkout.entries, relPath),
+			fileText,
+		});
 
 		return {
 			kind: "github",
 			url,
-			owner: parsed.owner,
-			repo: parsed.repo,
-			strategy: "github-sparse-checkout",
-			cache: "managed",
-			repoDir,
-			ref: resolved.ref,
-			requestedPath: resolved.relPath || undefined,
+			owner,
+			repo,
+			strategy: "github-checkout",
+			repoDir: checkout.dir,
+			ref,
+			requestedPath: relPath || undefined,
 			localPath,
 			preview,
-			content,
-			contentKind,
+			content: isFile ? content : preview,
+			contentKind: isFile ? "text" : "listing",
 			contentTruncated,
-			contentUnavailable,
 		};
 	});
 }

@@ -14,12 +14,17 @@ Pi extension for:
 - deterministic ordinary-page handling
   - usable extracted content up to the configured threshold is returned directly
   - the fast model is used for focused questions, oversized summaries, and ambiguous quality only
-- GitHub URLs use the cheapest targeted path
+- GitHub repository and `/tree/` URLs put a checkout on disk, so the agent explores it with its own file tools
+  - each ref has its own checkout at `github-cache/<owner>/<repo>/<ref>`, updated with a `--depth=1` fetch on each request
+  - a new checkout is full when the GitHub trees API reports 500 MB of files or less at that commit; when GitHub cannot report the size, it is full for 20,000 files or less
+  - other checkouts are sparse: the root files are on disk, each requested folder is added and stays, and `<ref>.files.txt` lists every file
+  - the listing shows two levels below the requested path, and a `/tree/` URL to a file includes its text
+  - `fetch_url` does not answer a `prompt` for a repository or folder; the agent explores the checkout itself
+  - Git LFS files are not downloaded
+- other GitHub URLs use the cheapest targeted path
   - `raw.githubusercontent.com` files are fetched directly and never wait on a repository cache lock
   - GitHub `/blob/` pages are rewritten to direct raw-file requests
-  - GitHub `/tree/` paths use the Contents API first, with a sparse checkout fallback
   - GitHub commit and pull-request URLs use the API and include the actual patch (with a bounded preview for unusually large diffs)
-  - repository roots use an atomic `--depth=1 --filter=blob:none --sparse` cache
   - Git/API operations and repository-lock waits time out after five minutes
 - weak local extraction escalates automatically
   - Jina Reader first
@@ -33,8 +38,8 @@ Pi extension for:
 - a small adapter registry owns GitHub/YouTube special handling and rewrites supported Apple Developer pages to Sosumi Markdown while preserving the Apple canonical URL; cross-origin rewrites do not forward query values
 - oversized results auto-summarize with:
   - the configured `fastCheap` model role (`/fast-model status`, `/fast-model set provider/model`)
-- if `fetch_url` gets a `prompt`, it answers from the bounded fetched text or listing, including GitHub-special payloads; weak ordinary extraction may escalate to Firecrawl when configured
-- fetch artifacts are saved locally in per-request, atomically unique directories; focused GitHub payloads are available as `content.txt`, while sparse-cache paths are supplemental and may change after another checkout
+- if `fetch_url` gets a `prompt`, it answers from the bounded fetched text, including GitHub files and API payloads; weak ordinary extraction may escalate to Firecrawl when configured
+- fetch artifacts are saved locally in per-request, atomically unique directories; focused GitHub API payloads are available as `content.txt`
 - Firecrawl crawl failures/cancellations are errors, and crawl startup plus polling share one deadline
 - every billable Firecrawl request checks the live team balance first and fails closed if the balance cannot be read
 - Firecrawl search, scrape fallback, and crawl start stop when credits reach the configured minimum reserve

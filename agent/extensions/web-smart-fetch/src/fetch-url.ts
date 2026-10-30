@@ -948,19 +948,21 @@ export async function fetchUrl(
 		let answerQuality: "OK" | "WEAK" | undefined;
 		let answerQualityReason: string | undefined;
 		let answerModel: string | undefined;
-		if (prompt) {
+		// A listing is a poor source for a focused answer. The agent explores the checkout itself.
+		const answerable = gh.contentKind !== "listing";
+		if (prompt && answerable) {
 			onUpdate?.({ content: [{ type: "text", text: "Answering focused question from GitHub payload..." }] });
 			const focused = await processExtractedContentWithSpark(
 				content,
 				ctx,
-				gh.contentUnavailable ? ["github-content-unavailable"] : [],
+				[],
 				signal,
 				prompt,
 				{
 					url: route.canonicalUrl,
 					finalUrl: route.fetchUrl,
 					contentType: gh.contentKind === "text" ? "text/plain" : "application/json",
-					contentKind: gh.contentKind,
+					contentKind: gh.contentKind === "text" ? "text" : "api",
 					method: "github",
 					contentTruncated: gh.contentTruncated,
 					sourcePath: gh.localPath || gh.requestedPath,
@@ -982,12 +984,10 @@ export async function fetchUrl(
 			dedupeKey: route.dedupeKey,
 			adapterId: route.adapterId,
 			strategy: gh.strategy,
-			cache: gh.cache,
 			owner: gh.owner,
 			repo: gh.repo,
 			repoDir: gh.repoDir,
 			localPath: gh.localPath,
-			cachePath: gh.localPath,
 			ref: gh.ref,
 			requestedPath: gh.requestedPath,
 		};
@@ -997,7 +997,6 @@ export async function fetchUrl(
 			contentKind: gh.contentKind,
 			contentChars: content.length,
 			contentTruncated: Boolean(gh.contentTruncated),
-			contentUnavailable: Boolean(gh.contentUnavailable),
 			quality: answerQuality,
 			qualityReason: answerQualityReason,
 			answer,
@@ -1008,14 +1007,19 @@ export async function fetchUrl(
 			files,
 		};
 		saveJson(metadataPath, details);
-		const artifactLines = Object.entries(files).map(([key, value]) => `- ${key}: ${value}`);
+		// The checkout is the source of truth, so per-request artifacts only add noise for the agent.
+		const artifactLines = gh.strategy === "github-checkout"
+			? []
+			: ["\nArtifacts:", ...Object.entries(files).map(([key, value]) => `- ${key}: ${value}`)];
 		const output = [
 			gh.preview,
 			answer ? `\nAnswer:\n\n${answer}` : undefined,
-			prompt && !answer
-				? `\nNote:\n\nFocused answer unavailable; ${gh.contentUnavailable ? "the GitHub API did not provide the file body, so inspect the download URL or " : "inspect "}the bounded payload artifact at ${files.content}.`
+			prompt && !answerable
+				? "\nNote:\n\nfetch_url does not answer questions about a repository or folder. Explore the local checkout to answer the question."
 				: undefined,
-			"\nArtifacts:",
+			prompt && answerable && !answer
+				? `\nNote:\n\nFocused answer unavailable; ${gh.strategy === "github-checkout" ? `read the local file at ${gh.localPath}` : `inspect the bounded payload artifact at ${files.content}`}.`
+				: undefined,
 			...artifactLines,
 		].filter(Boolean).join("\n");
 		return {

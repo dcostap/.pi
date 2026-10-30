@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { handleGitHubUrl, buildPartialCloneArgs, decodeGitHubContentsText, formatGitHubCommitPreview, formatGitHubContentsPreview, GITHUB_GIT_TIMEOUT_MS, parseGitHubUrl } from "./github.ts";
+import { checkoutDirName, formatCheckoutPreview, formatGitHubCommitPreview, formatListing, GITHUB_GIT_TIMEOUT_MS, parseGitHubUrl, parseLsTree } from "./github.ts";
 import { normalizeUrl, resolveUrl, sanitizeUrlCandidate, thirdPartyFallbackBlockReason, urlDedupeKey } from "./url-routing.ts";
 
 test("sanitizes Markdown wrappers and unbalanced punctuation", () => {
@@ -69,25 +69,6 @@ test("routes GitHub raw files directly without the repository cache", () => {
 	assert.equal(blob.fetchUrl, "https://raw.githubusercontent.com/google/fonts/main/ofl/silkscreen/OFL.txt");
 });
 
-test("uses a five-minute shallow, blob-filtered, sparse GitHub clone", () => {
-	const args = buildPartialCloneArgs("google", "fonts", "C:/cache/fonts.tmp");
-	assert.equal(GITHUB_GIT_TIMEOUT_MS, 300_000);
-	assert.ok(args.includes("--depth=1"));
-	assert.ok(args.includes("--filter=blob:none"));
-	assert.ok(args.includes("--sparse"));
-	assert.ok(args.includes("--no-checkout"));
-});
-
-test("formats GitHub directory listings without claiming a local checkout", () => {
-	const preview = formatGitHubContentsPreview("google", "fonts", "main", "ofl/silkscreen", [
-		{ type: "file", name: "Silkscreen-Regular.ttf", size: 1234 },
-		{ type: "dir", name: "docs", size: 0 },
-	]);
-	assert.match(preview, /GitHub Contents API \(no repository clone\)/);
-	assert.match(preview, /Silkscreen-Regular\.ttf/);
-	assert.doesNotMatch(preview, /Local path:/);
-});
-
 test("formats GitHub commits with metadata and the actual patch", () => {
 	const preview = formatGitHubCommitPreview("owner", "repo", {
 		sha: "abcdef1234567",
@@ -107,55 +88,86 @@ test("formats GitHub commits with metadata and the actual patch", () => {
 	assert.match(preview, /@@ -1 \+1 @@\n-old\n\+new/);
 });
 
-test("labels truncated or unavailable GitHub API file content", () => {
-	const longText = "x".repeat(20_100);
-	const truncated = formatGitHubContentsPreview("owner", "repo", "main", "large.txt", {
-		type: "file",
-		size: longText.length,
-		encoding: "base64",
-		content: Buffer.from(longText).toString("base64"),
-	});
-	assert.match(truncated, /preview truncated at 20,000 characters/);
-
-	const unavailable = formatGitHubContentsPreview("owner", "repo", "main", "huge.bin", {
-		type: "file",
-		size: 2_000_000,
-		download_url: "https://raw.githubusercontent.com/owner/repo/main/huge.bin",
-	});
-	assert.match(unavailable, /Content unavailable/);
-	assert.match(unavailable, /Download URL:/);
+test("parses git ls-tree output, including paths with spaces and tabs", () => {
+	const output = [
+		"040000 tree aaa\tapps",
+		"100644 blob bbb\tapps/my file.ts",
+		"100644 blob ccc\ta\tb.txt",
+		"160000 commit ddd\tvendor",
+		"",
+	].join("\0");
+	assert.deepEqual(parseLsTree(output), [
+		{ type: "tree", path: "apps" },
+		{ type: "blob", path: "apps/my file.ts" },
+		{ type: "blob", path: "a\tb.txt" },
+		{ type: "commit", path: "vendor" },
+	]);
 });
 
-test("decodes GitHub API file content for focused answers", () => {
-	const source = "module intellij.platform.editor";
-	const contents = {
-		type: "file",
-		encoding: "base64",
-		content: Buffer.from(source).toString("base64"),
-	};
-	assert.equal(decodeGitHubContentsText(contents), source);
-	assert.equal(decodeGitHubContentsText({ type: "file", content: source }), source);
+test("names one checkout folder per ref, also for refs with slashes", () => {
+	assert.equal(checkoutDirName("main"), "main");
+	assert.equal(checkoutDirName("release/1.0"), "release%2F1.0");
 });
 
-test("returns decoded GitHub tree file text separately from its preview", async () => {
-	const source = "intellij.platform.editor\nintellij.platform.core\n";
-	const originalFetch = globalThis.fetch;
-	globalThis.fetch = async () => new Response(JSON.stringify({
-		type: "file",
-		name: "module.iml",
-		size: Buffer.byteLength(source),
-		encoding: "base64",
-		content: Buffer.from(source).toString("base64"),
-	}), { status: 200, headers: { "content-type": "application/json" } });
+test("lists two levels below a path, or one level when two are too many", () => {
+	const entries = [
+		{ type: "tree", path: "apps" },
+		{ type: "tree", path: "apps/server" },
+		{ type: "blob", path: "apps/server/index.ts" },
+		{ type: "blob", path: "package.json" },
+	];
+	assert.deepEqual(formatListing(entries, ""), ["apps/", "apps/server/", "package.json"]);
+	assert.deepEqual(formatListing(entries, "apps"), ["server/", "server/index.ts"]);
 
-	try {
-		const result = await handleGitHubUrl({ maxTextResponseBytes: 1024 } as any, "https://github.com/owner/repo/tree/main/module.iml");
-		assert.equal(result.content, source);
-		assert.equal(result.contentKind, "text");
-		assert.equal(result.contentTruncated, false);
-		assert.match(result.preview, /File: module\.iml/);
-		assert.match(result.preview, /Source: GitHub Contents API/);
-	} finally {
-		globalThis.fetch = originalFetch;
-	}
+	const wide = Array.from({ length: 150 }, (_, i) => [
+		{ type: "tree", path: `d${i}` },
+		{ type: "blob", path: `d${i}/f.ts` },
+	]).flat();
+	const listing = formatListing(wide, "");
+	assert.equal(listing.length, 150);
+	assert.ok(listing.every((line) => !line.includes("/f.ts")));
+});
+
+test("tells the agent to explore a full checkout locally", () => {
+	const preview = formatCheckoutPreview({
+		owner: "owner",
+		repo: "repo",
+		ref: "main",
+		sha: "0123456789abcdef",
+		relPath: "",
+		dir: "C:/cache/owner/repo/main",
+		localPath: "C:/cache/owner/repo/main",
+		fileCount: 1234,
+		sparse: false,
+		sparsePaths: [],
+		listing: ["apps/", "package.json"],
+	});
+	assert.match(preview, /Local checkout: C:\/cache\/owner\/repo\/main/);
+	assert.match(preview, /Checkout: full, 1,234 files/);
+	assert.match(preview, /whole repository is on disk/);
+	assert.match(preview, /Listing of \/:\napps\/\npackage\.json/);
+	assert.doesNotMatch(preview, /\n\n\n/);
+});
+
+test("tells the agent how to add folders to a sparse checkout", () => {
+	const preview = formatCheckoutPreview({
+		owner: "owner",
+		repo: "repo",
+		ref: "main",
+		sha: "0123456789abcdef",
+		relPath: "apps/server",
+		dir: "C:/cache/owner/repo/main",
+		localPath: "C:/cache/owner/repo/main/apps/server",
+		fileCount: 90000,
+		sparse: true,
+		sparseReason: "the files total 2,000 MB",
+		sparsePaths: ["apps/server"],
+		fileListPath: "C:/cache/owner/repo/main.files.txt",
+		listing: ["index.ts"],
+	});
+	assert.match(preview, /Path: apps\/server/);
+	assert.match(preview, /Checkout: sparse, 90,000 files \(the files total 2,000 MB\)/);
+	assert.match(preview, /On disk: root files, apps\/server/);
+	assert.match(preview, /https:\/\/github\.com\/owner\/repo\/tree\/main\/<folder>/);
+	assert.match(preview, /main\.files\.txt/);
 });

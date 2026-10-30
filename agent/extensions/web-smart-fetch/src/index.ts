@@ -72,35 +72,13 @@ function renderToolOutputBlock(output: string, expanded: boolean, theme: any, ma
 	return text;
 }
 
-function githubPayloadKind(output: string, strategy?: string): { label: string; note: string } {
-	const firstLine = output.trimStart().split(/\r?\n/, 1)[0] || "";
-	const fromApi = strategy === "github-api";
-	if (firstLine.startsWith("File: ")) {
-		return {
-			label: "file contents preview",
-			note: fromApi
-				? "The agent received file metadata plus a bounded preview from the GitHub API; focused answers use the bounded decoded file artifact."
-				: "The agent received the file header plus bounded file text from a shared sparse cache; a stable per-request content artifact is also saved.",
-		};
+function githubPayloadKind(details: any): { label: string; note: string } {
+	if (details.strategy !== "github-checkout") {
+		return { label: "GitHub API data", note: "The agent received the data shown below from the GitHub API." };
 	}
-	if (firstLine.startsWith("Directory: ")) {
-		return {
-			label: "directory listing",
-			note: fromApi
-				? "The agent received this folder listing from the GitHub API without cloning the repository."
-				: "The agent received a listing of this folder from the sparse cached checkout, not every file's contents.",
-		};
-	}
-	if (firstLine.startsWith("Repository: ")) {
-		return {
-			label: "repository metadata/path",
-			note: "The agent received repository metadata and a bounded listing; any shared cache path may change on a later sparse checkout.",
-		};
-	}
-	return {
-		label: "GitHub preview",
-		note: "The agent received the preview shown below.",
-	};
+	return details.contentKind === "text"
+		? { label: "file from local checkout", note: "The agent received the file text and the local checkout path." }
+		: { label: "local checkout", note: "The agent received the local checkout path and a listing. It explores the files with its own tools." };
 }
 
 function renderGitHubInjectedBlock(output: string, expanded: boolean, theme: any): string {
@@ -167,19 +145,18 @@ export default function (pi: ExtensionAPI) {
 		name: "fetch_url",
 		label: "Fetch URL",
 		description:
-			"Fetch one specific URL with local extraction first, focused-question answering from the fetched payload, direct GitHub raw/blob fetching, GitHub API tree inspection, sparse repository caching, and remote fallback when needed. Oversized pages are summarized and stable artifacts are saved locally.",
-		promptSnippet: "Fetch a specific URL/page/PDF, answer a focused question about it, inspect a GitHub path without cloning, or sparsely cache an external GitHub repository root.",
+			"Fetch one specific URL with local extraction first, focused-question answering from the fetched payload, direct GitHub raw/blob fetching, local checkouts for GitHub repository and tree URLs, and remote fallback when needed. Oversized pages are summarized and stable artifacts are saved locally.",
+		promptSnippet: "Fetch a specific URL/page/PDF, answer a focused question about it, or put an external GitHub repository on disk to explore it locally.",
 		promptGuidelines: [
 			"Use fetch_url when the user gives a specific URL or asks to inspect one exact page.",
 			"When several URLs are worth fetching, batch 2-4 independent fetch_url calls in parallel; don't fetch whole result lists by default.",
-			"Use fetch_url instead of git clone for external GitHub repos you only need to inspect; raw files are fetched directly, tree paths use the GitHub API, and repository roots use a shallow sparse cache.",
-			"When asking a focused question, fetch_url passes the bounded fetched text or listing to the answer model; a local/cache path is supplemental, not the answer payload.",
-			"For exact large GitHub file contents, prefer a blob/raw URL when available; tree URLs are optimized for directory inspection and bounded previews.",
-			"If the user asks you to clone a GitHub repo into the workspace so they can modify it, use normal git/workspace commands instead.",
+			"To explore an external GitHub repository, fetch its root or tree URL once. fetch_url puts a checkout on disk and returns its path. Then use read, rg and ls in that folder, not more fetch_url calls.",
+			"fetch_url does not answer a prompt for a GitHub repository or tree URL. Explore the checkout yourself. To read one GitHub file without a checkout, fetch its blob or raw URL.",
+			"Do not edit files in a fetch_url checkout. If the user wants to modify a GitHub repo, clone it into the workspace with git.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "The URL to fetch" }),
-			prompt: Type.Optional(Type.String({ description: "Optional focused question about the fetched payload. For GitHub paths, the answer model receives the bounded file text or listing, while stable artifacts remain available locally." })),
+			prompt: Type.Optional(Type.String({ description: "Optional focused question about the fetched page or file. Not used for GitHub repository or tree URLs." })),
 		}),
 		renderCall(args, theme, context) {
 			const label = theme.fg("toolTitle", theme.bold("fetch_url"));
@@ -199,10 +176,10 @@ export default function (pi: ExtensionAPI) {
 			if (d.method) text += ` ${theme.fg("muted", d.method)}`;
 			if (d.method === "github") {
 				const output = textOutput(result);
-				const payload = githubPayloadKind(output, d.strategy);
+				const payload = githubPayloadKind(d);
 				if (d.owner && d.repo) text += `\n${theme.fg("success", "Repository:")} ${theme.fg("accent", `${d.owner}/${d.repo}`)}`;
 				if (d.ref) text += `\n${theme.fg("success", "Ref:")} ${theme.fg("dim", String(d.ref))}`;
-				if (d.localPath) text += `\n${theme.fg("success", "Cache path:")} ${linkFile(theme.fg("dim", String(d.localPath)), String(d.localPath), context.cwd)}`;
+				if (d.localPath) text += `\n${theme.fg("success", "Local path:")} ${linkFile(theme.fg("dim", String(d.localPath)), String(d.localPath), context.cwd)}`;
 				if (d.requestedPath) text += `\n${theme.fg("success", "Requested path:")} ${theme.fg("dim", String(d.requestedPath))}`;
 				text += `\n${theme.fg("success", "Payload:")} ${theme.fg("accent", payload.label)}`;
 				text += `\n${theme.fg("muted", payload.note)}`;
