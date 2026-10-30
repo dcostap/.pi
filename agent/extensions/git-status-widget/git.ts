@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { basename } from "node:path";
+import { getLinkedWorktree } from "../_shared/git-worktree.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
@@ -182,23 +182,6 @@ async function getTrackedLineStats(
 		added: unstaged.added + staged.added,
 		removed: unstaged.removed + staged.removed,
 	};
-}
-
-function normalizePath(path: string) {
-	const forward = path.replace(/\\/g, "/").replace(/\/+$/, "");
-	return process.platform === "win32" ? forward.toLowerCase() : forward;
-}
-
-// A linked worktree has its own Git folder. The main checkout's Git folder is the common folder.
-async function getLinkedWorktree(cwd: string, execute: GitRunner, signal: AbortSignal | undefined) {
-	const output = await execute(
-		["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"],
-		cwd,
-		signal,
-	).catch(() => "");
-	const [gitDir, commonDir, topLevel] = output.trim().split(/\r?\n/);
-	if (!gitDir || !commonDir || !topLevel) return undefined;
-	return normalizePath(gitDir) === normalizePath(commonDir) ? undefined : basename(topLevel);
 }
 
 export async function collectGitSnapshot(cwd: string, options: CollectOptions = {}): Promise<GitSnapshot> {

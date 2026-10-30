@@ -6,19 +6,26 @@
  * can show the built-in indeterminate progress ring. On completion, it clears progress
  * and emits BEL so Windows Terminal can show its native bell notification (depending on
  * the user's bellStyle settings).
+ *
+ * In a linked Git worktree, the title starts with "wt:<worktree folder>".
  */
 
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getLinkedWorktree } from "./_shared/git-worktree.ts";
+import { runGit } from "./git-status-widget/git.ts";
 
 const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const OSC = "\x1b]";
 const BEL = "\x07";
 
-function getBaseTitle(pi: ExtensionAPI, activeCwd: string): string {
+function buildTitle(pi: ExtensionAPI, activeCwd: string, worktree: string | undefined, status = ""): string {
 	const cwd = path.basename(activeCwd);
 	const session = pi.getSessionName();
-	return session ? `π - ${session} - ${cwd}` : `π - ${cwd}`;
+	// The worktree prefix already names the folder, so the title does not repeat it.
+	const place = worktree === cwd ? [] : [cwd];
+	const title = ["π", ...(session ? [session] : []), ...place].join(" - ");
+	return [...(worktree ? [`wt:${worktree}`] : []), ...(status ? [status] : []), title].join(" ");
 }
 
 function isWindowsTerminal(): boolean {
@@ -60,6 +67,25 @@ export default function (pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let frameIndex = 0;
 	let startedAt = 0;
+	// Worktree names by directory. A pending lookup reads as no worktree.
+	const worktrees = new Map<string, string | undefined>();
+
+	function worktreeFor(ctx: ExtensionContext) {
+		const cwd = ctx.cwd;
+		if (worktrees.has(cwd)) return worktrees.get(cwd);
+		worktrees.set(cwd, undefined);
+		void getLinkedWorktree(cwd, runGit).then((worktree) => {
+			worktrees.set(cwd, worktree);
+			// A running animation picks up the name on its next frame.
+			if (!worktree || timer || ctx.cwd !== cwd) return;
+			try {
+				ctx.ui.setTitle(buildTitle(pi, cwd, worktree));
+			} catch {
+				// Session replacement can stale a context before the lookup ends.
+			}
+		});
+		return undefined;
+	}
 
 	function stopAnimation(ctx: ExtensionContext, notifyDone = false) {
 		if (timer) {
@@ -68,7 +94,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		frameIndex = 0;
 		startedAt = 0;
-		ctx.ui.setTitle(getBaseTitle(pi, ctx.cwd));
+		ctx.ui.setTitle(buildTitle(pi, ctx.cwd, worktreeFor(ctx)));
 		clearWindowsTerminalProgress();
 		if (notifyDone) ringWindowsTerminalBell();
 	}
@@ -80,14 +106,14 @@ export default function (pi: ExtensionAPI) {
 		timer = setInterval(() => {
 			const frame = BRAILLE_FRAMES[frameIndex % BRAILLE_FRAMES.length];
 			const elapsed = formatElapsed(Date.now() - startedAt);
-			const cwd = path.basename(ctx.cwd);
-			const session = pi.getSessionName();
-			const prefix = `${frame} ${elapsed}`;
-			const title = session ? `${prefix} π - ${session} - ${cwd}` : `${prefix} π - ${cwd}`;
-			ctx.ui.setTitle(title);
+			ctx.ui.setTitle(buildTitle(pi, ctx.cwd, worktreeFor(ctx), `${frame} ${elapsed}`));
 			frameIndex++;
 		}, 80);
 	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		ctx.ui.setTitle(buildTitle(pi, ctx.cwd, worktreeFor(ctx)));
+	});
 
 	pi.on("agent_start", async (_event, ctx) => {
 		startAnimation(ctx);
