@@ -9,6 +9,7 @@ export const MAX_FALLBACK_DELAY_MS = 60_000;
 const GRAY = "\x1b[90m";
 const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
+const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
 
 type TimerHandle = ReturnType<typeof setTimeout>;
@@ -39,7 +40,8 @@ function countLabel(count: number, label: string) {
 }
 
 export function formatSnapshot(snapshot: GitSnapshot) {
-	const parts = [`${GRAY} ${snapshot.branch}`];
+	const worktree = snapshot.worktree ? `${YELLOW}worktree ${snapshot.worktree} ` : "";
+	const parts = [`${worktree}${GRAY} ${snapshot.branch}`];
 	if (snapshot.conflictedCount > 0) parts.push(countLabel(snapshot.conflictedCount, "conflict"));
 	if (snapshot.stagedCount > 0) parts.push(`${snapshot.stagedCount} staged`);
 	parts.push(`${snapshot.unstagedCount} unstaged ${snapshot.unstagedCount === 1 ? "file" : "files"}`);

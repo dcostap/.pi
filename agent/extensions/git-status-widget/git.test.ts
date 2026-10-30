@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	collectGitSnapshot,
 	parseNumstat,
@@ -69,17 +73,33 @@ describe("numstat parsing", () => {
 });
 
 describe("snapshot collection", () => {
-	test("runs only status for a clean worktree", async () => {
+	test("does not diff a clean worktree", async () => {
 		const calls: string[][] = [];
 		const fakeRunGit: GitRunner = async (args) => {
 			calls.push([...args]);
-			return "# branch.oid 0123456789abcdef\0# branch.head main\0";
+			return args[0] === "status" ? "# branch.oid 0123456789abcdef\0# branch.head main\0" : "";
 		};
 
 		const snapshot = await collectGitSnapshot("C:/repo", { runGit: fakeRunGit });
 		expect(snapshot).toMatchObject({ branch: "main", added: 0, removed: 0, lineStatsComplete: true });
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.[0]).toBe("status");
+		expect(calls.some((args) => args[0] === "diff")).toBe(false);
+	});
+
+	test("names a linked worktree but not the main checkout", async () => {
+		const root = mkdtempSync(join(tmpdir(), "git-status-widget-"));
+		try {
+			const main = join(root, "main");
+			const linked = join(root, "task-tree");
+			const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
+			git("init", "-q", "-b", "main", main);
+			git("-C", main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+			git("-C", main, "worktree", "add", "-q", "-b", "task", linked);
+
+			expect((await collectGitSnapshot(main)).worktree).toBeUndefined();
+			expect(await collectGitSnapshot(join(linked))).toMatchObject({ worktree: "task-tree", branch: "task" });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("combines staged and unstaged line activity and marks untracked lines approximate", async () => {
@@ -96,7 +116,7 @@ describe("snapshot collection", () => {
 
 		const snapshot = await collectGitSnapshot("C:/repo", { runGit: fakeRunGit });
 		expect(snapshot).toMatchObject({ added: 7, removed: 3, lineStatsComplete: false });
-		expect(calls).toHaveLength(3);
+		expect(calls.filter((args) => args[0] === "diff")).toHaveLength(2);
 		expect(calls).toContainEqual(["diff", "--numstat", "--"]);
 		expect(calls).toContainEqual(["diff", "--cached", "--numstat", "--"]);
 	});
@@ -120,7 +140,7 @@ describe("snapshot collection", () => {
 
 		const snapshot = await collectGitSnapshot("C:/repo", { runGit: fakeRunGit });
 		expect(snapshot).toMatchObject({ added: 3, removed: 1 });
-		expect(calls.slice(1)).toEqual([
+		expect(calls.filter((args) => args[0] === "diff")).toEqual([
 			["diff", "--numstat", "--"],
 			["diff", "--cached", "--numstat", "--"],
 		]);

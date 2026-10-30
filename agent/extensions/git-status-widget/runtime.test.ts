@@ -25,6 +25,7 @@ function snapshot(overrides: Partial<GitSnapshot> = {}): GitSnapshot {
 		added: 0,
 		removed: 0,
 		lineStatsComplete: true,
+		worktree: undefined,
 		durationMs: 100,
 		...overrides,
 	};
@@ -104,6 +105,13 @@ describe("widget formatting", () => {
 		expect(text).toContain("2 staged");
 		expect(text).not.toContain("stageds");
 		expect(text).toContain("2 conflicts");
+	});
+
+	test("leads with the worktree name only inside a linked worktree", () => {
+		const linked = formatSnapshot(snapshot({ worktree: "anvil-wt-dialogs", branch: "ui/dialogs" }));
+		expect(linked).toContain("worktree anvil-wt-dialogs");
+		expect(linked.indexOf("worktree anvil-wt-dialogs")).toBeLessThan(linked.indexOf("ui/dialogs"));
+		expect(formatSnapshot(snapshot())).not.toContain("worktree");
 	});
 });
 

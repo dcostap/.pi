@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { basename } from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
@@ -24,6 +25,8 @@ export type GitSnapshot = ParsedGitStatus & {
 	added: number;
 	removed: number;
 	lineStatsComplete: boolean;
+	// The folder name of a linked worktree. Undefined in the main checkout.
+	worktree: string | undefined;
 	durationMs: number;
 };
 
@@ -181,14 +184,34 @@ async function getTrackedLineStats(
 	};
 }
 
+function normalizePath(path: string) {
+	const forward = path.replace(/\\/g, "/").replace(/\/+$/, "");
+	return process.platform === "win32" ? forward.toLowerCase() : forward;
+}
+
+// A linked worktree has its own Git folder. The main checkout's Git folder is the common folder.
+async function getLinkedWorktree(cwd: string, execute: GitRunner, signal: AbortSignal | undefined) {
+	const output = await execute(
+		["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"],
+		cwd,
+		signal,
+	).catch(() => "");
+	const [gitDir, commonDir, topLevel] = output.trim().split(/\r?\n/);
+	if (!gitDir || !commonDir || !topLevel) return undefined;
+	return normalizePath(gitDir) === normalizePath(commonDir) ? undefined : basename(topLevel);
+}
+
 export async function collectGitSnapshot(cwd: string, options: CollectOptions = {}): Promise<GitSnapshot> {
 	const startedAt = performance.now();
 	const execute = options.runGit ?? runGit;
-	const statusOutput = await execute(
-		["status", "--porcelain=v2", "-z", "--branch", "--no-ahead-behind", "--untracked-files=normal"],
-		cwd,
-		options.signal,
-	);
+	const [statusOutput, worktree] = await Promise.all([
+		execute(
+			["status", "--porcelain=v2", "-z", "--branch", "--no-ahead-behind", "--untracked-files=normal"],
+			cwd,
+			options.signal,
+		),
+		getLinkedWorktree(cwd, execute, options.signal),
+	]);
 	const status = parseStatusPorcelainV2(statusOutput);
 
 	let added = 0;
@@ -204,6 +227,7 @@ export async function collectGitSnapshot(cwd: string, options: CollectOptions = 
 		added,
 		removed,
 		lineStatsComplete: status.untrackedCount === 0,
+		worktree,
 		durationMs: performance.now() - startedAt,
 	};
 }
