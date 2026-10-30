@@ -16,3 +16,9 @@ When explaining something, explain for understanding without losing technical de
 In Markdown files you edit or write, don't hard-wrap lines.
 
 Cut taglines, helper text and secondary labels. If a screen needs them to make sense, fix the layout.
+
+Work in the main checkout. Use a Git worktree only when the user asks for one.
+
+Other agents can work in the same checkout. Changes that you did not make in other files are normal. Leave them alone and commit only your files. Stop and tell the user when another agent's work blocks you: a file that you must edit has changes that you did not make, a file changes while you work, or a build or test fails in code that you did not change. Suggest a worktree for this task.
+
+In a worktree, merge with `git merge --ff-only` after the checks pass. If master moved, rebase, check again and retry. Then remove the worktree and its branch. Never stash or discard changes that you did not make.
