@@ -124,20 +124,6 @@ describe("BackgroundProcessManager", () => {
 		expect(manager.getDeferred()).toEqual([]);
 	});
 
-	test("consume skips delivery of settled processes and leaves running ones alone", async () => {
-		const operations = new FakeOperations();
-		const manager = new BackgroundProcessManager(operations);
-		manager.start("a", "A", ".");
-		manager.start("b", "B", ".");
-		operations.complete("a", 1);
-		await tick();
-		manager.consume(["bg-1", "bg-2"]);
-		expect(manager.getDeferred()).toEqual([]);
-		operations.complete("b");
-		await tick();
-		expect(manager.getDeferred().map((entry) => entry.id)).toEqual(["bg-2"]);
-	});
-
 	test("wait returns all requested settlements and consumes delivery", async () => {
 		const operations = new FakeOperations();
 		const manager = new BackgroundProcessManager(operations);

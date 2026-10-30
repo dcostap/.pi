@@ -280,11 +280,6 @@ export class BackgroundProcessManager {
 		return snapshot;
 	}
 
-	/** Marks settled processes as seen, so that automatic delivery skips them. Running processes are unchanged. */
-	consume(ids: string[]): void {
-		this.consumeEntries(ids.flatMap((id) => this.entries.get(id) ?? []));
-	}
-
 	validateIds(ids: string[]): string[] {
 		const unique = [...new Set(ids)];
 		for (const id of unique) this.requireEntry(id);
