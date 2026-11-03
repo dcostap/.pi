@@ -1,4 +1,4 @@
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // Pi keeps no public hook for code blocks. Wrap the private `renderToken` of Markdown to add a
 // label to each fence line, and add `handleMouse` to copy the block's source on a click.
@@ -11,6 +11,8 @@ const RESULT_MS = 1500;
 interface Token {
 	type: string;
 	text?: string;
+	tokens?: Token[];
+	items?: { tokens: Token[] }[];
 }
 
 interface MouseEvent {
@@ -28,6 +30,7 @@ interface MouseResult {
 interface MarkdownLike {
 	theme: { link: (text: string) => string };
 	cachedLines?: string[];
+	cachedTokens?: WeakRef<{ tokens: Token[] }>;
 	renderToken(token: Token, width: number, nextTokenType?: string, styleContext?: unknown): string[];
 	render(width: number): string[];
 	invalidate(): void;
@@ -45,6 +48,7 @@ interface Button {
 interface RenderState {
 	buttons: Button[];
 	results: Map<number, string>;
+	lines: string[];
 }
 
 const PATCH = Symbol.for("pi.code-block-copy-button");
@@ -73,50 +77,59 @@ export function installCodeBlockCopyButton(
 	const states = new WeakMap<object, RenderState>();
 	const timers = new Set<ReturnType<typeof setTimeout>>();
 	let active = true;
-	let pending: string[] | undefined;
 
 	function stateOf(markdown: object): RenderState {
 		let state = states.get(markdown);
-		if (!state) states.set(markdown, state = { buttons: [], results: new Map() });
+		if (!state) states.set(markdown, state = { buttons: [], results: new Map(), lines: [] });
 		return state;
 	}
 
 	function renderToken(this: MarkdownLike, token: Token, ...rest: [number, string?, unknown?]): string[] {
 		const lines = originalRenderToken.call(this, token, ...rest);
-		if (!active || !pending || token.type !== "code" || typeof token.text !== "string" || lines.length === 0) {
+		if (!active || token.type !== "code" || typeof token.text !== "string" || lines.length === 0) {
 			return lines;
 		}
-		const label = states.get(this)?.results.get(pending.length) ?? COPY_LABEL;
-		pending.push(token.text);
-		lines[0] += `  ${this.theme.link(label)}`;
+		// Keep cached blocks independent of their position and click result.
+		lines[0] += `  ${this.theme.link(COPY_LABEL)}`;
 		return lines;
+	}
+
+	function codeTexts(tokens: Token[]): string[] {
+		return tokens.flatMap((token) => {
+			if (token.type === "code" && typeof token.text === "string") return [token.text];
+			if (token.type === "list") return (token.items ?? []).flatMap((item) => codeTexts(item.tokens));
+			if (token.type === "blockquote") return codeTexts(token.tokens ?? []);
+			return [];
+		});
 	}
 
 	function render(this: MarkdownLike, width: number): string[] {
 		if (!active) return originalRender.call(this, width);
 		const cached = this.cachedLines;
-		const outer = pending;
-		pending = [];
-		try {
-			const lines = originalRender.call(this, width);
-			// A cache hit does not render tokens again, so keep the buttons from the last real render.
-			if (lines === cached && states.has(this)) return lines;
-			const texts = pending;
-			const found: Button[] = [];
-			lines.forEach((line, row) => {
-				const matched = FENCE_LABEL.exec(stripTerminalSequences(line));
-				if (!matched) return;
-				const plain = stripTerminalSequences(line).trimEnd();
-				const start = visibleWidth(plain.slice(0, plain.length - matched[1].length));
-				found.push({ text: "", index: found.length, row, start, end: start + visibleWidth(matched[1]) });
-			});
-			// Labels and blocks are in the same order. If the counts differ, a code line fooled the match.
-			if (found.length === texts.length) found.forEach((button, index) => { button.text = texts[index]; });
-			stateOf(this).buttons = found.length === texts.length ? found : [];
-			return lines;
-		} finally {
-			pending = outer;
-		}
+		const baseLines = originalRender.call(this, width);
+		const previous = states.get(this);
+		if (baseLines === cached && previous) return previous.lines;
+		// Pi can reuse some blocks without calling renderToken. Read all sources from its parsed tokens.
+		const texts = codeTexts(this.cachedTokens?.deref()?.tokens ?? []);
+		const state = stateOf(this);
+		const lines = baseLines.slice();
+		const found: Button[] = [];
+		lines.forEach((line, row) => {
+			const matched = FENCE_LABEL.exec(stripTerminalSequences(line));
+			if (!matched) return;
+			const plain = stripTerminalSequences(line).trimEnd();
+			const start = visibleWidth(plain.slice(0, plain.length - matched[1].length));
+			const index = found.length;
+			const label = state.results.get(index) ?? COPY_LABEL;
+			found.push({ text: "", index, row, start, end: start + visibleWidth(label) });
+			// Do not change Pi's cached lines, which can also belong to another identical block.
+			lines[row] = truncateToWidth(line.replace(COPY_LABEL, label), width, "");
+		});
+		// Labels and blocks are in the same order. If the counts differ, a code line fooled the match.
+		if (found.length === texts.length) found.forEach((button, index) => { button.text = texts[index]; });
+		state.buttons = found.length === texts.length ? found : [];
+		state.lines = lines;
+		return lines;
 	}
 
 	function showResult(markdown: MarkdownLike, index: number, label: string): void {

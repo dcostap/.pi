@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Markdown, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { Markdown, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { COPIED_LABEL, COPY_LABEL, FAILED_LABEL, installCodeBlockCopyButton } from "./code-block-copy-button.ts";
 
 const identity = (text: string) => text;
@@ -69,6 +69,7 @@ describe("code block copy button", () => {
 		const text = () => markdown.render(40).map((line) => stripTerminalSequences(line));
 		expect(text().filter((line) => line.includes(COPIED_LABEL))).toHaveLength(1);
 		expect(text().filter((line) => line.includes(COPY_LABEL))).toHaveLength(1);
+		expect(markdown.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
 		expect(copies.renders.count).toBeGreaterThan(0);
 		await Bun.sleep(1700);
 		expect(text().some((line) => line.includes(COPIED_LABEL))).toBe(false);
@@ -101,6 +102,49 @@ describe("code block copy button", () => {
 		const first = labelPosition(markdown.render(40), 0);
 		click(markdown, first.x, first.row);
 		expect(copies).toHaveLength(1);
+	});
+
+	test("streamed updates keep reused blocks clickable", async () => {
+		const copies = install();
+		const markdown = new Markdown("```ts\nfirst()\n```\n\nAfter", 1, 0, theme as any);
+		markdown.render(40);
+		markdown.setText("```ts\nfirst()\n```\n\nAfter streaming\n\n```\nsecond\n```");
+		markdown.render(40);
+		markdown.setText("```ts\nfirst()\n```\n\nAfter streaming\n\n```\nsecond\n```\n\nDone");
+		const lines = markdown.render(40);
+		for (let index = 0; index < 2; index++) {
+			const position = labelPosition(lines, index);
+			expect(click(markdown, position.x, position.row)).toEqual({ handled: true });
+		}
+		await Bun.sleep(20);
+		expect(copies).toEqual(["first()", "second"]);
+		expect(markdown.render(40).filter((line) => stripTerminalSequences(line).includes(COPIED_LABEL))).toHaveLength(2);
+	});
+
+	test("identical blocks keep separate click targets and feedback", async () => {
+		const copies = install();
+		const markdown = new Markdown("```\nsame\n```\n\n```\nsame\n```\n\nAfter", 1, 0, theme as any);
+		const second = labelPosition(markdown.render(40), 1);
+		expect(click(markdown, second.x, second.row)).toEqual({ handled: true });
+		await Bun.sleep(20);
+		const lines = markdown.render(40);
+		expect(copies).toEqual(["same"]);
+		expect(lines.filter((line) => stripTerminalSequences(line).includes(COPIED_LABEL))).toHaveLength(1);
+		expect(lines.filter((line) => stripTerminalSequences(line).includes(COPY_LABEL))).toHaveLength(1);
+	});
+
+	test("streamed updates keep code in quotes and lists clickable", () => {
+		const copies = install();
+		const nested = "> ```\n> quoted\n> ```\n\n- item\n\n  ```\n  listed\n  ```\n\nAfter";
+		const markdown = new Markdown(nested, 1, 0, theme as any);
+		markdown.render(40);
+		markdown.setText(`${nested} streaming`);
+		const lines = markdown.render(40);
+		for (let index = 0; index < 2; index++) {
+			const position = labelPosition(lines, index);
+			expect(click(markdown, position.x, position.row)).toEqual({ handled: true });
+		}
+		expect(copies).toEqual(["quoted", "listed"]);
 	});
 
 	test("restore removes the label and the click handler", () => {
