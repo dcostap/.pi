@@ -6,7 +6,7 @@ const identity = (text: string) => text;
 const theme = {
 	heading: identity, link: identity, linkUrl: identity, code: identity, codeBlock: identity,
 	codeBlockBorder: identity, quote: identity, quoteBorder: identity, hr: identity, listBullet: identity,
-	bold: identity, italic: identity, strikethrough: identity, underline: identity,
+	bold: identity, italic: identity, strikethrough: identity, underline: (text: string) => `\x1b[4m${text}\x1b[24m`,
 };
 
 const restores: Array<() => void> = [];
@@ -14,13 +14,14 @@ afterEach(() => {
 	for (const restore of restores.splice(0).reverse()) restore();
 });
 
-function install(copy?: (text: string) => Promise<void>) {
+function install(copy?: (text: string) => Promise<void>, tui?: unknown) {
 	const copies: string[] = [];
 	const renders = { count: 0 };
 	const restore = installCodeBlockCopyButton(
 		Markdown,
 		copy ?? (async (text) => { copies.push(text); }),
 		() => { renders.count++; },
+		tui,
 	);
 	expect(restore).toBeDefined();
 	restores.push(restore!);
@@ -58,6 +59,75 @@ describe("code block copy button", () => {
 		expect(click(markdown, first.x + 1, first.row)).toEqual({ handled: true });
 		expect(click(markdown, second.x, second.row)).toEqual({ handled: true });
 		expect(copies).toEqual([`${longLine}\n  /XD .git`, "second block"]);
+	});
+
+	test("hover underlines only its label and clears when the pointer leaves", () => {
+		const copies = install();
+		const markdown = new Markdown(source, 1, 0, theme as any);
+		const first = labelPosition(markdown.render(40), 0);
+		const second = labelPosition(markdown.render(40), 1);
+		const underlined = `\x1b[4m${COPY_LABEL}\x1b[24m`;
+		expect(click(markdown, first.x, first.row, "move", "none")).toEqual({ handled: true, render: false });
+		expect(markdown.render(40)[first.row]).toContain(underlined);
+		expect(markdown.render(40)[second.row]).not.toContain(underlined);
+		const renders = copies.renders.count;
+		click(markdown, first.x + 1, first.row, "move", "none");
+		expect(copies.renders.count).toBe(renders);
+		click(markdown, second.x, second.row, "move", "none");
+		expect(markdown.render(40)[first.row]).not.toContain(underlined);
+		expect(markdown.render(40)[second.row]).toContain(underlined);
+		expect(markdown.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
+		click(markdown, 0, second.row, "move", "none");
+		expect(markdown.render(40).some((line) => line.includes(underlined))).toBe(false);
+		expect(copies).toEqual([]);
+	});
+
+	test("moving into another Markdown clears the previous hover", () => {
+		install();
+		const first = new Markdown(source, 1, 0, theme as any);
+		const second = new Markdown(source, 1, 0, theme as any);
+		const position = labelPosition(first.render(40), 0);
+		second.render(40);
+		click(first, position.x, position.row, "move", "none");
+		click(second, position.x, position.row, "move", "none");
+		expect(first.render(40)[position.row]).not.toContain(`\x1b[4m${COPY_LABEL}`);
+		expect(second.render(40)[position.row]).toContain(`\x1b[4m${COPY_LABEL}`);
+	});
+
+	test("fullscreen input clears hover outside Markdown, on scroll, and on focus loss", () => {
+		let dispatch = () => {};
+		const originalInput = () => { dispatch(); return { consume: true }; };
+		const tui = Object.create({ handleViewportInput: originalInput });
+		install(undefined, tui);
+		const markdown = new Markdown(source, 1, 0, theme as any);
+		const position = labelPosition(markdown.render(40), 0);
+		for (const data of ["outside", "wheel", "\x1b[O"]) {
+			dispatch = () => { click(markdown, position.x, position.row, "move", "none"); };
+			expect(tui.handleViewportInput("move")).toEqual({ consume: true });
+			expect(markdown.render(40)[position.row]).toContain(`\x1b[4m${COPY_LABEL}`);
+			dispatch = data === "wheel"
+				? () => { click(markdown, position.x, position.row, "wheel", "none"); }
+				: () => {};
+			tui.handleViewportInput(data);
+			expect(markdown.render(40)[position.row]).not.toContain(`\x1b[4m${COPY_LABEL}`);
+		}
+		restores.pop()!();
+		expect(Object.hasOwn(tui, "handleViewportInput")).toBe(false);
+		expect(tui.handleViewportInput).toBe(originalInput);
+	});
+
+	test("click feedback replaces the hovered label until its timer ends", async () => {
+		const copies = install();
+		const markdown = new Markdown(source, 1, 0, theme as any);
+		const first = labelPosition(markdown.render(40), 0);
+		click(markdown, first.x, first.row, "move", "none");
+		click(markdown, first.x, first.row);
+		await Bun.sleep(20);
+		expect(copies).toEqual([`${longLine}\n  /XD .git`]);
+		expect(markdown.render(40)[first.row]).toContain(COPIED_LABEL);
+		expect(markdown.render(40)[first.row]).not.toContain("\x1b[4m");
+		await Bun.sleep(1700);
+		expect(markdown.render(40)[first.row]).toContain(`\x1b[4m${COPY_LABEL}`);
 	});
 
 	test("the label shows the result of a click, then goes back", async () => {

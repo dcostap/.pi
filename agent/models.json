@@ -3,7 +3,17 @@
     "deepseek": {
       "modelOverrides": {
         "deepseek-flash": {
-          "contextWindow": 300000
+          "contextWindow": 300000,
+          "inputLimits": {
+            "images": {
+              "resize": {
+                "maxWidth": 1024,
+                "maxHeight": 1024,
+                "maxBytes": 400000,
+                "jpegQuality": 80
+              }
+            }
+          }
         }
       }
     }

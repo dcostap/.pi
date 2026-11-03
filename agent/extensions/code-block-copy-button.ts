@@ -12,10 +12,10 @@ export default function codeBlockCopyButton(pi: ExtensionAPI) {
 		// Only a widget factory receives the TUI. The widget draws nothing.
 		ctx.ui.setWidget(WIDGET_KEY, (tui) => {
 			requestRender = () => tui.requestRender();
+			restore?.();
+			restore = installCodeBlockCopyButton(Markdown, copyToClipboard, () => requestRender(), tui);
 			return { render: () => [], invalidate() {} };
 		});
-		restore?.();
-		restore = installCodeBlockCopyButton(Markdown, copyToClipboard, () => requestRender());
 		if (!restore) ctx.ui.notify("Code block copy button is not compatible with this Pi version.", "warning");
 	});
 	pi.on("session_shutdown", () => {

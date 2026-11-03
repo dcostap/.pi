@@ -28,7 +28,7 @@ interface MouseResult {
 }
 
 interface MarkdownLike {
-	theme: { link: (text: string) => string };
+	theme: { link: (text: string) => string; underline: (text: string) => string };
 	cachedLines?: string[];
 	cachedTokens?: WeakRef<{ tokens: Token[] }>;
 	renderToken(token: Token, width: number, nextTokenType?: string, styleContext?: unknown): string[];
@@ -59,6 +59,7 @@ export function installCodeBlockCopyButton(
 	markdown: unknown,
 	copy: (text: string) => void | Promise<void>,
 	requestRender: () => void,
+	tui?: unknown,
 ): (() => void) | undefined {
 	const prototype = (markdown as { prototype?: MarkdownLike } | undefined)?.prototype;
 	if (!prototype || typeof prototype.renderToken !== "function" || typeof prototype.render !== "function"
@@ -76,7 +77,31 @@ export function installCodeBlockCopyButton(
 	const mouseDescriptor = Object.getOwnPropertyDescriptor(prototype, "handleMouse");
 	const states = new WeakMap<object, RenderState>();
 	const timers = new Set<ReturnType<typeof setTimeout>>();
+	const inputHost = tui as { handleViewportInput?: (data: string) => unknown } | undefined;
+	const originalInput = inputHost?.handleViewportInput;
+	const inputDescriptor = inputHost && Object.getOwnPropertyDescriptor(inputHost, "handleViewportInput");
+	let hovered: { markdown: MarkdownLike; index: number } | undefined;
+	let hoverSeen = false;
 	let active = true;
+
+	function setHover(markdown?: MarkdownLike, index?: number): void {
+		if (hovered?.markdown === markdown && hovered?.index === index) return;
+		hovered?.markdown.invalidate();
+		hovered = markdown && index !== undefined ? { markdown, index } : undefined;
+		markdown?.invalidate();
+		requestRender();
+	}
+
+	// Pi sends no leave event. Clear hover when input leaves the Markdown component,
+	// scrolls the transcript, or removes terminal focus. Keep this private hook guarded.
+	function handleViewportInput(this: unknown, data: string): unknown {
+		hoverSeen = false;
+		try {
+			return originalInput!.call(this, data);
+		} finally {
+			if (!hoverSeen) setHover();
+		}
+	}
 
 	function stateOf(markdown: object): RenderState {
 		let state = states.get(markdown);
@@ -122,8 +147,10 @@ export function installCodeBlockCopyButton(
 			const index = found.length;
 			const label = state.results.get(index) ?? COPY_LABEL;
 			found.push({ text: "", index, row, start, end: start + visibleWidth(label) });
+			const styledLabel = label === COPY_LABEL && hovered?.markdown === this && hovered.index === index
+				? this.theme.underline(label) : label;
 			// Do not change Pi's cached lines, which can also belong to another identical block.
-			lines[row] = truncateToWidth(line.replace(COPY_LABEL, label), width, "");
+			lines[row] = truncateToWidth(line.replace(COPY_LABEL, styledLabel), width, "");
 		});
 		// Labels and blocks are in the same order. If the counts differ, a code line fooled the match.
 		if (found.length === texts.length) found.forEach((button, index) => { button.text = texts[index]; });
@@ -149,9 +176,16 @@ export function installCodeBlockCopyButton(
 	}
 
 	function handleMouse(this: MarkdownLike, event: MouseEvent): MouseResult | undefined {
-		if (!active || event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
+		if (!active) return undefined;
 		const hit = states.get(this)?.buttons.find((button) =>
 			button.row === event.y && event.x >= button.start - 1 && event.x <= button.end);
+		if (event.type === "move") {
+			hoverSeen = true;
+			setHover(hit ? this : undefined, hit?.index);
+			return hit ? { handled: true, render: false } : undefined;
+		}
+		if (hit && event.type !== "wheel" && hovered?.markdown === this && hovered.index === hit.index) hoverSeen = true;
+		if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
 		if (!hit) return undefined;
 		// The press is handled too, so Pi does not start a text selection.
 		if (event.type === "click") {
@@ -164,6 +198,7 @@ export function installCodeBlockCopyButton(
 	}
 
 	function restore(): void {
+		setHover();
 		active = false;
 		for (const timer of timers) clearTimeout(timer);
 		timers.clear();
@@ -175,12 +210,17 @@ export function installCodeBlockCopyButton(
 		put("render", renderDescriptor, prototype.render, render);
 		put("renderToken", tokenDescriptor, prototype.renderToken, renderToken);
 		put("handleMouse", mouseDescriptor, prototype.handleMouse, handleMouse);
+		if (inputHost?.handleViewportInput === handleViewportInput) {
+			if (inputDescriptor) Object.defineProperty(inputHost, "handleViewportInput", inputDescriptor);
+			else delete inputHost.handleViewportInput;
+		}
 		if (properties[PATCH] === restore) delete properties[PATCH];
 	}
 
 	prototype.renderToken = renderToken as MarkdownLike["renderToken"];
 	prototype.render = render;
 	prototype.handleMouse = handleMouse;
+	if (inputHost && typeof originalInput === "function") inputHost.handleViewportInput = handleViewportInput;
 	properties[PATCH] = restore;
 	return restore;
 }
