@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.4.0",
+  "lastChangelogVersion": "1.5.0",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-6.1-sol",
   "packages": [
@@ -36,5 +36,8 @@
     "deepseek/deepseek-flash": "high"
   },
   "fullscreenCopyOnSelect": false,
-  "fullscreenWheelScrollLines": 6
+  "fullscreenWheelScrollLines": 6,
+  "extensionChangelogVersions": {
+    "{\"source\":\"git:github.com/dcostap/pi-claude-bridge\",\"scope\":\"user\"}": "0.9.3"
+  }
 }
