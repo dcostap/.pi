@@ -144,7 +144,7 @@ export function getModelRoleReasoningEffort(resolved: ResolvedModelRole): string
 export function getModelRoleRequestOptions(
 	resolved: ResolvedModelRole,
 	options: { maxTokensCap?: number } = {},
-): { maxTokens?: number; reasoningEffort?: string } {
+): { maxTokens?: number; reasoningEffort?: string; cacheRetention?: "none" } {
 	const maxTokens = typeof resolved.config.maxTokens === "number"
 		? Math.min(resolved.config.maxTokens, options.maxTokensCap ?? resolved.config.maxTokens)
 		: options.maxTokensCap;
@@ -152,6 +152,8 @@ export function getModelRoleRequestOptions(
 	return {
 		...(maxTokens ? { maxTokens } : {}),
 		...(reasoningEffort ? { reasoningEffort } : {}),
+		// Claude Bridge needs isolated requests for these separate prompts.
+		...(resolved.model.provider === "claude-bridge" ? { cacheRetention: "none" as const } : {}),
 	};
 }
 
