@@ -29,7 +29,6 @@ const WIDGET = "fold-steps";
 /** Expanded folds, keyed by the first step: its chat child and its index in that child (-1 for the child). */
 const expanded = new WeakMap<Component, Set<number>>();
 let plans = new WeakMap<Box, Plan>();
-let showAll = false;
 // Fold lines are rebuilt on each render. Keep hover on the same step, not the temporary line.
 let hovered: Piece | undefined;
 let hoverSeen = false;
@@ -162,7 +161,7 @@ function planTurn(tui: Tui, theme: Theme, chat: Box, turn: Component[]): void {
 
 function renderChat(tui: Tui, theme: Theme, chat: Box, width: number): string[] {
 	plans = new WeakMap();
-	if (!showAll && tui.mode === "fullscreen") {
+	if (tui.mode === "fullscreen") {
 		let turn: Component[] | undefined;
 		for (const child of chat.children) {
 			if (child instanceof UserMessageComponent || child instanceof SkillInvocationMessageComponent) {
@@ -232,12 +231,4 @@ export default function foldSteps(pi: ExtensionAPI) {
 		restore = undefined;
 	});
 
-	pi.registerShortcut("alt+o", {
-		description: "Show or hide folded steps in all turns",
-		handler: () => {
-			showAll = !showAll;
-			hovered = undefined;
-			current?.requestRender();
-		},
-	});
 }

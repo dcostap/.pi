@@ -167,8 +167,8 @@ test("viewport input clears hover outside summaries, on scroll, and on focus los
 	expect(tui.handleViewportInput).toBe(originalInput);
 });
 
-test("hover stays within narrow widths and clears when all steps are shown", () => {
-	const { chat, tui, shortcuts } = setup();
+test("hover stays within narrow widths", () => {
+	const { chat, tui } = setup();
 	finishedTurn(chat, tui);
 	const row = lines(chat).findIndex((line) => line.includes("▸ 3 steps"));
 	mouse(chat, row);
@@ -177,10 +177,6 @@ test("hover stays within narrow widths and clears when all steps are shown", () 
 		const summaries = chat.render(width).filter((line) => line.includes("\x1b[4m"));
 		expect(summaries.every((line) => visibleWidth(line) <= width)).toBe(true);
 	}
-	shortcuts["alt+o"]!();
-	lines(chat);
-	shortcuts["alt+o"]!();
-	expect(chat.render(60)[row]).not.toContain("\x1b[4m");
 });
 
 test("keeps cancelled, failed, and running turns open", () => {
@@ -221,12 +217,10 @@ test("older finished turns fold while the newest turn runs", () => {
 	expect(text).toContain("contents of z.ts");
 });
 
-test("alt+o shows all steps, regular mode never folds, shutdown restores", () => {
+test("no folding shortcuts remain, regular mode never folds, shutdown restores", () => {
 	const { chat, tui, shortcuts, handlers } = setup();
 	finishedTurn(chat, tui);
-	shortcuts["alt+o"]!();
-	expect(lines(chat).join("\n")).toContain("contents of a.ts");
-	shortcuts["alt+o"]!();
+	expect(shortcuts).toEqual({});
 	expect(lines(chat).join("\n")).not.toContain("contents of a.ts");
 	tui.mode = "regular";
 	expect(lines(chat).join("\n")).toContain("contents of a.ts");
