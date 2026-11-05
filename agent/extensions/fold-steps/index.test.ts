@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { Container, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, ScrollView, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, initTheme,
 } from "@earendil-works/pi-coding-agent";
@@ -21,6 +21,13 @@ function setup(mode = "fullscreen", input = (_data: string): unknown => undefine
 	const tui = Object.assign(Object.create({ handleViewportInput: input }), {
 		children: [document], mode, renders: 0, requestRender() { this.renders++; },
 	});
+	const viewport = new ScrollView(document, { follow: "end", primary: true });
+	Object.defineProperty(tui, "isFollowingOutput", { get: () => viewport.isFollowingEnd });
+	const renderViewport = () => {
+		const lines = viewport.render(60).map((line) => stripTerminalSequences(line).trimEnd());
+		viewport.updateLayout(lines.length, 24, () => tui.requestRender());
+		return lines;
+	};
 	const handlers: Record<string, Function> = {};
 	const shortcuts: Record<string, Function> = {};
 	const notes: string[] = [];
@@ -39,7 +46,7 @@ function setup(mode = "fullscreen", input = (_data: string): unknown => undefine
 		},
 	});
 	cleanups.push(() => handlers.session_shutdown!());
-	return { chat, tui, shortcuts, notes, handlers };
+	return { chat, tui, shortcuts, notes, handlers, viewport, renderViewport };
 }
 
 function user(chat: Container, text: string) {
@@ -49,6 +56,7 @@ function assistant(chat: Container, content: unknown[], stopReason: string, stre
 	const component = new AssistantMessageComponent(undefined, false, getMarkdownTheme());
 	component.updateContent({ role: "assistant", content, stopReason } as never, streaming);
 	chat.addChild(component);
+	return component;
 }
 function tool(chat: Container, tui: unknown, id: string, path: string) {
 	const component = new ToolExecutionComponent("read", id, { path }, {}, undefined, tui as never, "C:/x");
@@ -77,6 +85,91 @@ function finishedTurn(chat: Container, tui: unknown) {
 		{ type: "text", text: "Fixed. The token expired early." },
 	], "stop");
 }
+
+function longRunningTurn(chat: Container, tui: unknown) {
+	user(chat, "synthetic task");
+	for (let i = 0; i < 30; i++) tool(chat, tui, `pending-${i}`, `pending-${i}.txt`);
+	const message = [{ type: "text", text: "Synthetic final answer." }];
+	const answer = assistant(chat, message, "stop", true);
+	return () => answer.updateContent({ role: "assistant", content: message, stopReason: "stop" } as never, false);
+}
+
+function history(chat: Container) {
+	chat.addChild({
+		render: () => Array.from({ length: 100 }, (_, i) => `Earlier history row ${i}`),
+		invalidate() {},
+	});
+}
+
+test("defers new folds while scrolled up, then folds on return to the bottom", () => {
+	const { chat, tui, viewport, renderViewport } = setup();
+	history(chat);
+	const finish = longRunningTurn(chat, tui);
+	renderViewport();
+	viewport.scrollBy(-10);
+	const before = renderViewport();
+	const top = viewport.scrollTop;
+	expect(viewport.isFollowingEnd).toBe(false);
+
+	finish();
+	for (let i = 0; i < 3; i++) {
+		const after = renderViewport();
+		expect(after).toEqual(before);
+		expect(viewport.scrollTop).toBe(top);
+		expect(viewport.isFollowingEnd).toBe(false);
+	}
+
+	viewport.scrollToEnd();
+	const folded = renderViewport();
+	expect(folded.join("\n")).toContain("▸ 30 steps");
+	expect(folded.join("\n")).not.toContain("contents of pending-0.txt");
+	expect(viewport.scrollTop).toBe(folded.length - viewport.viewportHeight);
+	expect(viewport.isFollowingEnd).toBe(true);
+
+	viewport.scrollBy(-10);
+	expect(renderViewport()).toEqual(folded);
+	const row = folded.findIndex((line) => line.includes("▸ 30 steps"));
+	click(chat, row);
+	expect(renderViewport().join("\n")).toContain("contents of pending-0.txt");
+	click(chat, row);
+	expect(renderViewport()).toEqual(folded);
+});
+
+test("keeps existing folds while several new turns wait for the bottom", () => {
+	const { chat, tui, viewport, renderViewport } = setup();
+	history(chat);
+	finishedTurn(chat, tui);
+	renderViewport();
+	viewport.scrollTo(20);
+	for (let i = 0; i < 2; i++) {
+		const finish = longRunningTurn(chat, tui);
+		renderViewport();
+		finish();
+		const output = renderViewport().join("\n");
+		expect(output).not.toContain("contents of a.ts");
+		expect(output).toContain("contents of pending-0.txt");
+		expect(viewport.scrollTop).toBe(20);
+		expect(viewport.isFollowingEnd).toBe(false);
+	}
+	viewport.scrollToEnd();
+	const folded = renderViewport();
+	expect(folded.filter((line) => line.includes("▸ 30 steps"))).toHaveLength(2);
+	expect(folded.join("\n")).not.toContain("contents of pending-0.txt");
+});
+
+test("folds immediately when the viewport follows output", () => {
+	const { chat, tui, viewport, renderViewport } = setup();
+	history(chat);
+	const finish = longRunningTurn(chat, tui);
+	const before = renderViewport();
+	expect(viewport.isFollowingEnd).toBe(true);
+	finish();
+	const after = renderViewport();
+	expect(after.length).toBeLessThan(before.length);
+	expect(after.join("\n")).toContain("▸ 30 steps");
+	expect(viewport.scrollTop).toBe(after.length - viewport.viewportHeight);
+	expect(viewport.isFollowingEnd).toBe(true);
+});
 
 test("folds steps between texts of a finished turn and toggles on click", () => {
 	const { chat, tui, notes } = setup();

@@ -18,7 +18,13 @@ type Assistant = AssistantMessageComponent & {
 	outputPad: number;
 	lastMessage?: { stopReason?: string; content: { type: string; text?: string }[] };
 };
-type Tui = { children: Component[]; mode?: string; requestRender(): void; handleViewportInput?(data: string): unknown };
+type Tui = {
+	children: Component[];
+	mode?: string;
+	readonly isFollowingOutput?: boolean;
+	requestRender(): void;
+	handleViewportInput?(data: string): unknown;
+};
 type Plan = { hidden: Set<Component>; folds: Map<Component, FoldLine> };
 type Piece = { component: Component; box: Box; owner: Component; index: number };
 type Kind = "step" | "glue" | "other";
@@ -29,6 +35,8 @@ const WIDGET = "fold-steps";
 /** Expanded folds, keyed by the first step: its chat child and its index in that child (-1 for the child). */
 const expanded = new WeakMap<Component, Set<number>>();
 let plans = new WeakMap<Box, Plan>();
+// Keep existing folds when the user scrolls up. Admit new folds only at the bottom.
+let foldable = new WeakSet<Assistant>();
 // Fold lines are rebuilt on each render. Keep hover on the same step, not the temporary line.
 let hovered: Piece | undefined;
 let hoverSeen = false;
@@ -135,6 +143,8 @@ function pieces(turn: Component[], chat: Box): (Piece & { kind: Kind })[] {
 function planTurn(tui: Tui, theme: Theme, chat: Box, turn: Component[]): void {
 	const last = finished(turn);
 	if (!last) return;
+	if (!foldable.has(last) && tui.isFollowingOutput !== true) return;
+	foldable.add(last);
 	const flat = pieces(turn, chat);
 	let start = -1;
 	let end = -1;
@@ -217,6 +227,7 @@ export default function foldSteps(pi: ExtensionAPI) {
 					}
 					delete (chat as { render?: unknown }).render;
 					plans = new WeakMap();
+					foldable = new WeakSet();
 					current = undefined;
 				};
 			}
