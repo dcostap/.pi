@@ -7,6 +7,7 @@
   "tui.altScreen.halfPageDown": ["ctrl+down"],
   "tui.altScreen.previousPrompt": ["ctrl+shift+up"],
   "tui.altScreen.nextPrompt": ["ctrl+shift+down"],
+  "tui.altScreen.searchNext": ["enter"],
   "tui.editor.deleteCharForward": ["delete"],
   "tui.editor.yank": [],
   "app.exit": [],
@@ -15,6 +16,7 @@
   "app.model.cycleForward": [],
   "app.model.cycleBackward": [],
   "app.thinking.toggle": [],
+  "app.tools.expand": [],
   "app.message.copy": [],
   "app.message.followUp": ["ctrl+q"],
   "app.message.dequeue": ["alt+up"]
