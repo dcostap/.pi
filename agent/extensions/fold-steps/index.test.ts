@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { Container, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { afterEach, expect, test } from "bun:test";
+import { Container, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, initTheme,
 } from "@earendil-works/pi-coding-agent";
@@ -7,13 +7,20 @@ import install from "./index.ts";
 
 initTheme("dark");
 
-function setup(mode = "fullscreen") {
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+	for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+});
+
+function setup(mode = "fullscreen", input = (_data: string): unknown => undefined) {
 	const chat = new Container();
 	const document = new Container();
 	document.addChild(new Container());
 	document.addChild(new Container());
 	document.addChild(chat);
-	const tui = { children: [document], mode, renders: 0, requestRender() { this.renders++; } };
+	const tui = Object.assign(Object.create({ handleViewportInput: input }), {
+		children: [document], mode, renders: 0, requestRender() { this.renders++; },
+	});
 	const handlers: Record<string, Function> = {};
 	const shortcuts: Record<string, Function> = {};
 	const notes: string[] = [];
@@ -24,10 +31,14 @@ function setup(mode = "fullscreen") {
 	handlers.session_start!({}, {
 		mode: "tui",
 		ui: {
-			setWidget: (_key: string, factory?: Function) => factory?.(tui, { fg: (_c: string, t: string) => t }),
+			setWidget: (_key: string, factory?: Function) => factory?.(tui, {
+				fg: (_c: string, t: string) => t,
+				underline: (text: string) => `\x1b[4m${text}\x1b[24m`,
+			}),
 			notify: (text: string) => notes.push(text),
 		},
 	});
+	cleanups.push(() => handlers.session_shutdown!());
 	return { chat, tui, shortcuts, notes, handlers };
 }
 
@@ -45,10 +56,11 @@ function tool(chat: Container, tui: unknown, id: string, path: string) {
 	chat.addChild(component);
 }
 const lines = (chat: Container) => chat.render(60).map((line) => stripTerminalSequences(line).trimEnd());
-const click = (chat: Container, y: number) => chat.handleMouse({
-	type: "click", button: "left", x: 2, y, screenX: 2, screenY: y, width: 60, height: 999,
+const mouse = (chat: Container, y: number, type = "move", x = 2, width = 60, button = "left") => chat.handleMouse({
+	type, button, x, y, screenX: x, screenY: y, width, height: 999,
 	shift: false, alt: false, ctrl: false,
 } as never);
+const click = (chat: Container, y: number) => mouse(chat, y, "click");
 
 function finishedTurn(chat: Container, tui: unknown) {
 	user(chat, "fix the bug");
@@ -95,6 +107,80 @@ test("folds steps between texts of a finished turn and toggles on click", () => 
 	const thinkingRow = folded.findIndex((line) => line.includes("▸ 1 step"));
 	click(chat, thinkingRow);
 	expect(lines(chat).join("\n")).toContain("I should look around");
+});
+
+test("hover underlines only its summary and stays on the same step after renders and clicks", () => {
+	const { chat, tui } = setup();
+	finishedTurn(chat, tui);
+	const folded = lines(chat);
+	const first = folded.findIndex((line) => line.includes("▸ 1 step"));
+	const second = folded.findIndex((line) => line.includes("▸ 3 steps"));
+	mouse(chat, first);
+	expect(chat.render(60)[first]).toContain("\x1b[4m▸ 1 step\x1b[24m");
+	expect(chat.render(60)[second]).not.toContain("\x1b[4m");
+	const renders = tui.renders;
+	mouse(chat, first, "move", 3);
+	expect(tui.renders).toBe(renders);
+	mouse(chat, second);
+	expect(chat.render(60)[first]).not.toContain("\x1b[4m");
+	expect(chat.render(60)[second]).toContain("\x1b[4m▸ 3 steps\x1b[24m");
+	expect(mouse(chat, second, "press")?.handled).toBe(true);
+	expect(lines(chat)).toEqual(folded);
+	click(chat, second);
+	expect(chat.render(60)[second]).toContain("\x1b[4m▾ 3 steps\x1b[24m");
+	click(chat, second);
+	expect(chat.render(60)[second]).toContain("\x1b[4m▸ 3 steps\x1b[24m");
+});
+
+test("padding, blank rows, and space after a summary do not hover or toggle", () => {
+	const { chat, tui } = setup();
+	finishedTurn(chat, tui);
+	const folded = lines(chat);
+	const row = folded.findIndex((line) => line.includes("▸ 3 steps"));
+	for (const [x, y] of [[0, row], [20, row], [2, row - 1]]) {
+		mouse(chat, row);
+		chat.render(60);
+		mouse(chat, y!, "move", x!);
+		expect(chat.render(60)[row]).not.toContain("\x1b[4m");
+		expect(mouse(chat, y!, "click", x!)).toBeUndefined();
+		expect(lines(chat)).toEqual(folded);
+	}
+	expect(mouse(chat, row, "click", 2, 60, "right")).toBeUndefined();
+});
+
+test("viewport input clears hover outside summaries, on scroll, and on focus loss", () => {
+	let dispatch = (_data: string) => {};
+	const originalInput = (data: string) => { dispatch(data); return { consume: true }; };
+	const { chat, tui, handlers } = setup("fullscreen", originalInput);
+	finishedTurn(chat, tui);
+	const row = lines(chat).findIndex((line) => line.includes("▸ 3 steps"));
+	for (const data of ["outside", "wheel", "\x1b[O", "page-up"]) {
+		dispatch = () => { mouse(chat, row); };
+		expect(tui.handleViewportInput("move")).toEqual({ consume: true });
+		expect(chat.render(60)[row]).toContain("\x1b[4m");
+		dispatch = data === "wheel" ? () => { mouse(chat, row, "wheel"); } : () => {};
+		tui.handleViewportInput(data);
+		expect(chat.render(60)[row]).not.toContain("\x1b[4m");
+	}
+	handlers.session_shutdown!();
+	expect(Object.hasOwn(tui, "handleViewportInput")).toBe(false);
+	expect(tui.handleViewportInput).toBe(originalInput);
+});
+
+test("hover stays within narrow widths and clears when all steps are shown", () => {
+	const { chat, tui, shortcuts } = setup();
+	finishedTurn(chat, tui);
+	const row = lines(chat).findIndex((line) => line.includes("▸ 3 steps"));
+	mouse(chat, row);
+	expect(chat.render(60)[row]).toContain("\x1b[4m");
+	for (const width of [1, 5, 10]) {
+		const summaries = chat.render(width).filter((line) => line.includes("\x1b[4m"));
+		expect(summaries.every((line) => visibleWidth(line) <= width)).toBe(true);
+	}
+	shortcuts["alt+o"]!();
+	lines(chat);
+	shortcuts["alt+o"]!();
+	expect(chat.render(60)[row]).not.toContain("\x1b[4m");
 });
 
 test("keeps cancelled, failed, and running turns open", () => {

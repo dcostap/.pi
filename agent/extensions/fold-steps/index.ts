@@ -3,7 +3,7 @@ import {
 	type ExtensionAPI, type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
-	Container, MouseRegion, Spacer, truncateToWidth, type Component, type TuiMouseEvent,
+	Container, MouseRegion, Spacer, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 
 // Pi has no transcript grouping API. This extension replaces the render of Pi's chat container,
@@ -18,7 +18,7 @@ type Assistant = AssistantMessageComponent & {
 	outputPad: number;
 	lastMessage?: { stopReason?: string; content: { type: string; text?: string }[] };
 };
-type Tui = { children: Component[]; mode?: string; requestRender(): void };
+type Tui = { children: Component[]; mode?: string; requestRender(): void; handleViewportInput?(data: string): unknown };
 type Plan = { hidden: Set<Component>; folds: Map<Component, FoldLine> };
 type Piece = { component: Component; box: Box; owner: Component; index: number };
 type Kind = "step" | "glue" | "other";
@@ -30,6 +30,15 @@ const WIDGET = "fold-steps";
 const expanded = new WeakMap<Component, Set<number>>();
 let plans = new WeakMap<Box, Plan>();
 let showAll = false;
+// Fold lines are rebuilt on each render. Keep hover on the same step, not the temporary line.
+let hovered: Piece | undefined;
+let hoverSeen = false;
+
+function setHover(tui: Tui, piece?: Piece): void {
+	if (hovered?.owner === piece?.owner && hovered?.index === piece?.index) return;
+	hovered = piece;
+	tui.requestRender();
+}
 
 function planFor(box: Box): Plan {
 	let plan = plans.get(box);
@@ -57,6 +66,8 @@ function renderPlanned(this: Box, width: number): string[] {
 }
 
 class FoldLine implements Component {
+	private labelWidth = 0;
+
 	constructor(
 		private tui: Tui, private theme: Theme, private piece: Piece,
 		private steps: number, private open: boolean, private blank: boolean, private pad: number,
@@ -64,12 +75,24 @@ class FoldLine implements Component {
 
 	render(width: number): string[] {
 		const label = `${this.open ? "▾" : "▸"} ${this.steps} step${this.steps === 1 ? "" : "s"}`;
-		const line = truncateToWidth(" ".repeat(this.pad) + this.theme.fg("muted", label), width);
+		this.labelWidth = Math.min(visibleWidth(label), Math.max(0, width - this.pad));
+		const styled = hovered?.owner === this.piece.owner && hovered.index === this.piece.index
+			? this.theme.underline(label) : label;
+		const line = truncateToWidth(" ".repeat(this.pad) + this.theme.fg("muted", styled), width);
 		return this.blank ? ["", line] : [line];
 	}
 
 	handleMouse(event: TuiMouseEvent) {
-		if (event.type !== "click" || event.button !== "left" || (this.blank && event.y === 0)) return undefined;
+		const hit = event.y === (this.blank ? 1 : 0) && event.x >= this.pad && event.x < this.pad + this.labelWidth;
+		if (event.type === "move") {
+			hoverSeen = true;
+			setHover(this.tui, hit ? this.piece : undefined);
+			return hit ? { handled: true, render: false } : undefined;
+		}
+		if (hit && event.type !== "wheel") hoverSeen = true;
+		if (!hit || event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
+		// Handle the press too, so clicking the summary does not start a text selection.
+		if (event.type === "press") return { handled: true, render: false };
 		const { owner, index } = this.piece;
 		const open = expanded.get(owner) ?? new Set<number>();
 		if (open.has(index)) open.delete(index);
@@ -174,7 +197,25 @@ export default function foldSteps(pi: ExtensionAPI) {
 			if (chat) {
 				current = tui as unknown as Tui;
 				chat.render = (width) => renderChat(current!, theme, chat, width);
+				const host = current;
+				const originalInput = host.handleViewportInput;
+				const inputDescriptor = Object.getOwnPropertyDescriptor(host, "handleViewportInput");
+				// Pi sends no leave event. Clear hover outside the summary, on scroll, and on focus loss.
+				function handleViewportInput(this: Tui, data: string): unknown {
+					hoverSeen = false;
+					try {
+						return originalInput!.call(this, data);
+					} finally {
+						if (!hoverSeen) setHover(host);
+					}
+				}
+				if (typeof originalInput === "function") host.handleViewportInput = handleViewportInput;
 				restore = () => {
+					setHover(host);
+					if (host.handleViewportInput === handleViewportInput) {
+						if (inputDescriptor) Object.defineProperty(host, "handleViewportInput", inputDescriptor);
+						else delete host.handleViewportInput;
+					}
 					delete (chat as { render?: unknown }).render;
 					plans = new WeakMap();
 					current = undefined;
@@ -195,6 +236,7 @@ export default function foldSteps(pi: ExtensionAPI) {
 		description: "Show or hide folded steps in all turns",
 		handler: () => {
 			showAll = !showAll;
+			hovered = undefined;
 			current?.requestRender();
 		},
 	});
