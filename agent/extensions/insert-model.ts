@@ -33,7 +33,7 @@ export default function (pi: ExtensionAPI): void {
 						() => done(undefined),
 					),
 				);
-				if (selected !== undefined) ctx.ui.pasteToEditor(selected);
+				if (selected !== undefined) ctx.ui.pasteToEditor(`${selected} `);
 			} finally {
 				picking = false;
 			}
