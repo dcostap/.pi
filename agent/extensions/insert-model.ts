@@ -23,6 +23,7 @@ export default function (pi: ExtensionAPI): void {
 			picking = true;
 			try {
 				// Pi's own /model selector, so the picker looks and works the same as Ctrl+P.
+				// An inline dialog restores text with setText(), which moves the cursor to the end.
 				const selected = await ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) =>
 					new ModelSelectorComponent(
 						tui,
@@ -32,6 +33,7 @@ export default function (pi: ExtensionAPI): void {
 						(model) => done(`${model.provider}/${model.id}:${thinkingLevel(model)}`),
 						() => done(undefined),
 					),
+					{ overlay: true },
 				);
 				if (selected !== undefined) ctx.ui.pasteToEditor(`${selected} `);
 			} finally {
