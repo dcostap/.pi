@@ -117,6 +117,7 @@ export default function (pi: ExtensionAPI) {
 	// Check credits at use time, before each paid request, not during startup.
 	const firecrawlConfigured = Boolean(config.firecrawlApiKey);
 	const fetchLimiter = new ConcurrencyLimiter(config.maxConcurrentFetches);
+	let fetchModulePromise: Promise<typeof import("./fetch-url.ts")> | undefined;
 
 	if (firecrawlConfigured) {
 		pi.registerCommand("firecrawl-credits", {
@@ -250,7 +251,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			const release = await fetchLimiter.acquire(signal);
 			try {
-				const { fetchUrl } = await import("./fetch-url.ts");
+				// Jiti can return unfinished exports to concurrent importers. Share the pending import so all callers wait.
+				const { fetchUrl } = await (fetchModulePromise ??= import("./fetch-url.ts"));
 				signal?.throwIfAborted();
 				const result = await fetchUrl(params.url, config, ctx, params.prompt, onUpdate, signal);
 				return {
