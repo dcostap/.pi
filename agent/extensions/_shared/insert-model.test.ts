@@ -20,7 +20,16 @@ const { default: register } = await import("../insert-model.ts");
 function setup(text: string, cursor: number, cancel = false) {
 	let handler: (ctx: any) => Promise<void>;
 	const chosen = { provider: "test", id: "chosen" };
-	const state = { text, cursor, pastes: 0 };
+	const state = { text, cursor, pastes: 0, restores: 0 };
+	const editor = {
+		getText: () => state.text,
+		setText: (value: string) => {
+			state.text = value;
+			state.cursor = value.length;
+			state.restores++;
+		},
+	};
+	const originalSetText = editor.setText;
 	register({
 		getSettings: () => ({ defaultThinkingLevel: "high" }),
 		registerShortcut: (key: string, shortcut: any) => {
@@ -35,16 +44,17 @@ function setup(text: string, cursor: number, cancel = false) {
 		scopedModels: [],
 		ui: {
 			custom: async (factory: any, options: any) => {
+				expect(options?.overlay).not.toBe(true);
 				const savedText = state.text;
 				let result: string | undefined;
-				const picker = factory({}, {}, {}, (value: string | undefined) => { result = value; });
+				const picker = factory({ getFocusedComponent: () => editor }, {}, {}, (value: string | undefined) => {
+					// Pi restores inline dialogs synchronously when done() runs.
+					editor.setText(savedText);
+					result = value;
+				});
 				if (cancel) picker.cancel();
 				else picker.select(chosen);
-				// Pi restores inline dialogs with setText(), which resets the cursor.
-				if (!options?.overlay) {
-					state.text = savedText;
-					state.cursor = savedText.length;
-				}
+				expect(editor.setText).toBe(originalSetText);
 				return result;
 			},
 			pasteToEditor: (value: string) => {
@@ -65,11 +75,12 @@ for (const [text, cursor] of [["before after", 7], ["after", 0], ["first\nbefore
 		expect(state.text).toBe(text.slice(0, cursor) + inserted + text.slice(cursor));
 		expect(state.cursor).toBe(cursor + inserted.length);
 		expect(state.pastes).toBe(1);
+		expect(state.restores).toBe(0);
 	});
 }
 
 test("cancel keeps the prompt and cursor unchanged", async () => {
 	const { state, run } = setup("before after", 7, true);
 	await run();
-	expect(state).toEqual({ text: "before after", cursor: 7, pastes: 0 });
+	expect(state).toEqual({ text: "before after", cursor: 7, pastes: 0, restores: 0 });
 });

@@ -1,5 +1,6 @@
 import { clampThinkingLevel } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, ModelSelectorComponent } from "@earendil-works/pi-coding-agent";
+import type { EditorComponent } from "@earendil-works/pi-tui";
 
 export default function (pi: ExtensionAPI): void {
 	let picking = false;
@@ -22,19 +23,32 @@ export default function (pi: ExtensionAPI): void {
 
 			picking = true;
 			try {
-				// Pi's own /model selector, so the picker looks and works the same as Ctrl+P.
-				// An inline dialog restores text with setText(), which moves the cursor to the end.
-				const selected = await ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) =>
-					new ModelSelectorComponent(
+				const selected = await ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) => {
+					const editor = tui.getFocusedComponent() as Partial<EditorComponent> | null;
+					const finish = (value: string | undefined) => {
+						// Inline dialogs restore text with setText(). Skip unchanged text to preserve the cursor and paste state.
+						const setText = editor?.setText;
+						const getText = editor?.getText;
+						if (editor && setText && getText) {
+							editor.setText = (text) => {
+								if (text !== getText.call(editor)) setText.call(editor, text);
+							};
+						}
+						try {
+							done(value);
+						} finally {
+							if (editor && setText) editor.setText = setText;
+						}
+					};
+					return new ModelSelectorComponent(
 						tui,
 						ctx.model,
 						ctx.modelRegistry.runtime,
 						ctx.scopedModels,
-						(model) => done(`${model.provider}/${model.id}:${thinkingLevel(model)}`),
-						() => done(undefined),
-					),
-					{ overlay: true },
-				);
+						(model) => finish(`${model.provider}/${model.id}:${thinkingLevel(model)}`),
+						() => finish(undefined),
+					);
+				});
 				if (selected !== undefined) ctx.ui.pasteToEditor(`${selected} `);
 			} finally {
 				picking = false;
