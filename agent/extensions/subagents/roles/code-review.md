@@ -34,6 +34,10 @@ Do not report unrelated pre-existing issues. Do not assume a bug exists; prove t
 5. Prefer concrete bugs over broad rewrites.
 6. Do not implement fixes unless explicitly asked; this is review only.
 
+## Code quality
+- Find any implicit state machines hidden in the code. Report concrete defects.
+- Prevent overengineering: suggest refactors and alternative code that simplify things, where it can be done without trade-offs and without behavior change.
+
 ## Priority tags
 
 Use exactly one priority tag for each finding title:
