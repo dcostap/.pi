@@ -115,6 +115,11 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setTitle(buildTitle(pi, ctx.cwd, worktreeFor(ctx)));
 	});
 
+	// Auto-naming can finish after the run ends. A running animation picks up the name on its next frame.
+	pi.on("session_info_changed", async (_event, ctx) => {
+		if (!timer) ctx.ui.setTitle(buildTitle(pi, ctx.cwd, worktreeFor(ctx)));
+	});
+
 	pi.on("agent_start", async (_event, ctx) => {
 		startAnimation(ctx);
 	});

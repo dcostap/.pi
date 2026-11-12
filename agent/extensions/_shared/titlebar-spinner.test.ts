@@ -5,11 +5,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import titlebarSpinner from "../titlebar-spinner.ts";
 
-function load() {
+function load(getSessionName = () => "small fix") {
   const handlers = new Map<string, Function>();
   titlebarSpinner({
     on(name: string, handler: Function) { handlers.set(name, handler); },
-    getSessionName() { return "small fix"; },
+    getSessionName,
   } as any);
   return handlers;
 }
@@ -82,5 +82,24 @@ test("a session in a linked worktree leads its title with the worktree name", as
   } finally {
     await handlers.get("session_shutdown")!({}, ctx);
     await removeTree(root);
+  }
+});
+
+test("a name set after the run ends updates the title", async () => {
+  let name: string | undefined;
+  const handlers = load(() => name);
+  const titles: string[] = [];
+  const ctx = {
+    cwd: join(tmpdir(), "named-later"),
+    ui: { setTitle(title: string) { titles.push(title); } },
+  };
+  try {
+    await handlers.get("session_start")!({}, ctx);
+    expect(titles.at(-1)).toBe("π - named-later");
+    name = "Auto name";
+    await handlers.get("session_info_changed")!({ name }, ctx);
+    expect(titles.at(-1)).toBe("π - Auto name - named-later");
+  } finally {
+    await handlers.get("session_shutdown")!({}, ctx);
   }
 });
