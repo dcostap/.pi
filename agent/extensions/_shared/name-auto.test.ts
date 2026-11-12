@@ -121,7 +121,7 @@ test("refines a vague name until the try limit", async () => {
 	for (let i = 0; i < 7; i++) await h.settle();
 	assert.equal(h.requests.length, 5);
 	const retry = h.requests[1].context.messages[0].content[0].text;
-	assert.match(retry, /current name "Unclear request" is temporary/);
+	assert.match(retry, /current name "Unclear request" is a temporary guess/);
 	assert.doesNotMatch(retry, /Keep it unchanged/);
 });
 

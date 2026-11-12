@@ -123,7 +123,7 @@ function currentNameLine(currentName: string | undefined, temporary: boolean): s
 	if (!currentName) return "";
 	// "Keep it if accurate" anchors the model; a temporary name was a guess, so it gets no such protection.
 	return temporary
-		? `The current name ${JSON.stringify(currentName)} is temporary because the subject was unclear. Name the session from the conversation now.`
+		? `The current name ${JSON.stringify(currentName)} is a temporary guess because the subject was unclear. If the subject is still unclear, set needsRefinement to true again.`
 		: `Current name: ${JSON.stringify(currentName)}. Keep it unchanged if it is still accurate. Replace it only with a meaningfully better name.`;
 }
 
