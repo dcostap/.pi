@@ -1,42 +1,49 @@
 /**
- * /name_auto extension
+ * Session auto-naming
  *
- * Uses the configured fast cheap model to suggest a short session/thread name,
- * then replaces the editor with `/name <suggestion>` so the user can press Enter.
+ * Uses the configured fast cheap model to name the session.
+ * - Automatic: after the first run of an unnamed session. While the model reports
+ *   that the subject is still unknown, it tries again after later runs.
+ * - Manual: `/name_auto [guidance]` renames now with the same code.
+ * A name that the user sets with `/name` (or `--name`, as subagents do) is never replaced automatically.
  */
 
 import type { Message } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader, convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader } from "@earendil-works/pi-coding-agent";
 import { FAST_CHEAP_ROLE, getModelRoleRequestOptions, resolveModelRole } from "./_shared/model-roles";
 
 const COMMAND = "name_auto";
 const STATUS_KEY = "name-auto";
+const STATE_TYPE = "name-auto";
 
-const OUTPUT_MAX_TOKENS = 40;
-// Spark rejects a little before the advertised window once provider-side framing is added.
-// Naming does not need a full transcript, so keep a large reserve and a hard input cap.
-const PROMPT_SAFETY_MARGIN_TOKENS = 24_000;
-const MAX_CONVERSATION_TOKENS = 80_000;
-const MIN_CONTEXT_BUDGET_TOKENS = 1_000;
+const OUTPUT_MAX_TOKENS = 80;
 const MAX_NAME_CHARS = 72;
-const TARGET_NAME_WORDS = "3-7 words";
+// Same selection budget as t3code: names need the user's goal, not the transcript.
+const MAX_CONTEXT_CHARS = 8_000;
+const MAX_MESSAGE_CHARS = 2_000;
+const ASSISTANT_RESERVE_CHARS = 2_000;
+const MIN_MESSAGE_CHARS = 200;
+// Stops a session that stays vague ("hi", "thanks") from paying on every run.
+const MAX_REFINEMENT_ATTEMPTS = 3;
 
-const SYSTEM_PROMPT = [
-	"You name coding-agent chat threads.",
-	"Given the conversation history, produce one short descriptive thread name.",
-	`Target length: ${TARGET_NAME_WORDS}.`,
-	"Prefer concrete nouns: project, feature, bug, file, API, behavior.",
-	"Do not include quotes, markdown, punctuation decoration, explanations, or alternatives.",
-	"Return only the name text.",
-].join("\n");
+const SYSTEM_PROMPT = `You name coding-agent sessions so the user can recognize them weeks later.
+Return only JSON: {"name": string, "needsRefinement": boolean}.
+Set needsRefinement to true only if the subject is still unknown, such as "fix this", an unexplained link or image, or small talk. Otherwise set it to false.
 
-type AgentMessageLike = Record<string, unknown>;
+Rules:
+- 3-7 words, at most ${MAX_NAME_CHARS} characters.
+- Name the subject and the goal. Ignore instructions about how the agent should do the work.
+- Capture the umbrella goal, not one step or one finding.
+- Ignore workflow and deliverables such as plans, reviews, tests, commits, PRs and CI unless they are the topic.
+- Do not name models, subagents or tools unless they are the topic.
+- Do not claim the work is done.
+- Do not copy and cut the user's message.
+- No quotes, labels or trailing punctuation.`;
 
-function estimateTokens(text: string): number {
-	// Intentionally conservative: mixed code/JSON/tool logs often tokenize denser than 4 chars/token.
-	return Math.ceil(text.length / 3);
-}
+type Section = { role: "user" | "assistant"; text: string };
+export type NameState = { name: string; needsRefinement: boolean; attempt: number };
+type Suggestion = { name: string; needsRefinement: boolean };
 
 function cleanText(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
@@ -50,89 +57,76 @@ function clipAtWordBoundary(text: string, maxChars: number): string {
 	return (lastSpace >= Math.floor(maxChars * 0.6) ? clipped.slice(0, lastSpace) : clipped.slice(0, maxChars)).trim();
 }
 
-function clampConversationDump(text: string, maxTokens: number): { text: string; tokens: number; truncated: boolean } {
-	const normalized = cleanText(text);
-	const tokenCount = estimateTokens(normalized);
-	if (tokenCount <= maxTokens) {
-		return { text: normalized, tokens: tokenCount, truncated: false };
-	}
+const CUT_MARKER = "\n[...]\n";
 
-	const maxChars = Math.max(0, maxTokens * 4);
-	const marker = "\n\n[... middle of conversation omitted to fit the fast cheap model context window ...]\n\n";
-	if (maxChars <= marker.length + 200) {
-		const tail = normalized.slice(Math.max(0, normalized.length - maxChars));
-		return { text: cleanText(tail), tokens: estimateTokens(tail), truncated: true };
-	}
-
-	// Keep a little of the beginning for global topic, and most of the end for the current task.
-	const available = maxChars - marker.length;
-	const headChars = Math.floor(available * 0.18);
-	const tailChars = available - headChars;
-	const clamped = cleanText(normalized.slice(0, headChars)) + marker + cleanText(normalized.slice(-tailChars));
-	return { text: clamped, tokens: estimateTokens(clamped), truncated: true };
+function clipMiddle(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	const available = maxChars - CUT_MARKER.length;
+	let head = Math.ceil(available / 2);
+	let tail = available - head;
+	// A lone surrogate serializes to an escape that provider JSON parsers reject.
+	if (/[\ud800-\udbff]/.test(text[head - 1] ?? "")) head -= 1;
+	if (/[\udc00-\udfff]/.test(text[text.length - tail] ?? "")) tail -= 1;
+	return text.slice(0, head) + CUT_MARKER + text.slice(text.length - tail);
 }
 
-function entryToMessage(entry: SessionEntry): AgentMessageLike | undefined {
-	if (entry.type === "message" && "message" in entry) {
-		return entry.message as AgentMessageLike;
-	}
-	if (entry.type === "custom_message") {
-		const custom = entry as SessionEntry & { customType?: string; content?: unknown; display?: boolean; details?: unknown };
-		return {
-			role: "custom",
-			customType: custom.customType,
-			content: custom.content,
-			display: custom.display ?? true,
-			details: custom.details,
-			timestamp: Date.parse(entry.timestamp),
-		};
-	}
-	if (entry.type === "compaction") {
-		const compaction = entry as SessionEntry & { summary?: string; tokensBefore?: number };
-		return {
-			role: "compactionSummary",
-			summary: compaction.summary ?? "",
-			tokensBefore: compaction.tokensBefore ?? 0,
-			timestamp: Date.parse(entry.timestamp),
-		};
-	}
-	if (entry.type === "branch_summary") {
-		const branchSummary = entry as SessionEntry & { summary?: string; fromId?: string };
-		return {
-			role: "branchSummary",
-			summary: branchSummary.summary ?? "",
-			fromId: branchSummary.fromId ?? "",
-			timestamp: Date.parse(entry.timestamp),
-		};
-	}
-	return undefined;
+function messageText(message: any): string {
+	const content = message?.content;
+	if (typeof content === "string") return cleanText(content);
+	if (!Array.isArray(content)) return "";
+	const text = content
+		.filter((part) => part?.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n");
+	const image = message.role === "user" && content.some((part) => part?.type === "image");
+	return cleanText(image ? `${text}\n[Image attached]` : text);
 }
 
-function buildConversationDump(entries: SessionEntry[]): string {
-	const messages = entries.map(entryToMessage).filter((message): message is AgentMessageLike => Boolean(message));
-	if (messages.length === 0) return "";
-
-	try {
-		return serializeConversation(convertToLlm(messages as any));
-	} catch (_error) {
-		// Fallback: still give Spark the raw session data rather than failing on an unexpected message shape.
-		return entries.map((entry) => JSON.stringify(entry)).join("\n");
-	}
+function sectionsFromBranch(entries: SessionEntry[]): Section[] {
+	return entries.flatMap((entry) => {
+		if (entry.type !== "message") return [];
+		const message = (entry as any).message;
+		if (message?.role !== "user" && message?.role !== "assistant") return [];
+		const text = messageText(message);
+		return text ? [{ role: message.role, text }] : [];
+	});
 }
 
-function buildPrompt(conversation: string, extraGuidance: string | undefined): string {
+/** Keeps the first user message, then the newest user messages, then the newest assistant replies. */
+export function buildNamingContext(sections: Section[]): string {
+	const chosen = new Map<number, string>();
+	let remaining = MAX_CONTEXT_CHARS;
+	const add = (index: number, limit: number) => {
+		if (chosen.has(index)) return;
+		const cap = Math.min(limit, remaining);
+		if (cap < MIN_MESSAGE_CHARS) return;
+		const text = clipMiddle(sections[index].text, cap);
+		chosen.set(index, text);
+		remaining -= text.length;
+	};
+
+	const firstUser = sections.findIndex((section) => section.role === "user");
+	if (firstUser >= 0) add(firstUser, MAX_MESSAGE_CHARS);
+	for (let i = sections.length - 1; i >= 0; i--) {
+		if (sections[i].role === "user") add(i, Math.min(MAX_MESSAGE_CHARS, remaining - ASSISTANT_RESERVE_CHARS));
+	}
+	for (let i = sections.length - 1; i >= 0; i--) {
+		if (sections[i].role === "assistant") add(i, MAX_MESSAGE_CHARS);
+	}
+
+	const omitted = chosen.size < sections.length || [...chosen].some(([i, text]) => text !== sections[i].text);
+	const body = sections.flatMap((section, i) => (chosen.has(i) ? [`${section.role.toUpperCase()}:\n${chosen.get(i)}`] : []));
+	return (omitted ? "[Some content omitted]\n\n" : "") + body.join("\n\n");
+}
+
+function buildPrompt(context: string, currentName: string | undefined, guidance: string | undefined): string {
 	return [
-		"Name this coding-agent thread based on the conversation history below.",
-		extraGuidance ? `Additional user naming guidance: ${extraGuidance}` : "",
-		"",
-		"Rules:",
-		`- Return exactly one short name (${TARGET_NAME_WORDS}).`,
-		`- Maximum ${MAX_NAME_CHARS} characters.`,
-		"- No quotes, no bullet, no period, no colon prefix like 'Name:'.",
-		"- If the conversation is about implementing this command, name it accordingly.",
-		"",
+		currentName
+			? `Current name: ${JSON.stringify(currentName)}. Keep it unchanged if it is still accurate. Replace it only with a meaningfully better name.`
+			: "",
+		guidance ? `Additional user naming guidance: ${guidance}` : "",
 		"<conversation>",
-		conversation || "(empty conversation)",
+		context,
 		"</conversation>",
 	].filter(Boolean).join("\n");
 }
@@ -159,11 +153,114 @@ function sanitizeName(raw: string): string {
 	return clipAtWordBoundary(name, MAX_NAME_CHARS);
 }
 
+/** Reads the model's JSON. Unparseable output becomes a final name, so a broken reply cannot cause repeated calls. */
+export function parseSuggestion(raw: string): Suggestion {
+	const json = raw.match(/\{[\s\S]*\}/)?.[0];
+	if (json) {
+		try {
+			const parsed = JSON.parse(json);
+			if (typeof parsed?.name === "string") {
+				return { name: sanitizeName(parsed.name), needsRefinement: parsed.needsRefinement === true };
+			}
+		} catch {}
+	}
+	return { name: sanitizeName(raw), needsRefinement: false };
+}
+
+function latestState(ctx: ExtensionContext): NameState | undefined {
+	const entries = ctx.sessionManager.getEntries();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as any;
+		if (entry.type === "custom" && entry.customType === STATE_TYPE) return entry.data as NameState;
+	}
+	return undefined;
+}
+
+/** An unnamed session gets a name; a vague auto name gets more tries; any other name is the user's. */
+export function shouldAutoName(currentName: string | undefined, state: NameState | undefined): boolean {
+	if (!currentName) return true;
+	return state?.name === currentName && state.needsRefinement && state.attempt < MAX_REFINEMENT_ATTEMPTS;
+}
+
+async function suggestName(
+	ctx: ExtensionContext,
+	currentName: string | undefined,
+	guidance: string | undefined,
+	signal: AbortSignal,
+): Promise<Suggestion | null> {
+	const fastModel = await resolveModelRole(ctx, FAST_CHEAP_ROLE);
+	if (!fastModel.ok) throw new Error(fastModel.loudMessage);
+
+	const context = buildNamingContext(sectionsFromBranch(ctx.sessionManager.getBranch()));
+	if (!context.trim()) throw new Error("No conversation history found");
+
+	const response = await ctx.modelRegistry.complete(
+		fastModel.model,
+		{
+			systemPrompt: SYSTEM_PROMPT,
+			messages: [{ role: "user", content: [{ type: "text", text: buildPrompt(context, currentName, guidance) }], timestamp: Date.now() }],
+		},
+		{
+			apiKey: fastModel.auth.apiKey,
+			headers: fastModel.auth.headers,
+			...getModelRoleRequestOptions(fastModel, { maxTokensCap: OUTPUT_MAX_TOKENS }),
+			signal,
+			sessionId: ctx.sessionManager.getSessionId(),
+		},
+	);
+	if (response.stopReason === "aborted") return null;
+	if (response.stopReason === "error") throw new Error(response.errorMessage || "Fast cheap model request failed");
+
+	const suggestion = parseSuggestion(responseText(response));
+	if (!suggestion.name) throw new Error("Fast cheap model returned an empty name");
+	return suggestion;
+}
+
 export default function nameAutoExtension(pi: ExtensionAPI) {
 	let pending = false;
+	let autoRun: { controller: AbortController; done: Promise<void> } | undefined;
+	// One failure stops automatic naming for this session, so a broken model setup does not warn on every run.
+	let autoFailed = false;
+
+	const apply = (suggestion: Suggestion, attempt: number) => {
+		if (suggestion.name !== pi.getSessionName()) pi.setSessionName(suggestion.name);
+		pi.appendEntry<NameState>(STATE_TYPE, { ...suggestion, attempt });
+	};
+
+	pi.on("agent_settled", (event, ctx) => {
+		if (event.aborted || pending || autoFailed) return;
+		const currentName = pi.getSessionName();
+		const state = latestState(ctx);
+		if (!shouldAutoName(currentName, state)) return;
+
+		pending = true;
+		const controller = new AbortController();
+		const attempt = currentName ? (state?.attempt ?? 0) + 1 : 1;
+		// Fire and forget: naming must not delay the next run.
+		const done = suggestName(ctx, currentName, undefined, controller.signal)
+			.then((suggestion) => {
+				// A `/name` typed while the request ran wins.
+				if (suggestion && !controller.signal.aborted && pi.getSessionName() === currentName) apply(suggestion, attempt);
+			})
+			.catch((error) => {
+				if (controller.signal.aborted) return;
+				autoFailed = true;
+				const message = error instanceof Error ? error.message : String(error);
+				if (ctx.hasUI) ctx.ui.notify(message.includes("MODEL PROBLEM") ? message : `Auto-naming failed: ${message}`, "warning");
+			})
+			.finally(() => {
+				autoRun = undefined;
+				pending = false;
+			});
+		autoRun = { controller, done };
+	});
+
+	pi.on("session_shutdown", () => {
+		autoRun?.controller.abort();
+	});
 
 	pi.registerCommand(COMMAND, {
-		description: "Ask the configured fast cheap model for a short thread name and prefill `/name <name>`",
+		description: "Ask the configured fast cheap model for a short session name and set it",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 
@@ -172,8 +269,13 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 				return;
 			}
 
+			// The manual request replaces a running automatic one.
+			if (autoRun) {
+				autoRun.controller.abort();
+				await autoRun.done;
+			}
 			if (pending) {
-				ctx.ui.notify("A /name_auto request is already running", "warning");
+				ctx.ui.notify("A naming request is already running", "warning");
 				return;
 			}
 
@@ -181,72 +283,13 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", "naming…"));
 
 			try {
-				const fastModel = await resolveModelRole(ctx, FAST_CHEAP_ROLE);
-				if (!fastModel.ok) {
-					throw new Error(fastModel.loudMessage);
-				}
-				const { model, auth } = fastModel;
-				const fastModelOptions = getModelRoleRequestOptions(fastModel, { maxTokensCap: OUTPUT_MAX_TOKENS });
-
-				const fullDump = buildConversationDump(ctx.sessionManager.getBranch());
-				if (!fullDump.trim()) {
-					throw new Error("No conversation history found");
-				}
-
-				const fixedPromptTokens = estimateTokens(SYSTEM_PROMPT) + estimateTokens(buildPrompt("", args.trim() || undefined));
-				const availableContextTokens = model.contextWindow - PROMPT_SAFETY_MARGIN_TOKENS - OUTPUT_MAX_TOKENS - fixedPromptTokens;
-				const conversationBudget = Math.min(MAX_CONVERSATION_TOKENS, Math.max(0, availableContextTokens));
-				if (conversationBudget < MIN_CONTEXT_BUDGET_TOKENS) {
-					throw new Error(
-						`Model context window too small after safety padding (${conversationBudget.toLocaleString()} tokens available)`,
-					);
-				}
-				const clamped = clampConversationDump(fullDump, conversationBudget);
-				const prompt = buildPrompt(clamped.text, args.trim() || undefined);
-
-				const result = await ctx.ui.custom<{ text: string } | { error: string } | null>((tui, theme, _keybindings, done) => {
-					const loader = new BorderedLoader(
-						tui,
-						theme,
-						`Asking fast cheap model (${fastModel.label}) for a name (${clamped.tokens.toLocaleString()} tok${clamped.truncated ? ", clamped" : ""})...`,
-					);
+				const currentName = pi.getSessionName();
+				const result = await ctx.ui.custom<Suggestion | { error: string } | null>((tui, theme, _keybindings, done) => {
+					const loader = new BorderedLoader(tui, theme, "Asking the fast cheap model for a name...");
 					loader.onAbort = () => done(null);
-
-					const generate = async () => {
-						const response = await ctx.modelRegistry.complete(
-							model,
-							{
-								systemPrompt: SYSTEM_PROMPT,
-								messages: [
-									{
-										role: "user",
-										content: [{ type: "text", text: prompt }],
-										timestamp: Date.now(),
-									},
-								],
-							},
-							{
-								apiKey: auth.apiKey,
-								headers: auth.headers,
-								...fastModelOptions,
-								signal: loader.signal,
-								sessionId: ctx.sessionManager.getSessionId(),
-							},
-						);
-
-						if (response.stopReason === "aborted") return null;
-						if (response.stopReason === "error") {
-							throw new Error(response.errorMessage || "Fast cheap model request failed");
-						}
-
-						return { text: responseText(response) };
-					};
-
-					generate().then(done).catch((error) => {
-						console.error("/name_auto failed:", error);
-						done({ error: error instanceof Error ? error.message : String(error) });
-					});
-
+					suggestName(ctx, currentName, args.trim() || undefined, loader.signal)
+						.then(done)
+						.catch((error) => done({ error: error instanceof Error ? error.message : String(error) }));
 					return loader;
 				});
 
@@ -254,17 +297,10 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("Name generation cancelled", "info");
 					return;
 				}
-				if ("error" in result) {
-					throw new Error(result.error);
-				}
+				if ("error" in result) throw new Error(result.error);
 
-				const name = sanitizeName(result.text);
-				if (!name) {
-					throw new Error("Fast cheap model returned an empty name");
-				}
-
-				ctx.ui.setEditorText(`/name ${name}`);
-				ctx.ui.notify("Name suggestion loaded. Press Enter to apply or edit it first.", "info");
+				apply(result, 1);
+				ctx.ui.notify(result.name === currentName ? `Name unchanged: ${result.name}` : `Session named: ${result.name}`, "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(message.includes("MODEL PROBLEM") ? message : `/name_auto failed: ${message}`, "error");
