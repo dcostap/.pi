@@ -118,9 +118,11 @@ test("auto-names an unnamed session once", async () => {
 
 test("refines a vague name until the try limit", async () => {
 	const h = harness({ replies: ['{"name": "Unclear request", "needsRefinement": true}'] });
-	for (let i = 0; i < 5; i++) await h.settle();
-	assert.equal(h.requests.length, 3);
-	assert.match(h.requests[1].context.messages[0].content[0].text, /Current name: "Unclear request"/);
+	for (let i = 0; i < 7; i++) await h.settle();
+	assert.equal(h.requests.length, 5);
+	const retry = h.requests[1].context.messages[0].content[0].text;
+	assert.match(retry, /current name "Unclear request" is temporary/);
+	assert.doesNotMatch(retry, /Keep it unchanged/);
 });
 
 test("stops refining when the model is sure", async () => {
@@ -136,6 +138,13 @@ test("a user-set name stops refinement", async () => {
 	h.name = "My own name";
 	await h.settle();
 	assert.equal(h.requests.length, 1);
+	assert.equal(h.name, "My own name");
+});
+
+test("name_auto asks to keep a name that is not temporary", async () => {
+	const h = harness({ name: "My own name", replies: ['{"name": "My own name", "needsRefinement": false}'] });
+	await h.command("");
+	assert.match(h.requests[0].context.messages[0].content[0].text, /Current name: "My own name". Keep it unchanged/);
 	assert.equal(h.name, "My own name");
 });
 

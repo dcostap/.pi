@@ -25,7 +25,7 @@ const MAX_MESSAGE_CHARS = 2_000;
 const ASSISTANT_RESERVE_CHARS = 2_000;
 const MIN_MESSAGE_CHARS = 200;
 // Stops a session that stays vague ("hi", "thanks") from paying on every run.
-const MAX_REFINEMENT_ATTEMPTS = 3;
+const MAX_REFINEMENT_ATTEMPTS = 5;
 
 const SYSTEM_PROMPT = `You name coding-agent sessions so the user can recognize them weeks later.
 Return only JSON: {"name": string, "needsRefinement": boolean}.
@@ -119,11 +119,17 @@ export function buildNamingContext(sections: Section[]): string {
 	return (omitted ? "[Some content omitted]\n\n" : "") + body.join("\n\n");
 }
 
-function buildPrompt(context: string, currentName: string | undefined, guidance: string | undefined): string {
+function currentNameLine(currentName: string | undefined, temporary: boolean): string {
+	if (!currentName) return "";
+	// "Keep it if accurate" anchors the model; a temporary name was a guess, so it gets no such protection.
+	return temporary
+		? `The current name ${JSON.stringify(currentName)} is temporary because the subject was unclear. Name the session from the conversation now.`
+		: `Current name: ${JSON.stringify(currentName)}. Keep it unchanged if it is still accurate. Replace it only with a meaningfully better name.`;
+}
+
+function buildPrompt(context: string, currentName: string | undefined, temporary: boolean, guidance: string | undefined): string {
 	return [
-		currentName
-			? `Current name: ${JSON.stringify(currentName)}. Keep it unchanged if it is still accurate. Replace it only with a meaningfully better name.`
-			: "",
+		currentNameLine(currentName, temporary),
 		guidance ? `Additional user naming guidance: ${guidance}` : "",
 		"<conversation>",
 		context,
@@ -176,15 +182,20 @@ function latestState(ctx: ExtensionContext): NameState | undefined {
 	return undefined;
 }
 
+function isTemporary(currentName: string | undefined, state: NameState | undefined): boolean {
+	return Boolean(currentName) && state?.name === currentName && state.needsRefinement;
+}
+
 /** An unnamed session gets a name; a vague auto name gets more tries; any other name is the user's. */
 export function shouldAutoName(currentName: string | undefined, state: NameState | undefined): boolean {
 	if (!currentName) return true;
-	return state?.name === currentName && state.needsRefinement && state.attempt < MAX_REFINEMENT_ATTEMPTS;
+	return isTemporary(currentName, state) && state!.attempt < MAX_REFINEMENT_ATTEMPTS;
 }
 
 async function suggestName(
 	ctx: ExtensionContext,
 	currentName: string | undefined,
+	temporary: boolean,
 	guidance: string | undefined,
 	signal: AbortSignal,
 ): Promise<Suggestion | null> {
@@ -198,7 +209,7 @@ async function suggestName(
 		fastModel.model,
 		{
 			systemPrompt: SYSTEM_PROMPT,
-			messages: [{ role: "user", content: [{ type: "text", text: buildPrompt(context, currentName, guidance) }], timestamp: Date.now() }],
+			messages: [{ role: "user", content: [{ type: "text", text: buildPrompt(context, currentName, temporary, guidance) }], timestamp: Date.now() }],
 		},
 		{
 			apiKey: fastModel.auth.apiKey,
@@ -237,7 +248,7 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 		const controller = new AbortController();
 		const attempt = currentName ? (state?.attempt ?? 0) + 1 : 1;
 		// Fire and forget: naming must not delay the next run.
-		const done = suggestName(ctx, currentName, undefined, controller.signal)
+		const done = suggestName(ctx, currentName, isTemporary(currentName, state), undefined, controller.signal)
 			.then((suggestion) => {
 				// A `/name` typed while the request ran wins.
 				if (suggestion && !controller.signal.aborted && pi.getSessionName() === currentName) apply(suggestion, attempt);
@@ -284,10 +295,11 @@ export default function nameAutoExtension(pi: ExtensionAPI) {
 
 			try {
 				const currentName = pi.getSessionName();
+				const temporary = isTemporary(currentName, latestState(ctx));
 				const result = await ctx.ui.custom<Suggestion | { error: string } | null>((tui, theme, _keybindings, done) => {
 					const loader = new BorderedLoader(tui, theme, "Asking the fast cheap model for a name...");
 					loader.onAbort = () => done(null);
-					suggestName(ctx, currentName, args.trim() || undefined, loader.signal)
+					suggestName(ctx, currentName, temporary, args.trim() || undefined, loader.signal)
 						.then(done)
 						.catch((error) => done({ error: error instanceof Error ? error.message : String(error) }));
 					return loader;
