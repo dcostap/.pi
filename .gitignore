@@ -49,6 +49,7 @@ agent/extensions/**/.turbo/
 # Per-machine Pi auth/secrets
 agent/auth.json
 web-smart-fetch.json
+agent/skills/outlook-mail/
 
 # Runtime/generated/bulky Pi state
 agent/sessions/
