@@ -28,7 +28,7 @@
     },
     "openai-codex": {
       "modelOverrides": {
-        "gpt-6.1-sol": {
+        "gpt-6.2-sol": {
           "thinkingLevelMap": {
             "off": null,
             "minimal": null,
