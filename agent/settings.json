@@ -1,14 +1,14 @@
 {
   "lastChangelogVersion": "1.5.2",
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-6.1-sol",
+  "defaultProvider": "claude-bridge",
+  "defaultModel": "claude-opus-5-5",
   "packages": [
     "git:github.com/dcostap/pi-claude-bridge"
   ],
   "defaultThinkingLevel": "high",
   "enabledModels": [
     "deepseek/deepseek-flash",
-    "openai-codex/gpt-6.1-sol",
+    "openai-codex/gpt-6.2-sol",
     "openai-codex/gpt-6-luna",
     "claude-bridge/claude-opus-5-5",
     "claude-bridge/claude-haiku-5-5",
