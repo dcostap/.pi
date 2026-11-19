@@ -4,7 +4,7 @@ When calling PowerShell from `bash`, single-quote the entire `-Command` script (
 
 `bash` runs Git Bash, not cmd.exe or PowerShell. Use Unix syntax: `/dev/null` (not `NUL`), forward slashes, and `$VAR` (not `%VAR%` or `$env:VAR`).
 
-Tool calls in one response run concurrently. Wait for completion before issuing dependent calls in a separate response.
+Tool calls in one response run concurrently. Put dependent calls in separate responses.
 
 This rule applies to all prose you write: docs, commit messages, PR descriptions, reports, and replies: Follow ASD-STE100 Simplified Technical English for technical text:
 - Use approved words only. Each word has one meaning.
