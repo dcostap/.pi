@@ -22,6 +22,10 @@ agent/model-roles.local.json
 !powershell/
 !powershell/**
 
+# Parked design notes
+!ideas/
+!ideas/**
+
 # Pi customizations
 !agent/extensions/
 !agent/extensions/**
