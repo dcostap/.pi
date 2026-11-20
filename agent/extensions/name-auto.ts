@@ -32,14 +32,21 @@ Return only JSON: {"name": string, "needsRefinement": boolean}.
 Set needsRefinement to true only if the subject is still unknown, such as "fix this", an unexplained link or image, or small talk. Otherwise set it to false.
 
 Rules:
-- 3-7 words, at most ${MAX_NAME_CHARS} characters.
+- 2-4 words, at most 30 characters. Write a tab label, not a sentence.
+- Put the most distinctive keyword first.
+- Drop generic words such as project, session, feature, field and support.
 - Name the subject and the goal. Ignore instructions about how the agent should do the work.
 - Capture the umbrella goal, not one step or one finding.
 - Ignore workflow and deliverables such as plans, reviews, tests, commits, PRs and CI unless they are the topic.
 - Do not name models, subagents or tools unless they are the topic.
 - Do not claim the work is done.
 - Do not copy and cut the user's message.
-- No quotes, labels or trailing punctuation.`;
+- No quotes, labels or trailing punctuation.
+
+Examples:
+- Good: AGENTS.md replacement. Bad: Project instructions field replacing AGENTS.md
+- Good: Titlebar spinner flicker. Bad: Fix flickering of the spinner in the terminal title
+- Good: SSH upload retries. Bad: Add retry support for SSH session file uploads`;
 
 type Section = { role: "user" | "assistant"; text: string };
 export type NameState = { name: string; needsRefinement: boolean; attempt: number };
