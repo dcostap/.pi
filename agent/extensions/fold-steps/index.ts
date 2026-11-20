@@ -11,13 +11,15 @@ import {
 // Container.handleMouse uses the layout that render records, so clicks reach the fold lines.
 
 type Layout = { width: number; children: { component: Component; height: number }[] };
-type Box = Container & { mouseLayout?: Layout };
-type Assistant = AssistantMessageComponent & {
+type Box = Pick<Container, "children" | "render"> & { mouseLayout?: Layout };
+type Message = { stopReason?: string; content: { type: string; text?: string }[] };
+type Assistant = Component & {
 	contentContainer: Box;
 	isStreaming: boolean;
 	outputPad: number;
-	lastMessage?: { stopReason?: string; content: { type: string; text?: string }[] };
+	lastMessage?: Message;
 };
+type Run = { state: "working" | "settled" | "aborted" };
 type Tui = {
 	children: Component[];
 	mode?: string;
@@ -112,12 +114,17 @@ class FoldLine implements Component {
 	invalidate() {}
 }
 
-/** Only a turn that ended with a final answer folds. A running, cancelled, or failed turn stays open. */
-function finished(turn: Component[]): Assistant | undefined {
-	const last = turn.findLast((child) => child instanceof AssistantMessageComponent) as Assistant | undefined;
-	const message = last?.lastMessage;
-	if (!last || last.isStreaming || message?.stopReason !== "stop") return;
-	return message.content.some((part) => part.type === "text" && part.text?.trim()) ? last : undefined;
+function hasFinalAnswer(assistant: Assistant | undefined): assistant is Assistant {
+	const message = assistant?.lastMessage;
+	return !!assistant && !assistant.isStreaming && message?.stopReason === "stop" &&
+		message.content.some((part) => part.type === "text" && part.text?.trim());
+}
+
+// Saved transcripts do not record steering. A user message after a tool batch can continue it.
+function awaitsToolContinuation(assistant: Assistant | undefined): boolean {
+	const message = assistant?.lastMessage;
+	return message?.stopReason === "toolUse" || (message?.stopReason === "length" &&
+		message.content.some((part) => part.type === "toolCall"));
 }
 
 function kind(component: Component, inAssistant: boolean): Kind {
@@ -134,15 +141,13 @@ function pieces(turn: Component[], chat: Box): (Piece & { kind: Kind })[] {
 		if (!(owner instanceof AssistantMessageComponent)) {
 			return [{ component: owner, box: chat, owner, index: -1, kind: kind(owner, false) }];
 		}
-		const box = (owner as Assistant).contentContainer;
+		const box = (owner as unknown as Assistant).contentContainer;
 		box.render = renderPlanned;
 		return box.children.map((component, index) => ({ component, box, owner, index, kind: kind(component, true) }));
 	});
 }
 
-function planTurn(tui: Tui, theme: Theme, chat: Box, turn: Component[]): void {
-	const last = finished(turn);
-	if (!last) return;
+function planTurn(tui: Tui, theme: Theme, chat: Box, turn: Component[], last: Assistant): void {
 	if (!foldable.has(last) && tui.isFollowingOutput !== true) return;
 	foldable.add(last);
 	const flat = pieces(turn, chat);
@@ -169,18 +174,33 @@ function planTurn(tui: Tui, theme: Theme, chat: Box, turn: Component[]): void {
 	close();
 }
 
-function renderChat(tui: Tui, theme: Theme, chat: Box, width: number): string[] {
+function renderChat(tui: Tui, theme: Theme, chat: Box, width: number, runs: WeakMap<Message, Run>): string[] {
 	plans = new WeakMap();
 	if (tui.mode === "fullscreen") {
-		let turn: Component[] | undefined;
+		let turn: Component[] = [];
+		let last: Assistant | undefined;
+		let run: Run | undefined;
+		const finish = () => {
+			if ((!run || run.state === "settled") && hasFinalAnswer(last)) planTurn(tui, theme, chat, turn, last);
+			turn = [];
+			last = undefined;
+			run = undefined;
+		};
 		for (const child of chat.children) {
-			if (child instanceof UserMessageComponent || child instanceof SkillInvocationMessageComponent) {
-				if (turn) planTurn(tui, theme, chat, turn);
-				turn = [];
+			if (child instanceof AssistantMessageComponent) {
+				const assistant = child as unknown as Assistant;
+				const nextRun = assistant.lastMessage && runs.get(assistant.lastMessage);
+				// Use run boundaries even when an input has no visible user component.
+				if (last && run !== nextRun) finish();
+				last = assistant;
+				run = nextRun;
+			} else if (!run && (child instanceof UserMessageComponent || child instanceof SkillInvocationMessageComponent) &&
+				!awaitsToolContinuation(last)) {
+				finish();
 			}
-			turn?.push(child);
+			turn.push(child);
 		}
-		if (turn) planTurn(tui, theme, chat, turn);
+		finish();
 	}
 	return renderPlanned.call(chat, width);
 }
@@ -190,12 +210,35 @@ function findChat(tui: Tui): Box | undefined {
 	const document = tui.children[0];
 	if (!(document instanceof Container) || document.children.length !== 3) return;
 	const chat = document.children[2];
-	return chat instanceof Container ? chat : undefined;
+	return chat instanceof Container ? chat as unknown as Box : undefined;
 }
 
 export default function foldSteps(pi: ExtensionAPI) {
 	let restore: (() => void) | undefined;
 	let current: Tui | undefined;
+	let activeRun: Run | undefined;
+	let runs = new WeakMap<Message, Run>();
+
+	pi.on("agent_start", () => {
+		// Retries and queued inputs can start another low-level run before the session settles.
+		if (current) activeRun ??= { state: "working" };
+	});
+	pi.on("message_end", ({ message }) => {
+		if (activeRun && message.role === "assistant") runs.set(message, activeRun);
+	});
+	pi.on("agent_end", ({ messages }) => {
+		// Record finalized messages even if another extension replaced them in message_end.
+		if (!activeRun) return;
+		for (const message of messages) {
+			if (message.role === "assistant") runs.set(message, activeRun);
+		}
+	});
+	pi.on("agent_settled", ({ aborted }) => {
+		if (!activeRun) return;
+		activeRun.state = aborted ? "aborted" : "settled";
+		activeRun = undefined;
+		current?.requestRender();
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
@@ -205,8 +248,8 @@ export default function foldSteps(pi: ExtensionAPI) {
 			const chat = findChat(tui as unknown as Tui);
 			if (chat) {
 				current = tui as unknown as Tui;
-				chat.render = (width) => renderChat(current!, theme, chat, width);
 				const host = current;
+				chat.render = (width) => renderChat(host, theme, chat, width, runs);
 				const originalInput = host.handleViewportInput;
 				const inputDescriptor = Object.getOwnPropertyDescriptor(host, "handleViewportInput");
 				// Pi sends no leave event. Clear hover outside the summary, on scroll, and on focus loss.
@@ -240,6 +283,8 @@ export default function foldSteps(pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		restore?.();
 		restore = undefined;
+		activeRun = undefined;
+		runs = new WeakMap();
 	});
 
 }

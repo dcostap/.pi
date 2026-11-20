@@ -52,9 +52,11 @@ function setup(mode = "fullscreen", input = (_data: string): unknown => undefine
 function user(chat: Container, text: string) {
 	chat.addChild(new UserMessageComponent(text, getMarkdownTheme()));
 }
-function assistant(chat: Container, content: unknown[], stopReason: string, streaming = false) {
+function assistant(chat: Container, content: unknown[], stopReason: string, streaming = false, onEnd?: Function) {
+	const message = { role: "assistant", content, stopReason };
 	const component = new AssistantMessageComponent(undefined, false, getMarkdownTheme());
-	component.updateContent({ role: "assistant", content, stopReason } as never, streaming);
+	if (!streaming) onEnd?.({ message });
+	component.updateContent(message as never, streaming);
 	chat.addChild(component);
 	return component;
 }
@@ -288,6 +290,81 @@ test("keeps cancelled, failed, and running turns open", () => {
 		expect(text).toContain("plan");
 		expect(text).not.toContain("step");
 	}
+});
+
+function toolBatch(chat: Container, tui: unknown, path: string, onEnd?: Function) {
+	assistant(chat, [
+		{ type: "thinking", thinking: `Inspect ${path}` },
+		{ type: "toolCall", id: path, name: "read", arguments: { path } },
+	], "toolUse", false, onEnd);
+	tool(chat, tui, path, path);
+}
+
+test("multiple steering messages keep their place and fold only when the run settles", () => {
+	const { chat, tui, handlers } = setup();
+	handlers.agent_start!();
+	user(chat, "start the task");
+	toolBatch(chat, tui, "before.txt", handlers.message_end);
+	user(chat, "first steer");
+	toolBatch(chat, tui, "middle.txt", handlers.message_end);
+	user(chat, "second steer");
+	user(chat, "one more detail");
+	toolBatch(chat, tui, "after.txt", handlers.message_end);
+	assistant(chat, [{ type: "text", text: "Final answer." }], "stop", false, handlers.message_end);
+
+	const open = lines(chat).join("\n");
+	expect(open).not.toContain("▸");
+	for (const path of ["before.txt", "middle.txt", "after.txt"]) expect(open).toContain(`contents of ${path}`);
+
+	// A low-level end can lead to another run, not idle.
+	handlers.agent_end!({ messages: [] });
+	handlers.agent_start!();
+	expect(lines(chat).join("\n")).toBe(open);
+	const renders = tui.renders;
+	handlers.agent_settled!({ aborted: false });
+	expect(tui.renders).toBeGreaterThan(renders);
+	const folded = lines(chat).join("\n");
+	expect(folded.match(/▸ 2 steps/g)).toHaveLength(3);
+	expect(folded).toMatch(/▸ 2 steps[\s\S]*first steer[\s\S]*▸ 2 steps[\s\S]*second steer[\s\S]*one more detail[\s\S]*▸ 2 steps[\s\S]*Final answer\./);
+	expect(folded).not.toContain("contents of");
+});
+
+test("the next prompt cannot fold an aborted run with no final assistant message", () => {
+	const { chat, tui, handlers } = setup();
+	handlers.agent_start!();
+	user(chat, "start the task");
+	toolBatch(chat, tui, "cancelled.txt", handlers.message_end);
+	user(chat, "steer before cancelling");
+	handlers.agent_settled!({ aborted: true });
+
+	handlers.agent_start!();
+	user(chat, "new task");
+	toolBatch(chat, tui, "new.txt", handlers.message_end);
+	assistant(chat, [{ type: "text", text: "New task complete." }], "stop", false, handlers.message_end);
+	handlers.agent_settled!({ aborted: false });
+	const text = lines(chat).join("\n");
+	expect(text).toContain("contents of cancelled.txt");
+	expect(text).not.toContain("contents of new.txt");
+	expect(text).toContain("▸ 2 steps");
+});
+
+test("replayed transcripts fold across steering, but not past an aborted assistant response", () => {
+	const { chat, tui } = setup();
+	user(chat, "cancelled task");
+	toolBatch(chat, tui, "cancelled.txt");
+	user(chat, "interrupted steer");
+	assistant(chat, [{ type: "text", text: "Interrupted." }], "aborted");
+	user(chat, "new task");
+	toolBatch(chat, tui, "before.txt");
+	user(chat, "successful steer");
+	toolBatch(chat, tui, "after.txt");
+	assistant(chat, [{ type: "text", text: "Final answer." }], "stop");
+
+	const text = lines(chat).join("\n");
+	expect(text).toContain("contents of cancelled.txt");
+	expect(text).not.toContain("contents of before.txt");
+	expect(text).not.toContain("contents of after.txt");
+	expect(text).toMatch(/▸ 2 steps[\s\S]*successful steer[\s\S]*▸ 2 steps[\s\S]*Final answer\./);
 });
 
 test("a finished answer without text stays open", () => {
