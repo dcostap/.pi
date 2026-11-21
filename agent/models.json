@@ -50,7 +50,7 @@
             "max": "max"
           }
         },
-        "gpt-6-astra": {
+        "gpt-6.2-astra": {
           "thinkingLevelMap": {
             "off": null,
             "minimal": null,
