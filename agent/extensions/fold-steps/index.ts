@@ -10,8 +10,8 @@ import {
 // and of each assistant message's content container, so that it can skip steps and add fold lines.
 // Container.handleMouse uses the layout that render records, so clicks reach the fold lines.
 
-type Layout = { width: number; children: { component: Component; height: number }[] };
-type Box = Pick<Container, "children" | "render"> & { mouseLayout?: Layout };
+type Layout = { width: number; children: Component[]; parts: string[][]; lines: string[] };
+type Box = Pick<Container, "children" | "render"> & { childLines?: Layout };
 type Message = { stopReason?: string; content: { type: string; text?: string }[] };
 type Assistant = Component & {
 	contentContainer: Box;
@@ -58,20 +58,19 @@ function planFor(box: Box): Plan {
 function renderPlanned(this: Box, width: number): string[] {
 	const plan = plans.get(this);
 	if (!plan) return baseRender.call(this, width);
-	const lines: string[] = [];
-	const children: Layout["children"] = [];
+	const children: Component[] = [];
+	const parts: string[][] = [];
 	const add = (component: Component) => {
-		const rendered = component.render(width);
-		children.push({ component, height: rendered.length });
-		lines.push(...rendered);
+		children.push(component);
+		parts.push(component.render(width));
 	};
 	for (const child of this.children) {
 		const fold = plan.folds.get(child);
 		if (fold) add(fold);
 		if (!plan.hidden.has(child)) add(child);
 	}
-	this.mouseLayout = { width, children };
-	return lines;
+	this.childLines = { width, children, parts, lines: parts.flat() };
+	return this.childLines.lines;
 }
 
 class FoldLine implements Component {

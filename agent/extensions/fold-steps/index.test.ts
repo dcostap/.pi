@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { Container, ScrollView, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Markdown, ScrollView, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, initTheme,
 } from "@earendil-works/pi-coding-agent";
+import { COPY_LABEL, installCodeBlockCopyButton } from "../_shared/code-block-copy-button.ts";
 import install from "./index.ts";
 
 initTheme("dark");
@@ -70,7 +71,7 @@ const mouse = (chat: Container, y: number, type = "move", x = 2, width = 60, but
 	type, button, x, y, screenX: x, screenY: y, width, height: 999,
 	shift: false, alt: false, ctrl: false,
 } as never);
-const click = (chat: Container, y: number) => mouse(chat, y, "click");
+const click = (chat: Container, y: number, x?: number) => mouse(chat, y, "click", x);
 
 function finishedTurn(chat: Container, tui: unknown) {
 	user(chat, "fix the bug");
@@ -202,6 +203,23 @@ test("folds steps between texts of a finished turn and toggles on click", () => 
 	const thinkingRow = folded.findIndex((line) => line.includes("▸ 1 step"));
 	click(chat, thinkingRow);
 	expect(lines(chat).join("\n")).toContain("I should look around");
+});
+
+test("clicks reach the answer below folded steps", async () => {
+	const { chat, tui } = setup();
+	const copied: string[] = [];
+	const restore = installCodeBlockCopyButton(Markdown, (text) => { copied.push(text); }, () => {})!;
+	cleanups.push(restore);
+	user(chat, "run it");
+	assistant(chat, [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "a.ts" } }], "toolUse");
+	tool(chat, tui, "t1", "a.ts");
+	assistant(chat, [{ type: "text", text: "Run this:\n\n```sql\nSELECT 1;\n```" }], "stop");
+	const folded = lines(chat);
+	expect(folded.join("\n")).toContain("▸ 1 step");
+	const row = folded.findIndex((line) => line.includes(COPY_LABEL));
+	click(chat, row, folded[row]!.indexOf(COPY_LABEL));
+	await Promise.resolve();
+	expect(copied).toEqual(["SELECT 1;"]);
 });
 
 test("hover underlines only its summary and stays on the same step after renders and clicks", () => {
