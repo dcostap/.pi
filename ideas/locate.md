@@ -17,7 +17,7 @@ Large tool outputs cost context. One `read` or `bash` call can put up to 50 KB (
 - For codemode scripts, `bash` returns `structuredContent` with up to 1 MiB of output. `full_output_path` is set only above 1 MiB. Between 50 KB and 1 MiB, a script gets the full text but no path.
 - `chrome_cdp` has no `outputSchema`. Scripts get the same text as the model: a 2 KB preview plus `[Dumped … to <path>]`.
 - `claude-bridge` sends only the text `content` to Claude, never `structuredContent`.
-- Through the bridge, `claude-haiku-5-5` runs as `claude-haiku-5-5[1m]` (1M context). The `contextWindow: 300000` in `claude-bridge.json` changes only what pi shows and when it compacts.
+- Through the bridge, `claude-haiku-5-5` runs as `claude-haiku-5-5[1m]` (1M context). The `contextWindow` in `claude-bridge.json` changes only what pi shows and when it compacts.
 - These tools already save the full output to a file when they cut it: `bash`, `bash_bg_*`, `chrome_cdp`, `ssh_session`, `codex_web_search`, `everything_search`, `fetch_url`, subagent updates, and MCP tools (over 20 KB).
 
 ## Part 1: `output-cap` hook
