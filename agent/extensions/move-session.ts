@@ -28,6 +28,7 @@ import {
     renameSync,
     unlinkSync,
 } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { Type } from "typebox";
 
 import {
@@ -158,6 +159,17 @@ export async function trashFileBestEffort(filePath: string): Promise<boolean> {
         if (ok) return true;
     }
     return false;
+}
+
+// OSC 7 tells the terminal its current directory. The shell under pi stays in its old directory, so without this
+// the terminal's "current path" actions keep the old directory.
+function reportTerminalDirectory(directory: string): void {
+    if (!process.stdout?.isTTY) return;
+    try {
+        process.stdout.write(`\x1b]7;${pathToFileURL(directory).href}\x07`);
+    } catch {
+        // The terminal keeps its old directory
+    }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -330,6 +342,7 @@ export default function (pi: ExtensionAPI) {
                 // Runs only after a successful switch, before the agent continues.
                 withSession: async (next) => {
                     void trashFileBestEffort(sourceSessionFile);
+                    reportTerminalDirectory(targetCwd);
                     if (!continueAgent) return;
                     await next.sendMessage({
                         customType: "move-session",
